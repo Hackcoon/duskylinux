@@ -3,23 +3,131 @@
   "dark": {
     "text": {
       "default": "{{colors.on_surface.default.hex}}",
-      "subdued": "{{colors.on_surface_variant.default.hex}}"
+      "subdued": "{{colors.on_surface_variant.default.hex}}",
+      "action": {
+        "primary": {
+          "default": "{{colors.primary.default.hex}}",
+          "$hovered": "{{colors.primary_fixed.default.hex}}",
+          "$focused": "{{colors.on_primary.default.hex}}",
+          "$pressed": "{{colors.on_primary_container.default.hex}}",
+          "$selected": "{{colors.on_primary_container.default.hex}}",
+          "$disabled": "{{colors.outline_variant.default.hex}}"
+        },
+        "secondary": {
+          "default": "{{colors.on_surface_variant.default.hex}}",
+          "$hovered": "{{colors.on_surface.default.hex}}",
+          "$focused": "{{colors.on_surface.default.hex}}",
+          "$pressed": "{{colors.on_surface.default.hex}}",
+          "$selected": "{{colors.primary.default.hex}}",
+          "$disabled": "{{colors.outline_variant.default.hex}}"
+        },
+        "destructive": {
+          "default": "{{colors.error.default.hex}}",
+          "$hovered": "{{colors.on_error_container.default.hex}}",
+          "$focused": "{{colors.on_error.default.hex}}",
+          "$pressed": "{{colors.on_error_container.default.hex}}",
+          "$selected": "{{colors.on_error_container.default.hex}}",
+          "$disabled": "{{colors.outline_variant.default.hex}}"
+        }
+      },
+      "formfield": {
+        "default": "{{colors.on_surface.default.hex}}",
+        "$hovered": "{{colors.on_surface.default.hex}}",
+        "$focused": "{{colors.on_surface.default.hex}}",
+        "$pressed": "{{colors.on_surface.default.hex}}",
+        "$selected": "{{colors.primary.default.hex}}",
+        "$disabled": "{{colors.outline.default.hex}}"
+      },
+      "status": {
+        "running": "{{colors.tertiary.default.hex}}",
+        "question": "{{colors.primary.default.hex}}",
+        "permission": "{{colors.primary.default.hex}}",
+        "unread": "{{colors.secondary.default.hex}}"
+      },
+      "feedback": {
+        "error": {
+          "default": "{{colors.error.default.hex}}",
+          "subdued": "{{colors.on_error_container.default.hex}}"
+        },
+        "warning": {
+          "default": "{{colors.primary.default.hex}}",
+          "subdued": "{{colors.secondary.default.hex}}"
+        },
+        "success": {
+          "default": "{{colors.tertiary.default.hex}}",
+          "subdued": "{{colors.on_tertiary_container.default.hex}}"
+        },
+        "info": {
+          "default": "{{colors.secondary.default.hex}}",
+          "subdued": "{{colors.on_surface_variant.default.hex}}"
+        }
+      }
     },
     "background": {
-      "default": "{{colors.surface.default.hex}}"
+      "default": "{{colors.surface.default.hex}}",
+      "surface": {
+        "offset": "{{colors.surface_container.default.hex}}",
+        "overlay": "{{colors.surface_container_high.default.hex}}"
+      },
+      "action": {
+        "primary": {
+          "default": "{{colors.primary.default.hex}}",
+          "$hovered": "{{colors.primary_fixed.default.hex}}",
+          "$focused": "{{colors.primary.default.hex}}",
+          "$pressed": "{{colors.primary_container.default.hex}}",
+          "$selected": "{{colors.primary_container.default.hex}}",
+          "$disabled": "{{colors.surface_variant.default.hex}}"
+        },
+        "secondary": {
+          "default": "transparent"
+        },
+        "destructive": {
+          "default": "{{colors.error_container.default.hex}}",
+          "$hovered": "{{colors.error.default.hex}}",
+          "$focused": "{{colors.error_container.default.hex}}",
+          "$pressed": "{{colors.error_container.default.hex}}",
+          "$selected": "{{colors.error_container.default.hex}}",
+          "$disabled": "{{colors.surface_variant.default.hex}}"
+        }
+      },
+      "formfield": {
+        "default": "{{colors.surface_container.default.hex}}",
+        "$hovered": "{{colors.surface_container_high.default.hex}}",
+        "$focused": "{{colors.surface_container_high.default.hex}}",
+        "$pressed": "{{colors.surface_container_highest.default.hex}}",
+        "$selected": "{{colors.primary_container.default.hex}}",
+        "$disabled": "{{colors.surface.default.hex}}"
+      },
+      "feedback": {
+        "error": {
+          "default": "{{colors.error_container.default.hex}}"
+        },
+        "warning": {
+          "default": "{{colors.primary_container.default.hex}}"
+        },
+        "success": {
+          "default": "{{colors.tertiary_container.default.hex}}"
+        },
+        "info": {
+          "default": "{{colors.secondary_container.default.hex}}"
+        }
+      }
     },
     "border": {
       "default": "{{colors.outline_variant.default.hex}}"
     },
+    "scrollbar": {
+      "default": "{{colors.outline.default.hex}}"
+    },
     "syntax": {
-      "comment": "{{colors.on_surface_variant.default.hex}}",
+      "comment": "{{colors.outline.default.hex}}",
       "keyword": "{{colors.primary.default.hex}}",
       "function": "{{colors.secondary.default.hex}}",
       "variable": "{{colors.on_surface.default.hex}}",
-      "string": "{{colors.secondary.default.hex}}",
-      "number": "{{colors.secondary.default.hex}}",
+      "string": "{{colors.tertiary.default.hex}}",
+      "number": "{{colors.primary_fixed.default.hex}}",
       "type": "{{colors.primary.default.hex}}",
-      "operator": "{{colors.on_surface.default.hex}}",
+      "operator": "{{colors.on_surface_variant.default.hex}}",
       "punctuation": "{{colors.on_surface_variant.default.hex}}"
     },
     "markdown": {
@@ -27,44 +135,180 @@
       "heading": "{{colors.primary.default.hex}}",
       "link": "{{colors.primary.default.hex}}",
       "linkText": "{{colors.secondary.default.hex}}",
-      "code": "{{colors.secondary.default.hex}}",
-      "blockQuote": "{{colors.surface_variant.default.hex}}",
+      "code": "{{colors.tertiary.default.hex}}",
+      "blockQuote": "{{colors.on_surface_variant.default.hex}}",
       "emphasis": "{{colors.secondary.default.hex}}",
-      "strong": "{{colors.primary.default.hex}}",
-      "horizontalRule": "{{colors.surface_variant.default.hex}}",
+      "strong": "{{colors.on_surface.default.hex}}",
+      "horizontalRule": "{{colors.outline.default.hex}}",
       "listItem": "{{colors.primary.default.hex}}",
       "listEnumeration": "{{colors.secondary.default.hex}}",
       "image": "{{colors.primary.default.hex}}",
-      "imageText": "{{colors.secondary.default.hex}}",
+      "imageText": "{{colors.on_primary.default.hex}}",
       "codeBlock": "{{colors.on_surface.default.hex}}"
     },
     "diff": {
       "text": {
-        "added": "{{colors.secondary.default.hex}}",
+        "added": "{{colors.tertiary.default.hex}}",
+        "removed": "{{colors.error.default.hex}}",
+        "context": "{{colors.on_surface_variant.default.hex}}",
+        "hunkHeader": "{{colors.primary.default.hex}}"
+      },
+      "background": {
+        "added": "{{colors.tertiary_container.default.hex}}",
+        "removed": "{{colors.error_container.default.hex}}",
+        "context": "{{colors.surface_container.default.hex}}"
+      },
+      "highlight": {
+        "added": "{{colors.tertiary.default.hex}}",
         "removed": "{{colors.error.default.hex}}"
+      },
+      "lineNumber": {
+        "text": "{{colors.outline.default.hex}}",
+        "background": {
+          "added": "{{colors.tertiary_container.default.hex}}",
+          "removed": "{{colors.error_container.default.hex}}"
+        }
+      }
+    },
+    "@context:elevated": {
+      "background": {
+        "default": "{{colors.surface_container_high.default.hex}}"
+      }
+    },
+    "@context:overlay": {
+      "background": {
+        "default": "{{colors.surface_container_highest.default.hex}}"
       }
     }
   },
   "light": {
     "text": {
       "default": "{{colors.on_surface.default.hex}}",
-      "subdued": "{{colors.on_surface_variant.default.hex}}"
+      "subdued": "{{colors.on_surface_variant.default.hex}}",
+      "action": {
+        "primary": {
+          "default": "{{colors.primary.default.hex}}",
+          "$hovered": "{{colors.primary_fixed.default.hex}}",
+          "$focused": "{{colors.on_primary.default.hex}}",
+          "$pressed": "{{colors.on_primary_container.default.hex}}",
+          "$selected": "{{colors.on_primary_container.default.hex}}",
+          "$disabled": "{{colors.outline_variant.default.hex}}"
+        },
+        "secondary": {
+          "default": "{{colors.on_surface_variant.default.hex}}",
+          "$hovered": "{{colors.on_surface.default.hex}}",
+          "$focused": "{{colors.on_surface.default.hex}}",
+          "$pressed": "{{colors.on_surface.default.hex}}",
+          "$selected": "{{colors.primary.default.hex}}",
+          "$disabled": "{{colors.outline_variant.default.hex}}"
+        },
+        "destructive": {
+          "default": "{{colors.error.default.hex}}",
+          "$hovered": "{{colors.on_error_container.default.hex}}",
+          "$focused": "{{colors.on_error.default.hex}}",
+          "$pressed": "{{colors.on_error_container.default.hex}}",
+          "$selected": "{{colors.on_error_container.default.hex}}",
+          "$disabled": "{{colors.outline_variant.default.hex}}"
+        }
+      },
+      "formfield": {
+        "default": "{{colors.on_surface.default.hex}}",
+        "$hovered": "{{colors.on_surface.default.hex}}",
+        "$focused": "{{colors.on_surface.default.hex}}",
+        "$pressed": "{{colors.on_surface.default.hex}}",
+        "$selected": "{{colors.primary.default.hex}}",
+        "$disabled": "{{colors.outline.default.hex}}"
+      },
+      "status": {
+        "running": "{{colors.tertiary.default.hex}}",
+        "question": "{{colors.primary.default.hex}}",
+        "permission": "{{colors.primary.default.hex}}",
+        "unread": "{{colors.secondary.default.hex}}"
+      },
+      "feedback": {
+        "error": {
+          "default": "{{colors.error.default.hex}}",
+          "subdued": "{{colors.on_error_container.default.hex}}"
+        },
+        "warning": {
+          "default": "{{colors.primary.default.hex}}",
+          "subdued": "{{colors.secondary.default.hex}}"
+        },
+        "success": {
+          "default": "{{colors.tertiary.default.hex}}",
+          "subdued": "{{colors.on_tertiary_container.default.hex}}"
+        },
+        "info": {
+          "default": "{{colors.secondary.default.hex}}",
+          "subdued": "{{colors.on_surface_variant.default.hex}}"
+        }
+      }
     },
     "background": {
-      "default": "{{colors.surface.default.hex}}"
+      "default": "{{colors.surface.default.hex}}",
+      "surface": {
+        "offset": "{{colors.surface_container.default.hex}}",
+        "overlay": "{{colors.surface_container_high.default.hex}}"
+      },
+      "action": {
+        "primary": {
+          "default": "{{colors.primary.default.hex}}",
+          "$hovered": "{{colors.primary_fixed.default.hex}}",
+          "$focused": "{{colors.primary.default.hex}}",
+          "$pressed": "{{colors.primary_container.default.hex}}",
+          "$selected": "{{colors.primary_container.default.hex}}",
+          "$disabled": "{{colors.surface_variant.default.hex}}"
+        },
+        "secondary": {
+          "default": "transparent"
+        },
+        "destructive": {
+          "default": "{{colors.error_container.default.hex}}",
+          "$hovered": "{{colors.error.default.hex}}",
+          "$focused": "{{colors.error_container.default.hex}}",
+          "$pressed": "{{colors.error_container.default.hex}}",
+          "$selected": "{{colors.error_container.default.hex}}",
+          "$disabled": "{{colors.surface_variant.default.hex}}"
+        }
+      },
+      "formfield": {
+        "default": "{{colors.surface_container.default.hex}}",
+        "$hovered": "{{colors.surface_container_high.default.hex}}",
+        "$focused": "{{colors.surface_container_high.default.hex}}",
+        "$pressed": "{{colors.surface_container_highest.default.hex}}",
+        "$selected": "{{colors.primary_container.default.hex}}",
+        "$disabled": "{{colors.surface.default.hex}}"
+      },
+      "feedback": {
+        "error": {
+          "default": "{{colors.error_container.default.hex}}"
+        },
+        "warning": {
+          "default": "{{colors.primary_container.default.hex}}"
+        },
+        "success": {
+          "default": "{{colors.tertiary_container.default.hex}}"
+        },
+        "info": {
+          "default": "{{colors.secondary_container.default.hex}}"
+        }
+      }
     },
     "border": {
       "default": "{{colors.outline_variant.default.hex}}"
     },
+    "scrollbar": {
+      "default": "{{colors.outline.default.hex}}"
+    },
     "syntax": {
-      "comment": "{{colors.on_surface_variant.default.hex}}",
+      "comment": "{{colors.outline.default.hex}}",
       "keyword": "{{colors.primary.default.hex}}",
       "function": "{{colors.secondary.default.hex}}",
       "variable": "{{colors.on_surface.default.hex}}",
-      "string": "{{colors.secondary.default.hex}}",
-      "number": "{{colors.secondary.default.hex}}",
+      "string": "{{colors.tertiary.default.hex}}",
+      "number": "{{colors.primary_fixed.default.hex}}",
       "type": "{{colors.primary.default.hex}}",
-      "operator": "{{colors.on_surface.default.hex}}",
+      "operator": "{{colors.on_surface_variant.default.hex}}",
       "punctuation": "{{colors.on_surface_variant.default.hex}}"
     },
     "markdown": {
@@ -72,21 +316,49 @@
       "heading": "{{colors.primary.default.hex}}",
       "link": "{{colors.primary.default.hex}}",
       "linkText": "{{colors.secondary.default.hex}}",
-      "code": "{{colors.secondary.default.hex}}",
-      "blockQuote": "{{colors.surface_variant.default.hex}}",
+      "code": "{{colors.tertiary.default.hex}}",
+      "blockQuote": "{{colors.on_surface_variant.default.hex}}",
       "emphasis": "{{colors.secondary.default.hex}}",
-      "strong": "{{colors.primary.default.hex}}",
-      "horizontalRule": "{{colors.surface_variant.default.hex}}",
+      "strong": "{{colors.on_surface.default.hex}}",
+      "horizontalRule": "{{colors.outline.default.hex}}",
       "listItem": "{{colors.primary.default.hex}}",
       "listEnumeration": "{{colors.secondary.default.hex}}",
       "image": "{{colors.primary.default.hex}}",
-      "imageText": "{{colors.secondary.default.hex}}",
+      "imageText": "{{colors.on_primary.default.hex}}",
       "codeBlock": "{{colors.on_surface.default.hex}}"
     },
     "diff": {
       "text": {
-        "added": "{{colors.secondary.default.hex}}",
+        "added": "{{colors.tertiary.default.hex}}",
+        "removed": "{{colors.error.default.hex}}",
+        "context": "{{colors.on_surface_variant.default.hex}}",
+        "hunkHeader": "{{colors.primary.default.hex}}"
+      },
+      "background": {
+        "added": "{{colors.tertiary_container.default.hex}}",
+        "removed": "{{colors.error_container.default.hex}}",
+        "context": "{{colors.surface_container.default.hex}}"
+      },
+      "highlight": {
+        "added": "{{colors.tertiary.default.hex}}",
         "removed": "{{colors.error.default.hex}}"
+      },
+      "lineNumber": {
+        "text": "{{colors.outline.default.hex}}",
+        "background": {
+          "added": "{{colors.tertiary_container.default.hex}}",
+          "removed": "{{colors.error_container.default.hex}}"
+        }
+      }
+    },
+    "@context:elevated": {
+      "background": {
+        "default": "{{colors.surface_container_high.default.hex}}"
+      }
+    },
+    "@context:overlay": {
+      "background": {
+        "default": "{{colors.surface_container_highest.default.hex}}"
       }
     }
   }
