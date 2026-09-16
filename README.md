@@ -253,12 +253,10 @@ GUI keybind invokable sliders for:
 
 
 Speech to text 
-- Whisper - for cpu 
-or 
-- Parakeet - for nvidia gpus. might also work on Amd (not sure)
+- Parakeet - for nvidia gpus (CUDA) or cpu 
 
 text to speech 
-- kokoro for both cpu and gpu
+- kokoro for cpu, nvidia gpus and amd gpus (via ROCm)
 
 - mechanical keypress sounds
 togglalble with a keybind or from rofi. 
