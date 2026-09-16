@@ -94,6 +94,8 @@ scripts = [
     "S | 220_logrotate_optimization.sh",
     "S | 225_faillock_timeout.py --preset lenient -y",
     # "U | 230_asus_tuf_tweaks.sh",
+    # Intel Macs only (2012-2020); no-ops on everything else
+    # "S | 409_intel_mac_quirks.sh --auto",
     "U | 235_file_manager_switch.sh --thunar",
     "U | 236_browser_switcher.sh --firefox",
     "U | 237_text_editer_switcher.sh --mousepad",
