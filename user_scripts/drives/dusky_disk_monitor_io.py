@@ -1082,9 +1082,9 @@ class IOMonitorApp(App):
     def tick(self) -> None:
         dirty, wb = SysStatParser.get_ram_buffers()
         ram_txt = Text.from_markup(
-            f"[{LABEL_COL}]Dirty (Wait):[/] [bold {ACCENT}]{dirty:.1f} MB[/]    "
+            f"[{LABEL_COL}]Dirty:[/] [bold {ACCENT}]{dirty:.1f} MB[/]    "
             f"[bold {BG} on {SUCCESS}] Dusky Disk [/]    "
-            f"[{LABEL_COL}]Writeback (Active):[/] [bold {ERROR}]{wb:.1f} MB[/]"
+            f"[{LABEL_COL}]Writeback:[/] [bold {ERROR}]{wb:.1f} MB[/]"
         )
         try:
             self.query_one("#ram_txt", Static).update(ram_txt)
