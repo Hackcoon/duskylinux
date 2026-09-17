@@ -44,10 +44,7 @@ declare -agr LEARN_MENU=(
 )
 
 declare -agr AI_MENU=(
-    '󰔊  TTS - Kokoro (GPU)'
-    '󰔊  TTS - Kokoro (CPU)'
-    '󰍬  STT - Faster Whisper'
-    '󰍬  STT - Parakeet (GPU)'
+    '󰍬  STT - Parakeet'
     '󰍉  OCR Selection'
 )
 
@@ -318,17 +315,11 @@ show_ai_menu() {
         choice=$(menu_select "AI Tools" AI_MENU) || return 0
 
         case "$choice" in
-            '󰔊  TTS - Kokoro (GPU)')
-                run_app "$SCRIPTS_DIR/tts_stt/kokoro_gpu/speak.sh"
-                ;;
-            '󰔊  TTS - Kokoro (CPU)')
-                run_app "$SCRIPTS_DIR/tts_stt/kokoro_cpu/kokoro.sh"
-                ;;
-            '󰍬  STT - Faster Whisper')
-                run_app "$SCRIPTS_DIR/tts_stt/faster_whisper/faster_whisper_stt.sh"
-                ;;
-            '󰍬  STT - Parakeet (GPU)')
-                run_app "$SCRIPTS_DIR/tts_stt/parakeet/parakeet.sh"
+            '󰍬  STT - Parakeet')
+                # dusky_trigger is installed to ~/.local/bin by the
+                # dusky_parakeet installer; bare name so validate_launch_target
+                # gives a clean "Command not found" if STT was never installed.
+                run_app dusky_trigger
                 ;;
             '󰍉  OCR Selection')
                 require_commands slurp grim tesseract wl-copy || continue
