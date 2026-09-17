@@ -170,6 +170,23 @@ def format_rate(rate_bytes_per_sec: float) -> str:
     return "0.00 MB/s"
 
 
+def format_nvme_units(units: int | float | str) -> str:
+    """Formats NVMe data units (1 unit = 1,000 * 512 bytes = 512 KB) into human-readable SI string matching nvme-cli."""
+    if isinstance(units, str) and any(u in units for u in ("KB", "MB", "GB", "TB")):
+        return units.strip()
+    try:
+        bytes_val = float(units) * 512_000.0
+        if bytes_val < 1e6:
+            return f"{bytes_val / 1e3:.1f} KB"
+        if bytes_val < 1e9:
+            return f"{bytes_val / 1e6:.1f} MB"
+        if bytes_val < 1e12:
+            return f"{bytes_val / 1e9:.1f} GB"
+        return f"{bytes_val / 1e12:.2f} TB"
+    except (ValueError, TypeError):
+        return "N/A"
+
+
 @dataclass(slots=True, frozen=True)
 class BlockStats:
     timestamp: float
@@ -244,30 +261,67 @@ class SysStatParser:
             p_cycles = "N/A"
             p_hours = "N/A"
             realloc = "N/A"
+            tbr = "N/A"
+            tbw = "N/A"
+            u_shut = "N/A"
+            crit_warn = "N/A"
 
             if res.stdout:
                 try:
                     data = json.loads(res.stdout)
-                    t_curr = data.get("temperature", {}).get("current")
-                    if t_curr is not None:
-                        temp_str = f"{t_curr}°C"
-                    else:
+
+                    # NVMe SMART log block from smartctl (handles NVMe devices seamlessly)
+                    nvme_log = data.get("nvme_smart_health_information_log", {})
+                    if nvme_log:
+                        pct_used = nvme_log.get("percentage_used")
+                        if pct_used is not None:
+                            try:
+                                health_str = f"{max(0, 100 - int(pct_used))}%"
+                            except (ValueError, TypeError):
+                                pass
+                        dur = nvme_log.get("data_units_read")
+                        if dur is not None:
+                            tbr = format_nvme_units(dur)
+                        duw = nvme_log.get("data_units_written")
+                        if duw is not None:
+                            tbw = format_nvme_units(duw)
+                        p_cycles = str(nvme_log.get("power_cycles", "N/A"))
+                        p_hours = str(nvme_log.get("power_on_hours", "N/A"))
+                        u_shut = str(nvme_log.get("unsafe_shutdowns", "N/A"))
+                        realloc = str(nvme_log.get("media_errors", "N/A"))
+                        cw = nvme_log.get("critical_warning")
+                        if cw is not None:
+                            crit_warn = str(cw)
+                        t_nvme = nvme_log.get("temperature")
+                        if t_nvme is not None:
+                            temp_str = f"{t_nvme}°C"
+
+                    if temp_str == "N/A":
+                        t_curr = data.get("temperature", {}).get("current")
+                        if t_curr is not None:
+                            temp_str = f"{t_curr}°C"
+                        else:
+                            for attr in data.get("ata_smart_attributes", {}).get("table", []):
+                                if attr.get("name") in ("Temperature_Celsius", "Airflow_Temperature_Cel", "Temperature"):
+                                    raw_v = attr.get("raw", {}).get("value")
+                                    if raw_v is not None:
+                                        temp_str = f"{raw_v}°C"
+                                        break
+
+                    if health_str == "N/A":
+                        smart_passed = data.get("smart_status", {}).get("passed")
+                        health_str = "PASSED" if smart_passed is True else ("FAILED" if smart_passed is False else "N/A")
+
+                    if p_cycles == "N/A":
+                        p_cycles = str(data.get("power_cycle_count", "N/A"))
+                    if p_hours == "N/A":
+                        p_hours = str(data.get("power_on_time", {}).get("hours", "N/A"))
+
+                    if realloc == "N/A":
                         for attr in data.get("ata_smart_attributes", {}).get("table", []):
-                            if attr.get("name") in ("Temperature_Celsius", "Airflow_Temperature_Cel", "Temperature"):
-                                raw_v = attr.get("raw", {}).get("value")
-                                if raw_v is not None:
-                                    temp_str = f"{raw_v}°C"
-                                    break
-
-                    smart_passed = data.get("smart_status", {}).get("passed")
-                    health_str = "PASSED" if smart_passed is True else ("FAILED" if smart_passed is False else "N/A")
-                    p_cycles = str(data.get("power_cycle_count", "N/A"))
-                    p_hours = str(data.get("power_on_time", {}).get("hours", "N/A"))
-
-                    for attr in data.get("ata_smart_attributes", {}).get("table", []):
-                        if attr.get("name") in ("Reallocated_Sector_Ct", "Reallocated_Event_Count"):
-                            realloc = str(attr.get("raw", {}).get("value", attr.get("raw", {}).get("string", "N/A")))
-                            break
+                            if attr.get("name") in ("Reallocated_Sector_Ct", "Reallocated_Event_Count"):
+                                realloc = str(attr.get("raw", {}).get("value", attr.get("raw", {}).get("string", "N/A")))
+                                break
                 except json.JSONDecodeError:
                     pass
 
@@ -291,10 +345,14 @@ class SysStatParser:
 
             return SmartInfo(
                 temp=temp_str,
+                tbr=tbr,
+                tbw=tbw,
                 health=health_str,
                 power_cycles=p_cycles,
                 power_on_hours=p_hours,
+                unsafe_shutdowns=u_shut,
                 media_errors=realloc,
+                critical_warning=crit_warn,
             )
         except Exception:
             pass
@@ -306,101 +364,100 @@ class SysStatParser:
         if device.startswith(("zram", "loop", "ram", "dm", "sr", "fd", "nbd")):
             return SmartInfo()
 
-        # Parse NVMe controller data
+        # Parse NVMe controller telemetry via modern nvme-cli 3.0
         match = re.match(r"(nvme\d+)", device)
         if match:
             ctrl = match.group(1)
+            dev_target = f"/dev/{ctrl}" if Path(f"/dev/{ctrl}").exists() else f"/dev/{device}"
             try:
-                cmd = ["sudo", "-n", "nvme", "smart-log", f"/dev/{ctrl}"]
+                # Cutting-edge nvme-cli 3.0 native architecture:
+                # 1. 'nvme log smart': canonical 3.0 subcommand replacing deprecated 'smart-log'
+                # 2. '-o json' & '--output-format-version=2': script-friendly standardized JSON schema
+                # 3. '--timeout=1500': hardware IOCTL timeout preventing D-state kernel hangs
+                # 4. '--no-retries': disables retry loops on transient errors for zero-stutter polling
+                cmd = [
+                    "sudo", "-n", "nvme", "log", "smart", dev_target,
+                    "-o", "json",
+                    "--output-format-version=2",
+                    "--timeout=1500",
+                    "--no-retries",
+                ]
                 res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
-                if res.returncode == 0:
-                    temp_base = "N/A"
-                    t_sensors: list[str] = []
-                    health = "N/A"
-                    tbr = "N/A"
-                    tbw = "N/A"
-                    power_cycles = "N/A"
-                    power_on_hours = "N/A"
-                    unsafe_shutdowns = "N/A"
-                    media_errors = "N/A"
-                    critical_warning = "N/A"
-                    therm_t1 = "N/A"
+                if res.returncode == 0 and res.stdout:
+                    stdout_str = res.stdout.strip()
+                    if "{" in stdout_str and "}" in stdout_str:
+                        json_str = stdout_str[stdout_str.find("{"):stdout_str.rfind("}") + 1]
+                        data = json.loads(json_str)
 
-                    for line in res.stdout.splitlines():
-                        line = line.strip()
-                        if not line or ":" not in line:
-                            continue
+                        # Temperature (Kelvin in nvme-cli 3.0 JSON schema, converted to Celsius)
+                        raw_temps: list[str] = []
+                        temp_raw = data.get("temperature")
+                        if temp_raw is not None:
+                            t_c = temp_raw - 273 if temp_raw > 200 else temp_raw
+                            raw_temps.append(str(t_c))
 
-                        key, val = (p.strip() for p in line.split(":", 1))
+                        for i in range(1, 9):
+                            ts_raw = data.get(f"temperature_sensor_{i}")
+                            if ts_raw is not None and ts_raw > 0:
+                                ts_c = ts_raw - 273 if ts_raw > 200 else ts_raw
+                                s_str = str(ts_c)
+                                if s_str not in raw_temps and len(raw_temps) < 3:
+                                    raw_temps.append(s_str)
 
-                        if key == "temperature":
-                            temp_base = val.split("(")[0].strip().replace(" ", "")
-                        elif key.startswith("Temperature Sensor"):
-                            t_sensors.append(val.split("(")[0].strip().replace(" ", ""))
-                        elif key == "percentage_used":
-                            clean_val = val.replace("%", "").strip()
-                            try:
-                                health = f"{max(0, 100 - int(clean_val))}%"
-                            except ValueError:
-                                pass
-                        elif key == "Data Units Read":
-                            tbr = val.split("(")[1].replace(")", "").strip() if "(" in val else val
-                        elif key == "Data Units Written":
-                            tbw = val.split("(")[1].replace(")", "").strip() if "(" in val else val
-                        elif key == "power_cycles":
-                            power_cycles = val
-                        elif key == "power_on_hours":
-                            power_on_hours = val
-                        elif key == "unsafe_shutdowns":
-                            unsafe_shutdowns = val
-                        elif key == "media_errors":
-                            media_errors = val
-                        elif key == "critical_warning":
-                            critical_warning = val
-                        elif key == "Thermal Management T1 Total Time":
-                            therm_t1 = f"{val}s" if val.isdigit() else val
-
-                    raw_temps: list[str] = []
-                    if temp_base != "N/A":
-                        raw_temps.append(temp_base)
-                    for ts in t_sensors[:3]:
-                        if ts != temp_base and ts not in raw_temps:
-                            raw_temps.append(ts)
-
-                    if not raw_temps:
-                        temp_str = "N/A"
-                    else:
-                        clean_nums: list[str] = []
-                        unit = "°C"
-                        for t in raw_temps:
-                            num = t.replace("°C", "").replace("C", "").replace("°F", "").replace("F", "").strip()
-                            if "F" in t:
-                                unit = "°F"
-                            if num:
-                                clean_nums.append(num)
-                        if not clean_nums:
+                        if not raw_temps:
                             temp_str = "N/A"
-                        elif len(clean_nums) <= 2:
-                            temp_str = " │ ".join(f"{n}{unit}" for n in clean_nums)
+                        elif len(raw_temps) <= 2:
+                            temp_str = " │ ".join(f"{n}°C" for n in raw_temps)
                         else:
-                            temp_str = f"{' │ '.join(clean_nums)}{unit}"
+                            temp_str = f"{' │ '.join(raw_temps)}°C"
 
-                    return SmartInfo(
-                        temp=temp_str,
-                        tbr=tbr,
-                        tbw=tbw,
-                        health=health,
-                        power_cycles=power_cycles,
-                        power_on_hours=power_on_hours,
-                        unsafe_shutdowns=unsafe_shutdowns,
-                        media_errors=media_errors,
-                        critical_warning=critical_warning,
-                        therm_t1=therm_t1,
-                    )
+                        # Drive Health (Percentage Used)
+                        health = "N/A"
+                        pct_used = data.get("percent_used", data.get("percentage_used"))
+                        if pct_used is not None:
+                            try:
+                                health = f"{max(0, 100 - int(pct_used))}%"
+                            except (ValueError, TypeError):
+                                pass
+
+                        # TBR / TBW (Data Units Read/Written scaled to SI standard)
+                        dur = data.get("data_units_read")
+                        tbr = format_nvme_units(dur) if dur is not None else "N/A"
+                        duw = data.get("data_units_written")
+                        tbw = format_nvme_units(duw) if duw is not None else "N/A"
+
+                        # Hardware Lifecycle & Media Reliability Counters
+                        power_cycles = str(data.get("power_cycles", "N/A"))
+                        power_on_hours = str(data.get("power_on_hours", "N/A"))
+                        unsafe_shutdowns = str(data.get("unsafe_shutdowns", "N/A"))
+                        media_errors = str(data.get("media_errors", "N/A"))
+
+                        # Critical Warning (numeric or structured mask)
+                        cw = data.get("critical_warning", "N/A")
+                        if isinstance(cw, dict):
+                            cw = cw.get("value", "N/A")
+                        critical_warning = str(cw) if cw is not None else "N/A"
+
+                        # Thermal Throttling T1 Time
+                        t1 = data.get("thm_temp1_total_time")
+                        therm_t1 = f"{t1}s" if t1 is not None and str(t1).isdigit() else "N/A"
+
+                        return SmartInfo(
+                            temp=temp_str,
+                            tbr=tbr,
+                            tbw=tbw,
+                            health=health,
+                            power_cycles=power_cycles,
+                            power_on_hours=power_on_hours,
+                            unsafe_shutdowns=unsafe_shutdowns,
+                            media_errors=media_errors,
+                            critical_warning=critical_warning,
+                            therm_t1=therm_t1,
+                        )
             except Exception:
                 pass
 
-        # Fallback for SATA SSD, HDD, USB drives
+        # Fallback for SATA SSD, HDD, USB drives (or when nvme CLI is not authorized)
         return SysStatParser._get_smartctl_data(device)
 
     @staticmethod
@@ -641,8 +698,8 @@ class DriveWidget(Static, can_focus=True):
         r_spark, self.peak_read = self.generate_sparkline(self.history_read, self.peak_read, width=16, color_hex=SUCCESS)
         w_spark, self.peak_write = self.generate_sparkline(self.history_write, self.peak_write, width=16, color_hex=ACCENT)
 
-        err_col = SUCCESS if str(smart.media_errors) == "0" else ERROR
-        crit_col = SUCCESS if str(smart.critical_warning) == "0" else ERROR
+        err_col = SUCCESS if str(smart.media_errors).strip() in ("0", "0x0", "0x00") or smart.media_errors == 0 else ERROR
+        crit_col = SUCCESS if str(smart.critical_warning).strip() in ("0", "0x0", "0x00") or smart.critical_warning == 0 else ERROR
 
         r_spd = format_rate(r_mb_s * 1048576)
         w_spd = format_rate(w_mb_s * 1048576)
