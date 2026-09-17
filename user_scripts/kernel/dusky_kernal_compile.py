@@ -5108,6 +5108,26 @@ def _ops_virt(mx: Matrix, p: KernelProfile, d: Derived) -> None:
             mx.y(sym, why="portable_package paravirt/virtio support", optional=True)
 
 
+def _has_nvidia_dkms(dkms_modules: Iterable[str]) -> bool:
+    return any("nvidia" in m.lower() for m in dkms_modules)
+
+
+def _gpu_hide_active() -> bool:
+    try:
+        state = Path("/var/lib/gpu-disable/state.json").read_text(encoding="utf-8", errors="replace")
+        if '"action":"disabled"' in state.replace(" ", ""):
+            return True
+    except OSError:
+        pass
+    try:
+        cmdline = Path("/proc/cmdline").read_text(encoding="utf-8", errors="replace")
+        if "vfio-pci.ids=" in cmdline.replace("vfio_pci.", "vfio-pci."):
+            return True
+    except OSError:
+        pass
+    return False
+
+
 def _ops_gpu(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     f = d.facts
     gpus = set(f.gpus)
@@ -5124,8 +5144,27 @@ def _ops_gpu(mx: Matrix, p: KernelProfile, d: Derived) -> None:
         mx.m("DRM_I915", why="Intel GPU present/portable")
         mx.m("DRM_XE", why="Intel GPU present/portable")
         mx.y("DRM_XE_DISPLAY", optional=True)
-    if ("nvidia" in gpus or portable) and "nvidia" not in " ".join(f.dkms_modules):
-        mx.m("DRM_NOUVEAU", why="NVIDIA GPU without nvidia-dkms")
+    if _gpu_hide_active() and not portable:
+        warn("gpu-disable-toggle looks ACTIVE (state=disabled or vfio-pci.ids on cmdline): "
+             "PCI telemetry may be blind to the NVIDIA card, so this kernel may omit its "
+             "driver. If you want the dGPU in this kernel, --enable it first and re-run "
+             "'modprobed-db store' before rebuilding; if the disable is intentional, ignore this.")
+    if "nvidia" in gpus or portable:
+        nvidia_dkms = _has_nvidia_dkms(f.dkms_modules)
+        rc_target = "-rc" in d.version.lower()
+        if portable or not nvidia_dkms or rc_target:
+            if portable:
+                reason = "portable target (host DKMS says nothing about the target machine)"
+            elif not nvidia_dkms:
+                reason = (f"NVIDIA GPU without nvidia-dkms "
+                          f"({', '.join(f.dkms_modules) or 'no DKMS'} installed)")
+            else:
+                reason = (f"NVIDIA + nvidia-dkms but target {d.version} is -rc "
+                          f"(DKMS routinely fails on rc trees; fallback keeps GPU alive)")
+            mx.m("DRM_NOUVEAU", why=reason)
+        else:
+            debug(f"skipping DRM_NOUVEAU: NVIDIA + {', '.join(f.dkms_modules)} on stable "
+                  f"{d.version} (proprietary covers the card)")
     if (gpus & {"virtio", "qxl", "bochs", "vmware"}) or portable or p.name == "vm_guest" or _is_virt_target(p, f)[0]:
         for sym in ("DRM_VIRTIO_GPU", "DRM_QXL", "DRM_BOCHS", "DRM_VMWGFX"):
             mx.m(sym, optional=True)
