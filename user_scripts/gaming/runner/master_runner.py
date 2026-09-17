@@ -1784,6 +1784,10 @@ DEFAULT_CONFIG_TOML: Final = '''\
 # ==============================================================================
 schema = 3
 
+# Declarative config patches (JSON, INI, CFG) applied dynamically before launch.
+# Supports template tokens: {width}, {height}, {refresh}, {display_mode}, {display_mode_lower}, {gpu_name}, {user}, {game_dir}, {root_dir}, {prefix_dir}
+config_patches        = []
+
 [runner]
 auto_mount            = true      # mount DwarFS/overlay before launch
 auto_unmount_on_exit  = true
@@ -1794,6 +1798,7 @@ inhibit_idle          = true
 inhibit_sleep         = true
 notifications         = true
 kill_grace_s          = 8.0       # SIGTERM -> SIGKILL escalation window
+enable_io_shim        = true      # preload runner_shim.so for DwarFS/Mono quirks
 
 [storage]
 dwarfs_cache_percent  = 25        # percent of MemAvailable, clamped 64 MiB..8 GiB
@@ -1811,7 +1816,11 @@ union_backend         = "fuse-overlayfs"
 
 [graphics]
 gpu                   = "auto"    # auto|discrete|integrated|primary|nvidia|amd|intel
+wayland_native        = true      # Wine waylanddrv pure Wayland presentation
 prefer_xwayland       = false     # pure Wayland by default
+vulkan_icd            = "auto"    # auto|nvidia|radv|intel
+radv_perftest         = ""        # RADV debugging/tuning (e.g. sam, rt, aco)
+raytracing            = false     # DXR / raytracing via VKD3D / RADV
 hdr                   = false
 gl_threaded           = true
 vsync                 = "default" # default|on|off
@@ -1827,15 +1836,18 @@ height                = 0
 output_width          = 0
 output_height         = 0
 refresh_rate          = 0
+unfocused_refresh     = 0         # -o <hz> when unfocused (0 = uncapped)
 scaler                = ""        # auto|integer|fit|fill|stretch
 filter                = ""        # linear|nearest|fsr|nis|pixel
 fsr_sharpness         = 5         # 0 (sharpest) .. 20 (softest)
 adaptive_sync         = false
 immediate_flips       = false     # DRM backend only
-force_grab_cursor     = false
-grab_keyboard         = false
+force_grab_cursor     = false     # --force-grab-cursor
+grab_keyboard         = false     # -g
 realtime              = true      # --rt
 hdr                   = false
+hdr_itm               = false     # --hdr-itm-enable (SDR to HDR inverse tone mapping)
+expose_wayland        = true      # --expose-wayland to nested clients
 xwayland_count        = 0
 mangoapp              = true      # use --mangoapp instead of MANGOHUD=1 inside
 extra_args            = []
@@ -1872,24 +1884,30 @@ debug                 = "-all"
 large_address_aware   = true
 dxvk                  = true
 vkd3d                 = true
+vkd3d_config          = ""
 dxvk_nvapi            = false
 hide_wine             = false
+reprovision           = false
 disable_menubuilder   = true
 dll_overrides         = {}
 redistributables      = []
 winetricks            = []
 
+[runtime.umu]
+game_id               = ""
+store                 = "none"
+proton                = "GE-Proton"
+verb                  = "waitforexitandrun"
+protonfixes           = true
+
 [sandbox]
 enabled               = false
+sandbox_home          = ""
 bind_gpu              = true
 bind_audio            = true
 bind_wayland          = true
 bind_network          = false
 isolate_home          = true
-
-# Declarative config patches (JSON, INI, CFG) applied dynamically before launch.
-# Supports template tokens: {width}, {height}, {refresh}, {display_mode}, {gpu_name}, {user}, {game_dir}
-config_patches        = []
 
 [hooks]
 pre_mount   = []
@@ -2134,6 +2152,7 @@ class ProfileManager:
             "ROOT": str(self.root),
             "HOME": str(HOME),
             "USER": os.environ.get("USER") or HOME.name,
+            "ZRAM": "/mnt/zram1",
             "XDG_DATA_HOME": str(XDG_DATA_HOME),
             "XDG_CONFIG_HOME": str(XDG_CONFIG_HOME),
             "XDG_CACHE_HOME": str(XDG_CACHE_HOME),
@@ -2144,6 +2163,7 @@ class ProfileManager:
         }
         ctx = dict(base_ctx)
         ctx["PROFILE_ID"] = pid
+        ctx["GAME_ID"] = pid
         ctx["GAME_DIR"] = expand_str(game_dir, base_ctx)
         cfg = expand_tree(cfg, ctx)
 
@@ -3172,7 +3192,8 @@ class EnvironmentBuilder:
 
     def stage_session(self, *, under_gamescope: bool) -> None:
         gfx = self.p.sect("graphics")
-        xwayland = bool(gfx.get("prefer_xwayland", False))
+        wayland_native = gfx.get("wayland_native")
+        xwayland = bool(gfx.get("prefer_xwayland", False)) or (wayland_native is False)
 
         # The environment we build is inherited by the WHOLE pipeline, gamescope
         # included. gamescope --backend wayland needs the *host* WAYLAND_DISPLAY
@@ -3330,6 +3351,14 @@ class EnvironmentBuilder:
 
         # --- Vulkan driver resolution -------------------------------------
         icds = gpu.icds()
+        icd_override = str(gfx.get("vulkan_icd", "auto") or "auto").strip().lower()
+        if icd_override and icd_override != "auto":
+            matched = [
+                i for i in vulkan_icds()
+                if icd_override in i.vendor or icd_override in i.manifest.name.lower() or icd_override in i.library.lower()
+            ]
+            if matched:
+                icds = tuple(matched)
         if icds:
             # VK_DRIVER_FILES is the current spec name; VK_ICD_FILENAMES is
             # explicitly deprecated by the loader and is NOT set here.
@@ -3337,7 +3366,7 @@ class EnvironmentBuilder:
             self.notes["vulkan"] = ", ".join(sorted({i.library for i in icds}))
         else:
             Log.warn(
-                f"no Vulkan ICD manifest matched vendor {gpu.vendor!r} -- "
+                f"no Vulkan ICD manifest matched vendor {gpu.vendor!r} (override={icd_override!r}) -- "
                 "leaving loader discovery untouched"
             )
         # Even with explicit driver files, the Mesa device-select layer can
@@ -3962,7 +3991,7 @@ class PipelineBuilder:
             Log.warn(f"fps_limit={fps} exceeds output refresh {rate} Hz")
 
         argv: list[str] = ["gamescope", "--backend", backend]
-        if backend == "wayland":
+        if backend == "wayland" and bool(gs.get("expose_wayland", True)):
             # Without --expose-wayland a Wayland-native client (Proton's Wayland
             # driver, SDL3, Godot 4) cannot bind xdg-shell inside gamescope and
             # silently falls back to Xwayland.
