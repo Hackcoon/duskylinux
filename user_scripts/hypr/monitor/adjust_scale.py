@@ -47,7 +47,8 @@ XDG_RUNTIME_DIR: Final = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gett
 
 CONFIG_DIR: Final = XDG_CONFIG_HOME / "hypr" / "edit_here" / "source"
 CONFIG_FILE: Final = CONFIG_DIR / "monitors.lua"
-LOCK_FILE: Final = XDG_RUNTIME_DIR / f"hypr-monitor-{os.getuid()}.lock"
+LOCK_FILE: Final = XDG_RUNTIME_DIR / f"hypr-adjust-scale-{os.getuid()}.lock"
+CONFIG_LOCK: Final = XDG_RUNTIME_DIR / f"hypr-monitors-lua-{os.getuid()}.lock"
 
 NOTIFY_APP: Final = "hypr-monitor"
 NOTIFY_TAG: Final = "hypr-monitor"
@@ -122,22 +123,63 @@ def guard_environment() -> None:
 
 _LOCK_HANDLE: Any = None
 
-def acquire_lock(wait: float = 2.0) -> bool:
+def acquire_debounce_lock(lock_path: Path, min_interval: float = 0.15) -> bool:
+    """Non-blocking flock with monotonic timestamp debounce.
+
+    If an operation is currently active, or if less than min_interval seconds
+    have elapsed since the last operation, drops the invocation immediately
+    (zero waiting, zero queueing). This prevents runaway cascades when a keybind
+    is held down under Hyprland key-repeat.
+    """
     global _LOCK_HANDLE
-    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    LOCK_FILE.touch(exist_ok=True)
-    handle = open(LOCK_FILE, "r+b")
-    deadline = time.monotonic() + max(0.0, wait)
-    while True:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            _LOCK_HANDLE = handle
-            return True
-        except BlockingIOError:
-            if time.monotonic() >= deadline:
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        handle = open(fd, "r+b", buffering=0)
+    except OSError as exc:
+        log_warn(f"Failed to open lockfile {lock_path}: {exc}")
+        return False
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        handle.close()
+        return False
+
+    now = time.monotonic()
+    try:
+        raw = handle.read().decode("ascii", errors="ignore").strip()
+        if raw:
+            elapsed = now - float(raw)
+            if 0.0 <= elapsed < min_interval:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
                 handle.close()
                 return False
-            time.sleep(0.05)
+    except (ValueError, OSError):
+        pass
+
+    try:
+        handle.seek(0)
+        handle.truncate(0)
+        handle.write(f"{now:.6f}\n".encode("ascii"))
+        handle.flush()
+    except OSError:
+        pass
+
+    _LOCK_HANDLE = handle
+    return True
+
+def update_debounce_timestamp() -> None:
+    """Updates the monotonic timestamp in the lockfile to mark operation completion."""
+    global _LOCK_HANDLE
+    if _LOCK_HANDLE is not None:
+        try:
+            _LOCK_HANDLE.seek(0)
+            _LOCK_HANDLE.truncate(0)
+            _LOCK_HANDLE.write(f"{time.monotonic():.6f}\n".encode("ascii"))
+            _LOCK_HANDLE.flush()
+        except OSError:
+            pass
 
 # ---------------------------------------------------------------------------
 # 3. IPC Helpers (hyprctl eval + keyword fallback)
@@ -553,24 +595,30 @@ def read_config() -> str:
 def atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     real = path.resolve() if path.exists() else path
-    fd, tmp = tempfile.mkstemp(dir=real.parent, prefix=".monitors.lua.")
-    tmp_path = Path(tmp)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        mode = real.stat().st_mode if real.exists() else 0o644
-        os.chmod(tmp_path, mode & 0o7777)
-        os.replace(tmp_path, real)
-        dir_fd = os.open(real.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    CONFIG_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_LOCK, "a+b") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
         try:
-            os.fsync(dir_fd)
+            fd, tmp = tempfile.mkstemp(dir=real.parent, prefix=".monitors.lua.")
+            tmp_path = Path(tmp)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
+                mode = real.stat().st_mode if real.exists() else 0o644
+                os.chmod(tmp_path, mode & 0o7777)
+                os.replace(tmp_path, real)
+                dir_fd = os.open(real.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError as exc:
+                tmp_path.unlink(missing_ok=True)
+                raise HyprError(f"Atomic write to {real} failed: {exc}") from exc
         finally:
-            os.close(dir_fd)
-    except OSError as exc:
-        tmp_path.unlink(missing_ok=True)
-        raise HyprError(f"Atomic write to {real} failed: {exc}") from exc
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
 def show_diff(old: str, new: str) -> None:
     diff = list(difflib.unified_diff(
@@ -630,6 +678,10 @@ def run() -> int:
     if actions_given > 1:
         parser.error("choose exactly one of: direction (+/-), --set, --list, --show")
 
+    if not (args.show or args.list or args.dry_run):
+        if not acquire_debounce_lock(LOCK_FILE, min_interval=0.15):
+            return 0
+
     guard_environment()
 
     mon = pick_monitor(list_monitors(), args.monitor)
@@ -670,10 +722,6 @@ def run() -> int:
             s_str = fmt_scale(n)
             bullet = "●" if n == cur_n else "○"
             print(f"  {bullet} {s_str:>8}  →  {lw}x{lh} logical")
-        return 0
-
-    if not (args.dry_run or args.no_write) and not acquire_lock(wait=2.0):
-        log_warn("Another monitor operation is in flight — dropping invocation.")
         return 0
 
     if args.explicit_scale is not None:
@@ -736,6 +784,8 @@ def run() -> int:
             f"{name}: Compositor failed to apply scale {literal} (reported {actual_val}). "
             f"{CONFIG_FILE.name} left untouched."
         )
+
+    update_debounce_timestamp()
 
     # 5) Persist to disk only after verification succeeds
     if not args.no_write:
