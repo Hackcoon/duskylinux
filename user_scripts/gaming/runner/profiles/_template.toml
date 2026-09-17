@@ -246,7 +246,23 @@ bind_wayland = true                            # Passthrough Wayland compositor 
 bind_network = false                           # Block network / internet sockets
 
 # ------------------------------------------------------------------------------
-# 13. Lifecycle Hooks [hooks]
+# 13. Declarative Config Patches [[config_patches]]
+# ------------------------------------------------------------------------------
+# Declaratively patch JSON, INI, or CFG game settings files before launch.
+# Supports dynamic tokens: {width}, {height}, {refresh}, {display_mode}, {gpu_name}, {user}, {game_dir}
+# Example:
+# [[config_patches]]
+# file = "AppData/Local/GameName/settings.json"
+# format = "json"                              # "json" | "ini" | "cfg"
+# delete = ["AppData/Local/GameName/crash.ini"] # Optional files to clean up
+# [config_patches.set]
+# DisplayMode = "{display_mode}"               # "Window" on pure Wayland, "Borderless" under gamescope
+# Resolution = "{width}x{height}"
+# RefreshRate = "{refresh}"
+# SelectedGPU = "{gpu_name}"
+
+# ------------------------------------------------------------------------------
+# 14. Lifecycle Hooks [hooks]
 # ------------------------------------------------------------------------------
 [hooks]
 pre_mount    = []                              # Commands before mounting FUSE layers
@@ -256,7 +272,7 @@ post_launch  = []                              # Commands immediately after proc
 post_unmount = []                              # Commands after unmounting FUSE layers
 
 # ------------------------------------------------------------------------------
-# 14. Custom Environment Variables [env]
+# 15. Custom Environment Variables [env]
 # ------------------------------------------------------------------------------
 [env]
 # Key-value environment variables injected into the game process pipeline.
@@ -266,7 +282,7 @@ post_unmount = []                              # Commands after unmounting FUSE 
 # VKD3D_CONFIG = "force_static_cbv"
 
 # ------------------------------------------------------------------------------
-# 15. Hardware & Session Conditional Overlays [when.<predicate>]
+# 16. Hardware & Session Conditional Overlays [when.<predicate>]
 # (Applied automatically when the active system satisfies the predicate)
 # Available predicates: nvidia, amd, intel, hybrid, ntsync, hdr_output, hyprland, kernel_ge_7_1
 # ------------------------------------------------------------------------------

@@ -20,6 +20,7 @@
 """Master Game Runner Engine - declarative launcher for Arch Linux / Wayland."""
 
 import argparse
+import configparser
 import errno
 import fcntl
 import hashlib
@@ -1886,6 +1887,10 @@ bind_wayland          = true
 bind_network          = false
 isolate_home          = true
 
+# Declarative config patches (JSON, INI, CFG) applied dynamically before launch.
+# Supports template tokens: {width}, {height}, {refresh}, {display_mode}, {gpu_name}, {user}, {game_dir}
+config_patches        = []
+
 [hooks]
 pre_mount   = []
 post_mount  = []
@@ -2807,6 +2812,25 @@ class WinePrefix:
             if not r.ok:
                 Log.trace(f"reg add {key}\\{name} -> {r.message}")
 
+    def clean_stale_crash_markers(self) -> int:
+        """Remove lingering crash reporter markers that cause games to boot into safe mode."""
+        users = self.drive_c / "users"
+        if not users.is_dir():
+            return 0
+        removed = 0
+        with suppress(OSError):
+            for u in users.iterdir():
+                if not u.is_dir() or u.is_symlink() or u.name in ("Public", "Default"):
+                    continue
+                appdata = u / "AppData" / "Local"
+                if not appdata.is_dir():
+                    continue
+                for marker in appdata.glob("**/~CrashRpt.ini"):
+                    with suppress(OSError):
+                        marker.unlink()
+                        removed += 1
+        return removed
+
     def link_translators(
         self,
         *,
@@ -3008,6 +3032,8 @@ class WinePrefix:
             if pruned:
                 Log.debug(f"pruned {pruned} dangling prefix symlinks")
             self.unify_user_dirs()
+            self.suppress_crash_dialogs(env)
+            self.clean_stale_crash_markers()
 
             if needs_provision:
                 self._install_redists(env, root_dir, redistributables)
@@ -3162,16 +3188,29 @@ class EnvironmentBuilder:
                     "gamescope wayland backend selected but WAYLAND_DISPLAY is "
                     "unset -- use backend='drm' or 'headless'"
                 )
-            self._set("SDL_VIDEODRIVER", "x11" if xwayland else "wayland")
-            self._set("QT_QPA_PLATFORM", "xcb" if xwayland else "wayland")
-            self._set("GDK_BACKEND", "x11" if xwayland else "wayland")
+            is_wine_rt = str(self.p.get("runtime.type", "native")) in ("wine", "proton", "umu")
+            # Under gamescope, Wine/Proton games should always route via gamescope's
+            # X11 server (winex11.drv) where mode changes, resolution switches, and
+            # cursor grabs are virtualized seamlessly with zero Wayland protocol stalls.
+            force_x11 = xwayland or is_wine_rt
+            self._set("SDL_VIDEODRIVER", "x11" if force_x11 else "wayland")
+            self._set("QT_QPA_PLATFORM", "xcb" if force_x11 else "wayland")
+            self._set("GDK_BACKEND", "x11" if force_x11 else "wayland")
             # ENABLE_GAMESCOPE_WSI routes the client's VK_KHR_swapchain through
             # the gamescope WSI layer; it is mandatory for HDR passthrough and
             # for gamescope's own frame limiter to see real present timings.
             self._set("ENABLE_GAMESCOPE_WSI", "1")
-            self._set("PROTON_ENABLE_WAYLAND", "0" if xwayland else "1")
+            self._set("PROTON_ENABLE_WAYLAND", "0" if force_x11 else "1")
             self.notes["session"] = "gamescope-nested"
             return
+
+        out = active_output()
+        if out.width and out.height:
+            self._set("MASTER_RUNNER_DISPLAY_WIDTH", str(out.width))
+            self._set("MASTER_RUNNER_DISPLAY_HEIGHT", str(out.height))
+            self._set("MASTER_RUNNER_DISPLAY_REFRESH", str(int(round(out.refresh_hz))))
+            self._set("MASTER_RUNNER_DISPLAY_SCALE", str(out.scale))
+            self._set("MASTER_RUNNER_DISPLAY_NAME", out.name)
 
         if xwayland:
             self._set("SDL_VIDEODRIVER", "x11")
@@ -3474,6 +3513,13 @@ class EnvironmentBuilder:
                 overrides[k.strip()] = v.strip()
         if bool(wcfg.get("disable_menubuilder", True)):
             overrides["winemenubuilder.exe"] = ""
+        # Default native-first overrides for translators when enabled:
+        if bool(wcfg.get("dxvk", True)):
+            for dll in ("dxgi", "d3d11", "d3d9", "d3d10core"):
+                overrides.setdefault(dll, "n,b")
+        if bool(wcfg.get("vkd3d", True)):
+            for dll in ("d3d12", "d3d12core"):
+                overrides.setdefault(dll, "n,b")
         declared = wcfg.get("dll_overrides")
         if isinstance(declared, Mapping):
             for k, v in declared.items():
@@ -3575,6 +3621,13 @@ class EnvironmentBuilder:
         self._set("SteamAppId", "0")
         self._set("MASTER_RUNNER_PROFILE", self.p.pid)
         self._set("MASTER_RUNNER_VERSION", ENGINE_VERSION)
+        self._set("MASTER_RUNNER_GAME_DIR", str(self.paths.game_dir))
+        self._set("MASTER_RUNNER_ROOT", str(self.paths.root))
+        self._set("MASTER_RUNNER_DIR", str(SELF_PATH.parent))
+        self._set("MASTER_RUNNER_LIB_DIR", str(SELF_PATH.parent / "lib"))
+        if self.paths.prefix_dir:
+            self._set("MASTER_RUNNER_PREFIX_DIR", str(self.paths.prefix_dir))
+        self._set("MASTER_RUNNER_UNDER_GAMESCOPE", "1" if under_gamescope else "0")
 
     def stage_runtime_shims(self) -> None:
         if not bool(self.p.get("runner.enable_io_shim", True)):
@@ -3611,6 +3664,8 @@ class EnvironmentBuilder:
         self.stage_shader_cache()
         self.stage_wine(dry_run=self.dry_run)
         self.stage_overlays(under_gamescope=under_gamescope)
+        # Re-apply explicit profile [env] so user overrides always take final precedence:
+        self.stage_profile_env()
         # Strip empty values: an empty DISPLAY is *not* the same as an unset one
         # for SDL and Wine.
         return {k: v for k, v in self.env.items() if v != ""}
@@ -3674,6 +3729,200 @@ def parse_affinity(spec: str) -> list[int]:
             with suppress(ValueError):
                 out.append(int(chunk))
     return [c for c in dict.fromkeys(out) if c in set(online)]
+
+
+class ConfigPatcher:
+    """Dynamic declarative configuration patcher for game settings files.
+
+    Eliminates the need for per-game pre-launch scripts. Allows profiles to
+    declaratively patch JSON, INI, and Key-Value configuration files before
+    launch, injecting dynamic screen geometry, display modes, and GPU bindings.
+    """
+
+    @staticmethod
+    def apply(
+        prof: Profile,
+        paths: GamePaths,
+        *,
+        env: Mapping[str, str],
+        under_gamescope: bool = False,
+        dry_run: bool = False,
+    ) -> None:
+        patches = prof.get("config_patches")
+        if not patches or not isinstance(patches, list):
+            return
+
+        out = active_output()
+        w = int(env.get("MASTER_RUNNER_DISPLAY_WIDTH") or out.width or 1920)
+        h = int(env.get("MASTER_RUNNER_DISPLAY_HEIGHT") or out.height or 1080)
+        r = int(env.get("MASTER_RUNNER_DISPLAY_REFRESH") or round(out.refresh_hz) or 60)
+        gpu = str(env.get("DXVK_FILTER_DEVICE_NAME") or env.get("VKD3D_FILTER_DEVICE_NAME") or "")
+        if not gpu:
+            for g in gpus():
+                if g.is_discrete:
+                    gpu = g.name
+                    break
+        if not gpu:
+            gpu = gpus()[0].name if gpus() else "Unknown GPU"
+
+        mode_wayland = "Borderless" if under_gamescope else "Window"
+        mode_wayland_lower = mode_wayland.lower()
+
+        context: dict[str, str] = {
+            "width": str(w),
+            "height": str(h),
+            "refresh": str(r),
+            "display_mode": mode_wayland,
+            "display_mode_lower": mode_wayland_lower,
+            "gpu_name": gpu,
+            "game_dir": str(paths.game_dir),
+            "root_dir": str(paths.root),
+            "prefix_dir": str(paths.prefix_dir or ""),
+            "user": os.environ.get("USER") or HOME.name,
+        }
+
+        for patch in patches:
+            if not isinstance(patch, Mapping):
+                continue
+            ConfigPatcher._apply_one(patch, paths, context, dry_run=dry_run)
+
+    @staticmethod
+    def _resolve_targets(pattern: str, paths: GamePaths) -> list[Path]:
+        p = Path(pattern)
+        if p.is_absolute():
+            return [p]
+
+        prefix = paths.prefix_dir
+        if prefix and prefix.is_dir():
+            users_dir = prefix / "drive_c" / "users"
+            norm = pattern.replace("\\", "/")
+            if norm.startswith("AppData/"):
+                sub = norm[8:].lstrip("/")
+                targets: list[Path] = []
+                if users_dir.is_dir():
+                    for u in users_dir.iterdir():
+                        if u.is_dir() and not u.is_symlink() and u.name not in ("Public", "Default"):
+                            targets.append(u / "AppData" / sub)
+                if not targets:
+                    me = os.environ.get("USER") or HOME.name
+                    targets.append(users_dir / me / "AppData" / sub)
+                return targets
+            if norm.startswith("drive_c/"):
+                return [prefix / norm]
+            if norm.startswith("users/"):
+                return [prefix / "drive_c" / norm]
+
+        return [paths.game_dir / pattern]
+
+    @staticmethod
+    def _format_val(val: Any, context: dict[str, str], orig: Any = None) -> Any:
+        if isinstance(val, str):
+            try:
+                formatted = val.format(**context)
+            except KeyError:
+                formatted = val
+            if isinstance(orig, bool):
+                if formatted.lower() in ("true", "1", "yes"):
+                    return True
+                if formatted.lower() in ("false", "0", "no"):
+                    return False
+            elif isinstance(orig, int) and not isinstance(orig, bool):
+                with suppress(ValueError):
+                    return int(formatted)
+            elif isinstance(orig, float):
+                with suppress(ValueError):
+                    return float(formatted)
+            elif orig is None and formatted.isdigit():
+                return int(formatted)
+            return formatted
+        return val
+
+    @staticmethod
+    def _apply_one(patch: Mapping[str, Any], paths: GamePaths, context: dict[str, str], dry_run: bool) -> None:
+        file_pat = str(patch.get("file") or "")
+        fmt = str(patch.get("format") or "json").lower()
+        set_map = patch.get("set") or {}
+
+        del_patterns = patch.get("delete") or []
+        if isinstance(del_patterns, str):
+            del_patterns = [del_patterns]
+        for dp in del_patterns:
+            for t in ConfigPatcher._resolve_targets(str(dp), paths):
+                if t.is_file():
+                    if dry_run:
+                        Log.info(f"[dry-run] delete: {t}")
+                    else:
+                        with suppress(OSError):
+                            t.unlink()
+                            Log.debug(f"deleted file: {t}")
+
+        if not file_pat or not isinstance(set_map, Mapping):
+            return
+
+        targets = ConfigPatcher._resolve_targets(file_pat, paths)
+        for target in targets:
+            if fmt == "json":
+                ConfigPatcher._patch_json(target, set_map, context, dry_run=dry_run)
+            elif fmt in ("ini", "cfg"):
+                ConfigPatcher._patch_ini(target, set_map, context, dry_run=dry_run)
+
+    @staticmethod
+    def _patch_json(target: Path, set_map: Mapping[str, Any], context: dict[str, str], dry_run: bool) -> None:
+        data: dict[str, Any] = {}
+        if target.is_file():
+            with suppress(Exception):
+                data = json.loads(target.read_text(encoding="utf-8"))
+
+        for k, v in set_map.items():
+            keys = k.split(".")
+            cur = data
+            for subk in keys[:-1]:
+                if subk not in cur or not isinstance(cur[subk], dict):
+                    cur[subk] = {}
+                cur = cur[subk]
+            last_key = keys[-1]
+            orig_val = cur.get(last_key)
+            new_val = ConfigPatcher._format_val(v, context, orig_val)
+            cur[last_key] = new_val
+
+        if dry_run:
+            Log.info(f"[dry-run] patch json {target} with {len(set_map)} keys")
+        else:
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                Log.debug(f"patched json: {target}")
+            except OSError as exc:
+                Log.warn(f"failed to patch {target}: {exc}")
+
+    @staticmethod
+    def _patch_ini(target: Path, set_map: Mapping[str, Any], context: dict[str, str], dry_run: bool) -> None:
+        cp = configparser.ConfigParser()
+        if target.is_file():
+            with suppress(Exception):
+                cp.read(target, encoding="utf-8")
+
+        for k, v in set_map.items():
+            if "." in k:
+                sec, _, opt = k.partition(".")
+            else:
+                sec, opt = "DEFAULT", k
+            if not cp.has_section(sec) and sec != "DEFAULT":
+                cp.add_section(sec)
+            orig = cp.get(sec, opt, fallback=None)
+            formatted = str(ConfigPatcher._format_val(v, context, orig))
+            cp.set(sec, opt, formatted)
+
+        if dry_run:
+            Log.info(f"[dry-run] patch ini {target} with {len(set_map)} keys")
+        else:
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with open(target, "w", encoding="utf-8") as f:
+                    cp.write(f)
+                Log.debug(f"patched ini: {target}")
+            except OSError as exc:
+                Log.warn(f"failed to patch {target}: {exc}")
 
 
 class PipelineBuilder:
@@ -4224,6 +4473,18 @@ class GameSession:
                 return 78  # EX_CONFIG
 
             self._describe(argv, workdir, envb)
+
+            if envb.prefix is not None and not opts.dry_run:
+                envb.prefix.clean_stale_crash_markers()
+
+            ConfigPatcher.apply(
+                prof,
+                self.paths,
+                env=env,
+                under_gamescope=under_gs,
+                dry_run=opts.dry_run,
+            )
+
             if opts.dry_run:
                 Log.ok("dry-run complete; nothing was executed")
                 return 0
