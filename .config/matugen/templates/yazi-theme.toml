@@ -87,7 +87,7 @@ progress_error  = { fg = "{{colors.error.default.hex}}", bg = "{{colors.surface_
 
 [which]
 cols = 3
-mask = { bg = "{{colors.surface_bright.default.hex}}" }
+mask = {}
 border = { fg = "{{colors.primary.default.hex}}" }
 cand = { fg = "{{colors.primary.default.hex}}" }
 rest = { fg = "{{colors.on_surface_variant.default.hex}}" }
