@@ -3807,9 +3807,9 @@ description = ""
 [[pages.layout.items]]
 type = "button"
 [pages.layout.items.properties]
-title = "Search Keybinds"
-button_text = "Search"
-description = "Search and list all active keybindings"
+title = "Edit Keybinds"
+button_text = "Edit"
+description = "Edit custom keybindings (TUI wizard)"
 icon = "edit-find-symbolic"
 
 style = "suggested"
@@ -3820,15 +3820,16 @@ command = "kitty --class dusky_keybinds.sh --hold sh -c \"$HOME/user_scripts/hyp
 [[pages.layout.items]]
 type = "button"
 [pages.layout.items.properties]
-title = "Dusky Keybind Manager"
-button_text = "Open"
-description = "Custom keybinding wizard (TUI)"
-icon = "input-keyboard-symbolic"
+title = "Search Keybinds"
+button_text = "Search"
+description = "Search and launch keybindings via Rofi"
+icon = "edit-find-symbolic"
 
 style = "suggested"
 [pages.layout.items.on_press]
 type = "exec"
-command = "foot --app-id=dusky_tui --hold python3 $HOME/user_scripts/hypr/input/tui_keybinds.py"
+command = "$HOME/user_scripts/hypr/input/rofi_keybinds/keybindings.sh"
+terminal = false
 
 [[pages.layout.items]]
 type = "button"
@@ -3841,7 +3842,7 @@ icon = "view-grid-symbolic"
 style = "suggested"
 [pages.layout.items.on_press]
 type = "exec"
-command = "kitty --class dusky_keybinds_cheatsheet --hold sh -c \"python3 $HOME/user_scripts/hypr/input/keybinds_cheatsheet.py\""
+command = "kitty --class DuskyKeybindsCheatsheet --title \"Dusky Keybinds Cheatsheet\" -e python3.14 $HOME/user_scripts/hypr/input/keybinds_cheatsheet.py"
 
 [[pages]]
 id = "tools_and_ai"
