@@ -153,4 +153,9 @@
         background-color: var(--primary_fixed) !important;
         filter: brightness(1.1) !important;
     } */
+    /* >>> dusky:picks - managed by the Visual Picker, one rule per line */
+    button.ytSpecButtonShapeNextHost.ytSpecButtonShapeNextFilled.ytSpecButtonShapeNextMono { background-color: var(--primary_container) !important; color: var(--on_primary_container) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fbutton.ytSpecButtonShapeNextHost.ytSpecButtonShapeNextFilled.ytSpecButtonShapeNextMono%1Fbg | bg: primary_container */
+    button { color: var(--primary) !important; } /* dusky key=sel%1Fbutton%1Ftext | text: primary */
+    div.ytChipShapeChip.ytChipShapeActive.ytChipShapeOnlyTextPadding { background-color: var(--secondary_fixed_dim) !important; } /* dusky key=sel%1Fdiv.ytChipShapeChip.ytChipShapeActive.ytChipShapeOnlyTextPadding%1Fbg | bg: secondary_fixed_dim */
+    /* <<< dusky:picks */
 }
