@@ -28,5 +28,8 @@
     div.contentsPage__heading { background-color: var(--inverse_on_surface) !important; } /* dusky key=sel%1Fdiv.contentsPage__heading%1Fbg | bg: inverse_on_surface */
     div.contentsPage__section { background-color: var(--inverse_on_surface) !important; } /* dusky key=sel%1Fdiv.contentsPage__section%1Fbg | bg: inverse_on_surface */
     div.mwe-popups-container { background-color: var(--surface_container_highest) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.mwe-popups-container%1Fbg | bg: surface_container_highest */
+    #mwDA { background-color: var(--surface_container) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1F%23mwDA%1Fbg | bg: surface_container */
+    figcaption { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Ffigcaption%1Fbg | bg: surface */
+    table { background-color: var(--background) !important; color: var(--on_background) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Ftable%1Fbg | bg: background */
     /* <<< dusky:picks */
 }
