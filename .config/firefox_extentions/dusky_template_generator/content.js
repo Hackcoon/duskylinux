@@ -6,7 +6,7 @@
  *           framework signatures; generates structural themes for static sites.
  *   picker  Interactive visual picker that can target BOTH element selectors
  *           AND underlying CSS variables directly from clicked elements, with
- *           SVG fill support and automatic contrast pairing.
+ *           SVG fill support, Tailwind/Radix filtering, and automatic contrast pairing.
  *
  * Designed for Firefox 155+ and modern Arch Linux environments.
  */
@@ -134,6 +134,23 @@
   function matchKnownFramework(name) {
     const n = name.toLowerCase();
 
+    // ChatGPT Specific Tokens
+    if (n === "--gray-750") return "surface_container_highest";
+    if (n === "--gray-900") return "surface_container";
+    if (n === "--black") return "surface";
+    if (n === "--blue-400") return "primary_container";
+    if (n === "--default-theme-user-msg-text") return "surface";
+    if (n === "--message-surface") return "primary";
+    if (n === "--bg-primary") return "surface";
+    if (n === "--bg-secondary") return "surface_bright";
+    if (n === "--bg-tertiary") return "surface_container_high";
+    if (n === "--bg-elevated-secondary") return "surface_container_low";
+    if (n === "--text-primary") return "on_surface";
+    if (n === "--bg-secondary-surface") return "surface";
+    if (n.includes("sidebar-surface-primary")) return "surface_container";
+    if (n.includes("composer-surface-primary")) return "surface";
+
+    // YouTube Spec Tokens
     if (n.startsWith("--yt-spec-")) {
       if (n.includes("base-background") || n.includes("general-background-a")) return "background";
       if (n.includes("raised-background") || n.includes("menu-background")) return "surface_container";
@@ -148,6 +165,7 @@
       if (n.includes("10-percent-layer")) return "surface_variant";
     }
 
+    // Google / Gemini / Material Design
     if (n.startsWith("--gem-sys-color--") || n.startsWith("--mat-") || n.startsWith("--bard-color-")) {
       if (n.endsWith("--primary")) return "primary";
       if (n.endsWith("--on-primary")) return "on_primary";
@@ -172,6 +190,7 @@
       if (n.includes("background-color")) return "surface";
     }
 
+    // Tailwind / Shadcn / Radix UI tokens
     if (/^--(background|foreground|card|popover|primary|secondary|muted|accent|destructive|border|input|ring)(-foreground)?$/.test(n)) {
       if (n === "--background") return "surface";
       if (n === "--foreground") return "on_surface";
@@ -194,6 +213,7 @@
       if (n === "--ring") return "primary";
     }
 
+    // Discord tokens
     if (n.startsWith("--neutral-")) {
       const num = parseInt(n.replace("--neutral-", ""), 10);
       if (!isNaN(num)) {
@@ -213,12 +233,14 @@
       return "primary";
     }
 
+    // Instagram tokens
     if (n.startsWith("--ig-")) {
       if (n.includes("primary-background")) return "surface";
       if (n.includes("primary-text") || n.includes("primary-icon")) return "on_surface";
       if (n.includes("elevated-background")) return "surface_container_low";
     }
 
+    // Chess.com tokens
     if (n.startsWith("--color-gray-") || n.startsWith("--color-green-")) {
       if (n.includes("gray-800")) return "surface";
       if (n.includes("gray-700")) return "surface_container";
@@ -231,6 +253,7 @@
       if (n.includes("neutrals-white")) return "on_surface";
     }
 
+    // Telegram tokens
     if (n.startsWith("--color-") || n.startsWith("--theme-")) {
       if (n.includes("chat-hover") || n.includes("background-selected") || n.includes("gray")) return "surface_container_high";
       if (n.includes("chat-active") || n.includes("primary") || n.includes("background-own")) return "primary_container";
@@ -452,6 +475,47 @@
       groups.get(key).push(name);
     }
 
+    const host = window.location.hostname;
+
+    // Direct ChatGPT Detection & Injection
+    if (host.includes("chatgpt.com")) {
+      const chatgptTokens = [
+        ["--gray-750", "surface_container_highest"],
+        ["--gray-900", "surface_container"],
+        ["--black", "surface"],
+        ["--blue-400", "primary_container"],
+        ["--default-theme-user-msg-text", "surface"],
+        ["--message-surface", "primary"],
+        ["--bg-primary", "surface_container"],
+        ["--bg-tertiary", "surface_container_high"],
+        ["--bg-primary", "surface"],
+        ["--bg-secondary", "surface_bright"],
+        ["--bg-elevated-secondary", "surface_container_low"],
+        ["--text-primary", "on_surface"],
+        ["--bg-secondary-surface", "surface"]
+      ];
+
+      const lines = [
+        "    :root, .dark {",
+        "        color-scheme: dark !important;"
+      ];
+      for (const [v, t] of chatgptTokens) {
+        lines.push(`        ${v}: var(--${t}) !important;`);
+      }
+      lines.push("    }");
+      lines.push("");
+      lines.push("    .dark\\:bg-\\[\\#353535\\]:where(.dark, .dark *):not(:where(.dark .light, .dark .light *)) {");
+      lines.push("        background-color: var(--surface_container_high) !important;");
+      lines.push("    }");
+      lines.push("    .dark[data-oled] [data-composer-surface=\"true\"] {");
+      lines.push("        background-color: var(--surface_container) !important;");
+      lines.push("    }");
+      lines.push("    .dark\\:bg-\\[\\#171717\\]:where(.dark, .dark *):not(:where(.dark .light, .dark .light *)) {");
+      lines.push("        background-color: var(--surface_container_high) !important;");
+      lines.push("    }");
+      return { ok: true, found: chatgptTokens.length, mapped: chatgptTokens.length, body: lines.join("\n") };
+    }
+
     if (groups.size === 0) {
       const fallbackBody = generateStructuralFallback();
       return { ok: true, found: 0, mapped: 1, body: fallbackBody };
@@ -473,7 +537,6 @@
     }
     lines.push("    }");
 
-    const host = window.location.hostname;
     if (host.includes("youtube.com")) {
       lines.push("");
       lines.push("    /* YouTube Component Polish */");
@@ -483,11 +546,6 @@
       lines.push("    #logo-icon [fill=\"white\" i], .ytd-logo [fill=\"white\" i] { fill: var(--on_primary) !important; }");
       lines.push("    .ytSearchboxComponentInputBox { background-color: var(--surface_container) !important; color: var(--on_surface) !important; }");
       lines.push("    ytd-button-renderer.style-primary .yt-spec-button-shape-next--filled { background-color: var(--primary) !important; color: var(--on_primary) !important; }");
-    } else if (host.includes("chatgpt.com")) {
-      lines.push("");
-      lines.push("    /* ChatGPT Polish */");
-      lines.push("    .dark\\:bg-\\[\\#353535\\]:where(.dark, .dark *), .dark\\:bg-\\[\\#171717\\]:where(.dark, .dark *) { background-color: var(--surface_container_high) !important; }");
-      lines.push("    [data-composer-surface=\"true\"] { background-color: var(--surface_container) !important; }");
     }
 
     if (unmapped.length) {
@@ -587,6 +645,15 @@
       }
     };
 
+    // 1. Detect variables embedded inside Tailwind class names (e.g. bg-(--sidebar-surface-primary))
+    for (const cls of elm.classList) {
+      const m1 = cls.match(/^[a-z]+-\(--([a-zA-Z0-9_-]+)\)$/);
+      if (m1) addVar("--" + m1);
+      const m2 = cls.match(/^[a-z]+-token-([a-zA-Z0-9_-]+)$/);
+      if (m2) addVar("--" + m2);
+    }
+
+    // 2. Detect variables declared inline or via stylesheets
     if (elm.style) {
       for (const p of elm.style) addVar(p);
     }
@@ -792,21 +859,32 @@
     if (!S.raf) S.raf = requestAnimationFrame(() => { S.raf = 0; drawMask(); });
   }
 
+  // ─── Precision Filter: Blacklist Tailwind Utilities & Dynamic IDs ─────────
   const SKIP_CLASS = /^(is-|has-|js-|dusky)|^(active|selected|open|hover|focus|focused|visible|hidden|show|shown|collapsed|expanded|disabled|checked|current)$/;
   const HASHY = /^(css|sc|jsx|jss|svelte|emotion)-|^_[a-z0-9]+$|__[a-z0-9]{5,}$|^[^-_]*\d[^-_]*$/i;
+  const HASHY_ID = /^(radix|aria|headlessui|react-select|__next)-|^:[a-z0-9]+:$/i;
+  const TAILWIND_UTILITY = /^(flex|grid|block|inline|hidden|grow|shrink|relative|absolute|fixed|sticky|static|box-border|border-box|z-\d+|w-.*|h-.*|min-w-.*|max-w-.*|min-h-.*|max-h-.*|p-.*|px-.*|py-.*|pt-.*|pb-.*|pl-.*|pr-.*|m-.*|mx-.*|my-.*|mt-.*|mb-.*|ml-.*|mr-.*|col-.*|row-.*|items-.*|justify-.*|content-.*|self-.*|gap-.*|space-.*|cursor-.*|select-.*|touch:.*|last:.*|first:.*|group\/.*|peer\/.*|focus:.*|hover:.*|dark:.*|@.*|\[.*\]|bg-\(.*|bg-token-.*|text-token-.*|whitespace-.*|text-pretty)$/i;
+
   function goodClasses(n) {
-    const all = [...n.classList].filter((c) => !SKIP_CLASS.test(c));
-    const good = all.filter((c) => !HASHY.test(c));
-    return (good.length ? good : all).slice(0, 3);
+    const all = [...n.classList].filter((c) =>
+      !SKIP_CLASS.test(c) &&
+      !HASHY.test(c) &&
+      !TAILWIND_UTILITY.test(c) &&
+      !c.includes(":") &&
+      !c.includes("(") &&
+      !c.includes("/")
+    );
+    return all.slice(0, 3);
   }
+
   const simple = (n) => n.localName + goodClasses(n).map((c) => "." + CSS.escape(c)).join("");
-  const describe = (n) => n.localName + (n.id ? "#" + n.id : "") + goodClasses(n).map((c) => "." + c).join("");
+  const describe = (n) => n.localName + (n.id && !HASHY_ID.test(n.id) ? "#" + n.id : "") + goodClasses(n).map((c) => "." + c).join("");
   const attrStr = (v) => '"' + v.replace(/["\\]/g, "\\$&") + '"';
 
   function pathSel(n) {
     const parts = [];
     for (let cur = n; cur && cur !== document.body && cur !== document.documentElement && parts.length < 3; cur = cur.parentElement) {
-      if (cur.id && !HASHY.test(cur.id)) { parts.unshift("#" + CSS.escape(cur.id)); break; }
+      if (cur.id && !HASHY.test(cur.id) && !HASHY_ID.test(cur.id)) { parts.unshift("#" + CSS.escape(cur.id)); break; }
       let s = simple(cur);
       const siblings = cur.parentElement ? [...cur.parentElement.children] : [];
       if (siblings.some((c) => c !== cur && c.matches(s))) {
@@ -821,7 +899,7 @@
     if (!n || n === document.documentElement) return [{ sel: "html", count: 1 }];
     if (n === document.body) return [{ sel: "body", count: 1 }];
     const out = [];
-    if (n.id && !HASHY.test(n.id)) out.push("#" + CSS.escape(n.id));
+    if (n.id && !HASHY.test(n.id) && !HASHY_ID.test(n.id)) out.push("#" + CSS.escape(n.id));
     const s = simple(n);
     if (s !== n.localName) out.push(s);
     for (const a of ["role", "aria-label", "data-testid", "name"]) {
