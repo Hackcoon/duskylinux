@@ -1,5 +1,5 @@
 /* =============================================================================
- * Dusky Sites — Background Engine v5.1
+ * Dusky Sites — Background Engine v5.3
  * Firefox 153+ / Gecko / WebExtension MV3 non-persistent event page.
  *
  * ARCHITECTURE

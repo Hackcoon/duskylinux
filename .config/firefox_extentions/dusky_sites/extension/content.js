@@ -1,5 +1,5 @@
 /* =============================================================================
- * Dusky Sites — Content Runtime v5.1
+ * Dusky Sites — Content Runtime v5.3
  * Firefox 153+ / Gecko / injected at document_start into every frame.
  *
  * RESPONSIBILITIES (deliberately minimal - the page main thread is not ours)
