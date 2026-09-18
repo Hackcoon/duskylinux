@@ -190,9 +190,10 @@
       "--accent": "surface_container_high", "--accent-foreground": "on_surface",
       "--destructive": "error", "--destructive-foreground": "on_error",
       "--border": "outline_variant", "--input": "outline", "--ring": "primary",
-      "--sidebar": "surface_container", "--sidebar-foreground": "on_surface",
-      "--sidebar-primary": "primary", "--sidebar-accent": "surface_container_high",
-      "--sidebar-border": "outline_variant", "--sidebar-ring": "primary",
+      "--sidebar": "surface_container", "--sidebar-background": "surface_container",
+      "--sidebar-foreground": "on_surface", "--sidebar-primary": "primary",
+      "--sidebar-accent": "surface_container_high", "--sidebar-border": "outline_variant",
+      "--sidebar-ring": "primary",
     };
     if (shadcn[n]) return shadcn[n];
 
