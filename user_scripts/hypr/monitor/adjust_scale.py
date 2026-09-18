@@ -50,8 +50,8 @@ CONFIG_FILE: Final = CONFIG_DIR / "monitors.lua"
 LOCK_FILE: Final = XDG_RUNTIME_DIR / f"hypr-adjust-scale-{os.getuid()}.lock"
 CONFIG_LOCK: Final = XDG_RUNTIME_DIR / f"hypr-monitors-lua-{os.getuid()}.lock"
 
-NOTIFY_APP: Final = "hypr-monitor"
-NOTIFY_TAG: Final = "hypr-monitor"
+NOTIFY_APP: Final = "hypr-scale"
+NOTIFY_TAG: Final = "hypr-scale"
 
 SCALE_Q: Final = 120  # wp_fractional_scale_v1 granularity denominator
 SCALE_MIN_N: Final = 60    # 0.50x
@@ -85,9 +85,20 @@ def log_debug(msg: str) -> None:
     if DEBUG:
         print(_c("35", "[DEBUG]") + f" {msg}", file=sys.stderr)
 
-def notify(title: str, body: str, urgency: str = "low", icon: str = "video-display", ms: int = 2000) -> None:
+def _short(text: str, limit: int) -> str:
+    """Collapse whitespace and truncate with ellipsis so text fits the center pill."""
+    flat = " ".join(str(text).split())
+    if len(flat) <= limit:
+        return flat
+    return flat[: max(0, limit - 1)].rstrip() + "…"
+
+def notify(title: str, body: str = "", urgency: str = "low", icon: str = "video-display", ms: int = 1800) -> None:
     if shutil.which("notify-send") is None:
         return
+    # Normal pill is single-line (format shows summary only); critical keeps
+    # two lines. Caps sized for the 300px pill so mako never ellipsizes.
+    title = _short(title, 34)
+    body = _short(body, 36)
     try:
         subprocess.run(
             [
@@ -730,13 +741,14 @@ def run() -> int:
         computed = next_scale(cur_n, args.direction, ladder)
         if computed is None:
             log_warn(f"{name}: scale limit reached at {fmt_scale(cur_n)}")
-            notify("Display Scale", f"{name}: limit reached at {fmt_scale(cur_n)}", urgency="normal")
+            edge = "at max" if args.direction == "+" else "at min" if args.direction == "-" else "limit"
+            notify(f"{name} • {fmt_scale(cur_n)}× • {edge}", urgency="normal")
             return 0
         target_n = computed
 
     if target_n == cur_n:
         log_info(f"{name}: already at scale {fmt_scale(cur_n)}")
-        notify("Display Scale", f"{name}: already at scale {fmt_scale(cur_n)}")
+        notify(f"{name} • {fmt_scale(cur_n)}× • Already set")
         return 0
 
     literal = fmt_scale(target_n)
@@ -796,7 +808,7 @@ def run() -> int:
 
     lw, lh = logical_size(w, h, target_n, transform)
     log_ok(f"{name}: scale {literal} applied → {lw}x{lh} logical px")
-    notify(f"Display Scale: {literal}", f"{name} • {lw}×{lh} logical")
+    notify(f"{name} • {literal}× • {lw}×{lh}")
     return 0
 
 def main() -> None:
@@ -804,7 +816,7 @@ def main() -> None:
         sys.exit(run())
     except HyprError as exc:
         log_err(str(exc))
-        notify("Display Scale — Error", str(exc), urgency="critical", icon="dialog-error", ms=5000)
+        notify("Scale error", str(exc), urgency="critical", icon="dialog-error", ms=5000)
         sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)

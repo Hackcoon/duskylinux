@@ -51,8 +51,8 @@ CONFIG_FILE: Final = CONFIG_DIR / "monitors.lua"
 LOCK_FILE: Final = XDG_RUNTIME_DIR / f"hypr-screen-rotate-{os.getuid()}.lock"
 CONFIG_LOCK: Final = XDG_RUNTIME_DIR / f"hypr-monitors-lua-{os.getuid()}.lock"
 
-NOTIFY_APP: Final = "hypr-monitor"
-NOTIFY_TAG: Final = "hypr-monitor"
+NOTIFY_APP: Final = "hypr-rotate"
+NOTIFY_TAG: Final = "hypr-rotate"
 
 SCALE_Q: Final = 120
 
@@ -70,6 +70,18 @@ TRANSFORM_NAMES: Final[dict[int, str]] = {
     5: "90° (flipped + clockwise)",
     6: "180° (flipped + inverted)",
     7: "270° (flipped + counter-clockwise)",
+}
+
+# Compact single-glance labels for the center pill.
+TRANSFORM_SHORT: Final[dict[int, str]] = {
+    0: "0°",
+    1: "90°",
+    2: "180°",
+    3: "270°",
+    4: "0° flip",
+    5: "90° flip",
+    6: "180° flip",
+    7: "270° flip",
 }
 
 CONFIG_HEADER: Final = (
@@ -92,9 +104,18 @@ def log_debug(msg: str) -> None:
     if DEBUG:
         print(_c("35", "[DEBUG]") + f" {msg}", file=sys.stderr)
 
-def notify(title: str, body: str, urgency: str = "low", icon: str = "object-rotate-right", ms: int = 2000) -> None:
+def _short(text: str, limit: int) -> str:
+    """Collapse whitespace and truncate with ellipsis so text fits the center pill."""
+    flat = " ".join(str(text).split())
+    if len(flat) <= limit:
+        return flat
+    return flat[: max(0, limit - 1)].rstrip() + "…"
+
+def notify(title: str, body: str, urgency: str = "low", icon: str = "object-rotate-right", ms: int = 1800) -> None:
     if shutil.which("notify-send") is None:
         return
+    title = _short(title, 24)
+    body = _short(body, 32)
     try:
         subprocess.run(
             [
@@ -682,7 +703,7 @@ def run() -> int:
 
     if target_transform == current_transform:
         log_info(f"{name}: already at transform {current_transform} ({TRANSFORM_NAMES[current_transform]})")
-        notify(f"Screen Rotation: {name}", f"Already at {TRANSFORM_NAMES[current_transform]}")
+        notify(f"{name} • {TRANSFORM_SHORT.get(current_transform, str(current_transform))}", "Already set")
         return 0
 
     # 1) Build live eval payload preserving all fields from monitors.lua
@@ -742,7 +763,10 @@ def run() -> int:
         log_info(f"Persisted transform {target_transform} to {CONFIG_FILE.name}")
 
     log_ok(f"{name}: transform applied → {new_lbl} ({'persisted' if args.persist else 'ephemeral'})")
-    notify(f"Screen Rotated: {name}", f"{new_lbl}\n{'[persisted to disk]' if args.persist else '[ephemeral]'}")
+    notify(
+        f"{name} • {TRANSFORM_SHORT.get(target_transform, str(target_transform))}",
+        "persisted" if args.persist else "ephemeral",
+    )
     return 0
 
 def main() -> None:
@@ -750,7 +774,7 @@ def main() -> None:
         sys.exit(run())
     except HyprError as exc:
         log_err(str(exc))
-        notify("Screen Rotate — Error", str(exc), urgency="critical", icon="dialog-error", ms=5000)
+        notify("Rotate error", str(exc), urgency="critical", icon="dialog-error", ms=5000)
         sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)
