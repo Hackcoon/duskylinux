@@ -126,7 +126,7 @@ hl.bind(
 -- Rofi Powermenu
 hl.bind(
     "ALT + SHIFT + SPACE",
-    hl.dsp.exec_cmd("pkill rofi; rofi -show power-menu -modi power-menu:" .. dusky_scripts .. "rofi/powermenu.sh"),
+    hl.dsp.exec_cmd("pkill rofi; rofi -show power-menu -modi power-menu:" .. dusky_scripts .. "rofi/powermenu.sh -no-fixed-num-lines -i"),
     { description = "Power Menu" }
 )
 

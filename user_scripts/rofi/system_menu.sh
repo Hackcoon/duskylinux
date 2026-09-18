@@ -219,9 +219,10 @@ run_term_hold() {
 run_rofi_mode() {
     local mode="$1"
     local script="$2"
+    shift 2
 
     require_executable_file "$script" || return 0
-    run_app rofi -show "$mode" -modi "$mode:$script"
+    run_app rofi -show "$mode" -modi "$mode:$script" "$@"
 }
 
 open_editor() {
@@ -613,7 +614,7 @@ route_selection() {
             show_config_menu
             ;;
         '󰐉  Power')
-            run_rofi_mode "power-menu" "$SCRIPTS_DIR/rofi/powermenu.sh"
+            run_rofi_mode "power-menu" "$SCRIPTS_DIR/rofi/powermenu.sh" -no-fixed-num-lines -i
             ;;
         *)
             case "${choice,,}" in
@@ -651,7 +652,7 @@ route_selection() {
                     show_config_menu
                     ;;
                 power)
-                    run_rofi_mode "power-menu" "$SCRIPTS_DIR/rofi/powermenu.sh"
+                    run_rofi_mode "power-menu" "$SCRIPTS_DIR/rofi/powermenu.sh" -no-fixed-num-lines -i
                     ;;
                 *)
                     return 1
