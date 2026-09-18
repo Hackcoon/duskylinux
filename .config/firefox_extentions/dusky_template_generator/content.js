@@ -49,7 +49,9 @@
   const TOKEN_NAMES = new Set(TOKENS.map(([t]) => t));
   const OWNED = new Set([...TOKEN_NAMES].map((t) => "--" + t));
   const NOISE_RE = /^--(tw|fa|dusky|darkreader|wp--|chakra-emotion|mui-)/i;
-  const skipVar = (name) => OWNED.has(name) || NOISE_RE.test(name);
+  // Filters out both bare vendor noise AND Matugen's live-injected palette (_rgb, on_, inverse_, etc.)
+  const MATUGEN_INJECTED_RE = /^--(on_|inverse_|surface|primary|secondary|tertiary|outline|error|background|scrim|shadow|source_color|surface_tint)/i;
+  const skipVar = (name) => OWNED.has(name) || NOISE_RE.test(name) || (name.includes("_") && MATUGEN_INJECTED_RE.test(name));
 
   const paletteLoaded = () =>
     getComputedStyle(document.documentElement).getPropertyValue("--surface").trim() !== "";
@@ -1085,16 +1087,9 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
     const seq = ++S.saveSeq;
     setState("saving…", "");
     S.saving = (async () => {
-      let reply = await send({ type: "splice", region: "picks", body: serialise(), base_rev: S.rev });
-      if (reply?.conflict) {
-        mergeForeign(reply.picks);
-        renderLive(); refreshBar(); refreshDrawer();
-        S.rev = reply.rev ?? 0;
-        reply = await send({ type: "splice", region: "picks", body: serialise(), base_rev: S.rev });
-      }
+      const reply = await send({ type: "splice", region: "picks", body: serialise() });
       if (seq !== S.saveSeq) return;
       if (reply?.ok) {
-        S.rev = reply.rev ?? 0;
         setState("✓ saved " + String(reply.path).split("/").pop(), "ok");
       } else {
         setState("⚠ not saved: " + (reply?.error ?? "no reply"), "err");

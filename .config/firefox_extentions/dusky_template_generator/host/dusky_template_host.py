@@ -255,13 +255,6 @@ def handle(msg: dict[str, Any], root: Path) -> dict[str, Any]:
         if region not in BEGIN:
             return {"ok": False, "error": f"Unknown region: {region!r}"}
         current = read_doc(path)
-        base_rev = msg.get("base_rev")
-        if isinstance(base_rev, int) and base_rev > 0:
-            now = revision(path)
-            if now != base_rev:
-                return {"ok": False, "conflict": True, "domain": domain, "path": str(path),
-                        "css": current, "picks": region_body(current, "picks"), "rev": now,
-                        "error": "template changed on disk; merge and retry"}
         return store(path, domain, splice(current, domain, region, str(msg.get("body", ""))))
 
     if kind == "delete":
