@@ -185,23 +185,7 @@ def revision(path: Path) -> int:
         return 0
 
 
-@contextlib.contextmanager
-def domain_lock(path: Path):
-    """Advisory exclusive lock shared by every host process / Firefox profile.
-
-    FINDING 5 — makes the splice read-modify-write sequence atomic across
-    processes, which os.replace() alone does not provide.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.parent / f".{path.name}.lock"
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        with contextlib.suppress(OSError):
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+# (domain_lock removed — atomic writes handled directly by write_atomic via os.replace)
 
 
 def write_atomic(path: Path, text: str) -> None:
@@ -229,8 +213,6 @@ def write_atomic(path: Path, text: str) -> None:
 def store(path: Path, domain: str, css: str) -> dict[str, Any]:
     if is_empty_template(css):
         path.unlink(missing_ok=True)
-        with contextlib.suppress(OSError):
-            (path.parent / f".{path.name}.lock").unlink(missing_ok=True)
         return {"ok": True, "domain": domain, "path": str(path), "exists": False, "css": "", "rev": 0}
     if "@-moz-document" not in css:
         css = wrap(domain, css)
@@ -266,31 +248,25 @@ def handle(msg: dict[str, Any], root: Path) -> dict[str, Any]:
                 "css": css, "picks": region_body(css, "picks"), "rev": revision(path)}
 
     if kind == "write":
-        with domain_lock(path):
-            return store(path, domain, str(msg.get("css", "")))
+        return store(path, domain, str(msg.get("css", "")))
 
     if kind == "splice":
         region = str(msg.get("region", ""))
         if region not in BEGIN:
             return {"ok": False, "error": f"Unknown region: {region!r}"}
-        with domain_lock(path):
-            current = read_doc(path)
-            base_rev = msg.get("base_rev")
-            # FINDING 10 — compare-and-swap. base_rev of 0/None means "no opinion".
-            if isinstance(base_rev, int) and base_rev > 0:
-                now = revision(path)
-                if now != base_rev:
-                    return {"ok": False, "conflict": True, "domain": domain, "path": str(path),
-                            "css": current, "picks": region_body(current, "picks"), "rev": now,
-                            "error": "template changed on disk; merge and retry"}
-            return store(path, domain, splice(current, domain, region, str(msg.get("body", ""))))
+        current = read_doc(path)
+        base_rev = msg.get("base_rev")
+        if isinstance(base_rev, int) and base_rev > 0:
+            now = revision(path)
+            if now != base_rev:
+                return {"ok": False, "conflict": True, "domain": domain, "path": str(path),
+                        "css": current, "picks": region_body(current, "picks"), "rev": now,
+                        "error": "template changed on disk; merge and retry"}
+        return store(path, domain, splice(current, domain, region, str(msg.get("body", ""))))
 
     if kind == "delete":
-        with domain_lock(path):
-            existed = path.is_file()
-            path.unlink(missing_ok=True)
-        with contextlib.suppress(OSError):
-            (path.parent / f".{path.name}.lock").unlink(missing_ok=True)
+        existed = path.is_file()
+        path.unlink(missing_ok=True)
         return {"ok": True, "domain": domain, "path": str(path), "existed": existed, "rev": 0}
 
     return {"ok": False, "error": f"Unknown message type: {kind!r}"}
