@@ -462,7 +462,12 @@
     const body = [];
     let mapped = 0;
 
-    if (groups.size) {
+    // A site with fewer than 3 variables is not variable-driven (e.g. X.com, static HTML).
+    // Always trigger the full structural theme so layout containers, tweets, and buttons are themed.
+    let variableCount = 0;
+    for (const list of groups.values()) variableCount += list.length;
+
+    if (variableCount >= 3) {
       body.push(`${detectRootScopes()} {`, "    color-scheme: dark !important;");
       for (const [token] of TOKENS) {
         for (const suffix of ["", "\u0000rgb", "\u0000hsl"]) {
