@@ -102,12 +102,16 @@
     if (!probe.style.color) return null;
 
     const comp = getComputedStyle(probe).color;
-    const m = comp && RGB_OUT.exec(comp);
-    if (!m) return null;
-    const alpha = m === undefined ? 1 : (m.endsWith("%") ? parseFloat(m) / 100 : parseFloat(m));
+    const match = comp && RGB_OUT.exec(comp);
+    if (!match) return null;
+    const [, rStr, gStr, bStr, aStr] = match;
+    const alpha = aStr === undefined ? 1 : (aStr.endsWith("%") ? parseFloat(aStr) / 100 : parseFloat(aStr));
     return {
-      r: Math.round(+m), g: Math.round(+m), b: Math.round(+m),
-      a: alpha, shape: hsl ? "hsl-triplet" : "color",
+      r: Math.round(+rStr),
+      g: Math.round(+gStr),
+      b: Math.round(+bStr),
+      a: alpha,
+      shape: hsl ? "hsl-triplet" : "color",
     };
   }
 
@@ -364,47 +368,6 @@
     return out;
   }
 
-  const SITE_PROFILES = [
-    {
-      test: (h) => h.endsWith("youtube.com"),
-      rules: [
-        "/* YouTube component polish */",
-        "#guide-content.ytd-app, ytd-guide-renderer, #contentContainer.app-drawer,",
-        ".style-scope ytd-feed-filter-chip-bar-renderer { background-color: var(--surface) !important; }",
-        "#masthead-container.ytd-app { background-color: var(--background) !important; color: var(--on_background) !important; }",
-        ".ytp-play-progress, .ytp-play-progress.ytp-swatch-background-color {",
-        "    background-image: linear-gradient(to right, var(--primary) 0%, var(--primary) 100%) !important;",
-        "    background-color: transparent !important;",
-        "}",
-        ".ytp-scrubber-button.ytp-swatch-background-color { background-color: var(--secondary) !important; }",
-        ".ytp-volume-slider-handle::before { background: var(--primary) !important; }",
-        "#logo-icon svg g path[fill^=\"#ff\" i], ytd-logo svg g path[fill^=\"#ff\" i],",
-        "#logo-icon path.ytd-logo[fill^=\"#ff\" i] { fill: var(--primary) !important; }",
-        "#logo-icon [fill=\"white\" i], .ytd-logo [fill=\"white\" i] { fill: var(--on_primary) !important; }",
-        "#logo-icon path[fill=\"#212121\" i], .yt-icon-shape path[fill=\"#fff\" i] { fill: var(--on_surface) !important; }",
-        ".ytSearchboxComponentInputBox { background-color: var(--surface_container) !important; color: var(--on_surface) !important; }",
-        ".ytSearchboxComponentInputBox.ytSearchboxComponentInputBoxHasFocus { border-color: var(--primary) !important; }",
-        ".ytSearchboxComponentSearchButton { background-color: var(--primary) !important; color: var(--on_primary) !important; }",
-        "ytd-button-renderer.style-primary .yt-spec-button-shape-next--filled {",
-        "    background-color: var(--primary) !important; color: var(--on_primary) !important;",
-        "}",
-        "ytd-button-renderer.style-primary:hover .yt-spec-button-shape-next--filled {",
-        "    background-color: var(--primary_fixed_dim) !important;",
-        "}",
-        ".yt-spec-button-shape-next--tonal {",
-        "    background-color: var(--secondary_container) !important; color: var(--on_secondary_container) !important;",
-        "}",
-        ".yt-spec-button-shape-next--tonal:hover {",
-        "    background-color: var(--secondary_fixed_dim) !important; color: var(--on_secondary_fixed_variant) !important;",
-        "}",
-        ".yt-spec-icon-badge-shape--type-notification .yt-spec-icon-badge-shape__badge {",
-        "    background-color: var(--primary) !important; color: var(--on_primary) !important;",
-        "}",
-        "ytd-live-chat-frame#chat { border: 1px solid var(--outline_variant) !important; border-radius: 12px !important; }",
-      ],
-    },
-  ];
-
   function structuralFallback() {
     return [
       "/* Structural theme — this page exposes no usable design tokens. */",
@@ -466,48 +429,23 @@
 
   const indent = (lines) => lines.map((l) => (l ? "    " + l : "")).join("\n");
 
+  // Filter out unused raw palette swatch dumps (e.g. pink-100..900, orange-100..900)
+  function isSemanticThemeVar(name) {
+    const n = name.toLowerCase();
+    if (/^--(pink|orange|yellow|purple|cyan|teal|lime|amber|violet|fuchsia|rose|emerald|sky)-[0-9]+[a-z]?$/.test(n)) {
+      return false;
+    }
+    return true;
+  }
+
   function scan() {
     customPropIndex = null;
-    const host = location.hostname.replace(/^www\./, "");
-
-    /* ChatGPT Clean Profile: Outputs the exact, curated 15-line template */
-    if (host.endsWith("chatgpt.com") || host.endsWith("openai.com")) {
-      const lines = [
-        "    :root, .dark {",
-        "        color-scheme: dark !important;",
-        "        --gray-750: var(--surface_container_highest) !important;",
-        "        --gray-900: var(--surface_container) !important;",
-        "        --black: var(--surface) !important;",
-        "        --blue-400: var(--primary_container) !important;",
-        "        --default-theme-user-msg-text: var(--surface) !important;",
-        "        --message-surface: var(--primary) !important;",
-        "        --bg-primary: var(--surface) !important;",
-        "        --bg-secondary: var(--surface_bright) !important;",
-        "        --bg-tertiary: var(--surface_container_high) !important;",
-        "        --bg-elevated-secondary: var(--surface_container_low) !important;",
-        "        --text-primary: var(--on_surface) !important;",
-        "        --bg-secondary-surface: var(--surface) !important;",
-        "    }",
-        "",
-        "    .dark\\:bg-\\[\\#353535\\]:where(.dark, .dark *):not(:where(.dark .light, .dark .light *)) {",
-        "        background-color: var(--surface_container_high) !important;",
-        "    }",
-        "    .dark[data-oled] [data-composer-surface=\"true\"] {",
-        "        background-color: var(--surface_container) !important;",
-        "    }",
-        "    .dark\\:bg-\\[\\#171717\\]:where(.dark, .dark *):not(:where(.dark .light, .dark .light *)) {",
-        "        background-color: var(--surface_container_high) !important;",
-        "    }"
-      ];
-      return { ok: true, found: 12, mapped: 12, body: lines.join("\n") };
-    }
-
     const groups = new Map();
     const unmapped = [];
     let found = 0;
 
     for (const [name, rawValue] of collectVariables()) {
-      if (skipVar(name)) continue;
+      if (skipVar(name) || !isSemanticThemeVar(name)) continue;
       const col = parseCssColor(rawValue);
       if (!col || col.a === 0) continue;
       found++;
@@ -519,7 +457,6 @@
       (groups.get(key) ?? groups.set(key, []).get(key)).push(name);
     }
 
-    const profile = SITE_PROFILES.find((p) => p.test(host));
     const body = [];
     let mapped = 0;
 
@@ -543,8 +480,6 @@
       body.push(structuralFallback());
       mapped = 1;
     }
-
-    if (profile) { body.push("", ...profile.rules); mapped += 1; }
 
     if (unmapped.length) {
       const sorted = unmapped.sort();
@@ -583,8 +518,9 @@
     const trimmed = line.trim();
     if (!trimmed) return null;
     const km = KEY_RE.exec(trimmed);
-    const key = km ? decodeURIComponent(km) : "";
-    const meta = km ? (km || "") : "";
+    const [, rawKey = "", rawMeta = ""] = km || [];
+    const key = rawKey ? decodeURIComponent(rawKey) : "";
+    const meta = rawMeta;
     const css = km ? trimmed.slice(0, km.index).trim() : trimmed;
     const parts = splitRule(css);
     if (!parts) return { raw: css, key: key || "raw\u001F" + css, meta: meta || "manual" };
@@ -645,9 +581,15 @@
 
     for (const cls of elm.classList) {
       const arb = /^[a-z-]+-\((--[\w-]+)\)$/.exec(cls);
-      if (arb) add(arb);
+      if (arb) {
+        const [, arbVar] = arb;
+        add(arbVar);
+      }
       const tok = /^[a-z-]+-token-([\w-]+)$/.exec(cls);
-      if (tok) add("--" + tok);
+      if (tok) {
+        const [, tokName] = tok;
+        add("--" + tokName);
+      }
     }
     for (const p of elm.style) add(p);
     for (const { sel, props } of propIndex()) {
@@ -657,7 +599,10 @@
     }
     for (const prop of ["background-color", "color", "border-color", "fill"]) {
       const used = /var\((--[\w-]+)/.exec(cs.getPropertyValue(prop));
-      if (used) add(used);
+      if (used) {
+        const [, usedVar] = used;
+        add(usedVar);
+      }
     }
     return out;
   }
