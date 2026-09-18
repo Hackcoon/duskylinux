@@ -309,6 +309,7 @@ def send_message(message_content: dict) -> bool:
 _COLOR_RE = re.compile(r"(--[\w-]+)\s*:\s*([^;]+?)\s*(?:!important)?\s*;", re.IGNORECASE)
 _MOZ_DOMAIN_RE = re.compile(r"@-moz-document\s+(?P<specs>[^{]+)\{", re.IGNORECASE)
 _DOMAIN_SPEC_RE = re.compile(r'domain\(\s*["\']([^"\']+)["\']\s*\)', re.IGNORECASE)
+_URL_SPEC_RE = re.compile(r'(?:url|url-prefix)\(\s*["\'](?:https?://)?([^/"\']+)["\']\s*\)', re.IGNORECASE)
 
 def _extract_balanced_block(content: str, open_brace_idx: int) -> str:
     brace_count = 0
@@ -460,8 +461,13 @@ def parse_websites(websites_dir: str, disabled_sites: list[str] | None = None) -
                     websites[stem] = content.strip()
                     continue
                 for m in matches:
-                    domains = [d.lower() for d in _DOMAIN_SPEC_RE.findall(m.group("specs"))]
+                    specs = m.group("specs")
+                    domains = [d.lower() for d in _DOMAIN_SPEC_RE.findall(specs)]
+                    if not domains:
+                        domains = [d.lower() for d in _URL_SPEC_RE.findall(specs)]
                     body = _extract_balanced_block(content, m.end() - 1)
+                    if not domains and stem not in disabled_set:
+                        websites[stem] = body if body else content.strip()
                     for domain in domains:
                         if domain in disabled_set:
                             continue

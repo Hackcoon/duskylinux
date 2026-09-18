@@ -462,6 +462,16 @@
 
         await ensureWatchdog();
         if (state.enabled) connect();
+
+        browser.storage.local.get(K_PAINT).then((res) => {
+            const cur = res && res[K_PAINT];
+            if (!cur) return;
+            let dirty = false;
+            for (const h of Object.keys(cur)) {
+                if (!resolveCss(h)) { delete cur[h]; dirty = true; }
+            }
+            if (dirty) browser.storage.local.set({ [K_PAINT]: cur }).catch(swallow);
+        }).catch(swallow);
     }
 
     function persistVolatile() {
@@ -499,23 +509,44 @@
     /**
      * Domain matcher with an explicit specificity score so ordering is
      * deterministic.
-     *   exact host .............. 1000 + len
-     *   registrable suffix ...... 500 + len
-     *   single-label heuristic .. len
+     *   exact host ...................... 1000 + len
+     *   canonical www equivalence ........ 950 + len
+     *   explicit wildcard (*. or .) ...... 500 + len
+     *   single-label heuristic .......... 100 + len
+     *
+     * Invariant: A domain pattern without an explicit wildcard (e.g. "google.com")
+     * NEVER matches arbitrary subdomains (e.g. "drive.google.com").
      */
     function matchScore(hostname, pattern, allowSingleLabel) {
-        const h = hostname;
-        let d = String(pattern || '').toLowerCase().trim();
-        if (!h || !d) return 0;
+        const h = String(hostname || '').toLowerCase().trim().replace(/\.+$/, '');
+        const raw = String(pattern || '').toLowerCase().trim().replace(/\.+$/, '');
+        if (!h || !raw) return 0;
+
+        const isWildcard = raw.startsWith('*.') || raw.startsWith('.');
+        let d = raw;
         if (d.startsWith('*.')) d = d.slice(2);
         if (d.startsWith('.')) d = d.slice(1);
         if (!d) return 0;
+
+        // 1. Exact host match (highest specificity)
         if (h === d) return 1000 + d.length;
-        if (h.endsWith('.' + d)) return 500 + d.length;
-        if (allowSingleLabel && !d.includes('.')) {
-            const parts = h.split('.').filter(Boolean);
-            if (parts.length >= 2 && parts.slice(0, -1).includes(d)) return d.length;
+
+        // 2. Canonical www equivalence (google.com <-> www.google.com)
+        if (h === 'www.' + d) return 950 + d.length;
+        if (d === 'www.' + h) return 950 + h.length;
+
+        // 3. Explicit wildcard pattern (*.example.com or .example.com)
+        if (isWildcard && (h === d || h.endsWith('.' + d))) {
+            return 500 + d.length;
         }
+
+        // 4. Single-label heuristic (e.g. key "github" matches "github.com", "www.github.com")
+        if (allowSingleLabel && !d.includes('.')) {
+            const hNorm = h.startsWith('www.') ? h.slice(4) : h;
+            const parts = hNorm.split('.').filter(Boolean);
+            if (parts.length >= 2 && parts[0] === d) return 100 + d.length;
+        }
+
         return 0;
     }
 
@@ -1043,7 +1074,9 @@
     ].join('\n');
 
     /** Author-declared per-site rules, concatenated LEAST specific first so the
-     *  natural cascade resolves subdomain overrides without extra machinery. */
+     *  natural cascade resolves subdomain overrides without extra machinery.
+     *  When an exact host match or canonical www match is present, lower-tier
+     *  wildcards or single-label heuristics are discarded. */
     function siteRulesFor(hostname, websites) {
         if (!hostname || !websites) return '';
         const hits = [];
@@ -1052,9 +1085,13 @@
             if (score > 0 && typeof websites[key] === 'string') hits.push({ key, score, css: websites[key] });
         }
         if (!hits.length) return '';
-        hits.sort((a, b) => a.score - b.score || (a.key < b.key ? -1 : 1));
+        const maxScore = Math.max(...hits.map((h) => h.score));
+        const effectiveHits = maxScore >= 1000
+            ? hits.filter((h) => h.score >= 1000)
+            : (maxScore >= 950 ? hits.filter((h) => h.score >= 950) : hits);
+        effectiveHits.sort((a, b) => a.score - b.score || (a.key < b.key ? -1 : 1));
         let out = '';
-        for (const h of hits) out += '/* dusky:' + h.key + ' */\n' + h.css.slice(0, LIMITS.SITE_CSS_BYTES) + '\n';
+        for (const h of effectiveHits) out += '/* dusky:' + h.key + ' */\n' + h.css.slice(0, LIMITS.SITE_CSS_BYTES) + '\n';
         return out;
     }
 
@@ -1230,8 +1267,9 @@
                 if (cur[host] && cur[host].h === entry.h) continue;
                 cur[host] = entry; dirty = true;
             }
-            if (!dirty) return;
-            for (const host of Object.keys(cur)) if (cur[host].rev !== state.rev) delete cur[host];
+            for (const host of Object.keys(cur)) {
+                if (cur[host].rev !== state.rev || !resolveCss(host)) delete cur[host];
+            }
             const keys = Object.keys(cur);
             if (keys.length > LIMITS.PAINT_CACHE) {
                 keys.sort((a, b) => (cur[a].at || 0) - (cur[b].at || 0));
