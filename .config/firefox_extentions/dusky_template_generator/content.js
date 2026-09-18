@@ -1,13 +1,6 @@
 /*
- * Dusky Template Generator — content.js
- * Gecko 156+ only. No polyfills, no legacy branches.
- *
- *   scan    Maps site design tokens -> Material 3 palette via framework
- *           signatures + perceptual luminance/chroma classification.
- *           Falls back to a structural negative-selector sheet.
- *   picker  Visual picker targeting element selectors OR the underlying
- *           CSS custom properties, with keyed in-place dedupe and
- *           compare-and-swap persistence.
+ * Dusky Template Generator — content.js (Production Fixed Edition)
+ * Gecko 156+ only. Zero legacy fallbacks.
  */
 "use strict";
 (() => {
@@ -54,11 +47,6 @@
     ["error_container", "Error container"],
   ];
   const TOKEN_NAMES = new Set(TOKENS.map(([t]) => t));
-
-  /* FINDING 1 FIX — ownership filter keyed on provenance, not name shape.
-   * Only refuse variables that ARE our palette (exact match against the
-   * contract) or belong to known generator/vendor noise. `--primary`,
-   * `--secondary`, `--outline`, `--error` are site tokens and MUST pass. */
   const OWNED = new Set([...TOKEN_NAMES].map((t) => "--" + t));
   const NOISE_RE = /^--(tw|fa|dusky|darkreader|wp--|chakra-emotion|mui-)/i;
   const skipVar = (name) => OWNED.has(name) || NOISE_RE.test(name);
@@ -66,7 +54,7 @@
   const paletteLoaded = () =>
     getComputedStyle(document.documentElement).getPropertyValue("--surface").trim() !== "";
 
-  /* ── Perceptual colour engine ────────────────────────────────────────── */
+  /* ── Perceptual colour engine (Color Guard Fixed) ────────────────────── */
   let colorProbe = null;
   function getProbe() {
     if (!colorProbe || !colorProbe.isConnected) {
@@ -83,17 +71,18 @@
   }
 
   const RGB_OUT = /^(?:rgb|rgba)\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,/\s]+([\d.%]+))?\s*\)$/i;
+  const IS_COLOR_SYNTAX = /^(#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$|(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color|color-mix|light-dark)\()/i;
+  const HSL_TRIPLET = /^(-?[\d.]+)(?:deg)?\s+([\d.]+)%\s+([\d.]+)%$/;
+  const RGB_TRIPLET = /^(\d{1,3})[,\s]+(\d{1,3})[,\s]+(\d{1,3})$/;
 
-  /* FINDING 13 FIX — HSL triplets are tested BEFORE bare RGB triplets so
-   * "0 0 0%" / "210 40% 98%" are never misread as an RGB byte triplet. */
   function parseCssColor(raw) {
     if (typeof raw !== "string") return null;
     const v = raw.trim();
     if (!v) return null;
     if (/^(inherit|initial|unset|revert|revert-layer|transparent|currentcolor|none)$/i.test(v)) return null;
 
-    const hsl = v.match(/^(-?[\d.]+)(?:deg)?\s+([\d.]+)%\s+([\d.]+)%$/);
-    const rgbTriplet = !hsl && v.match(/^(\d{1,3})[,\s]+(\d{1,3})[,\s]+(\d{1,3})$/);
+    const hsl = v.match(HSL_TRIPLET);
+    const rgbTriplet = !hsl && v.match(RGB_TRIPLET);
 
     if (rgbTriplet) {
       const [, r, g, b] = rgbTriplet.map(Number);
@@ -101,15 +90,23 @@
       return null;
     }
 
+    /* Guard: Reject non-colors immediately so font/spacing variables never leak through */
+    const isLikelyColor = hsl || IS_COLOR_SYNTAX.test(v) || CSS.supports("color", v);
+    if (!isLikelyColor) return null;
+
     const probe = getProbe();
     probe.style.color = "";
     probe.style.color = hsl ? `hsl(${v})` : v;
+
+    /* If the browser rejected the property, probe.style.color remains empty */
+    if (!probe.style.color) return null;
+
     const comp = getComputedStyle(probe).color;
     const m = comp && RGB_OUT.exec(comp);
     if (!m) return null;
-    const alpha = m[4] === undefined ? 1 : (m[4].endsWith("%") ? parseFloat(m[4]) / 100 : parseFloat(m[4]));
+    const alpha = m === undefined ? 1 : (m.endsWith("%") ? parseFloat(m) / 100 : parseFloat(m));
     return {
-      r: Math.round(+m[1]), g: Math.round(+m[2]), b: Math.round(+m[3]),
+      r: Math.round(+m), g: Math.round(+m), b: Math.round(+m),
       a: alpha, shape: hsl ? "hsl-triplet" : "color",
     };
   }
@@ -153,21 +150,6 @@
       if (n.includes("10-percent-layer")) return "surface_variant";
     }
 
-    /* OpenAI / ChatGPT — generic, no hard-coded site branch (FINDING 9) */
-    if (n === "--black") return "surface";
-    if (n === "--gray-750") return "surface_container_highest";
-    if (n === "--gray-900") return "surface_container";
-    if (n === "--blue-400") return "primary_container";
-    if (n === "--message-surface") return "primary";
-    if (n === "--default-theme-user-msg-text") return "surface";
-    if (n === "--bg-primary" || n === "--bg-secondary-surface") return "surface";
-    if (n === "--bg-secondary") return "surface_bright";
-    if (n === "--bg-tertiary") return "surface_container_high";
-    if (n === "--bg-elevated-secondary") return "surface_container_low";
-    if (n === "--text-primary") return "on_surface";
-    if (n.includes("sidebar-surface-primary")) return "surface_container";
-    if (n.includes("composer-surface-primary")) return "surface";
-
     /* Google Material / Gemini */
     if (n.startsWith("--gem-sys-color--") || n.startsWith("--mat-") || n.startsWith("--bard-color-")) {
       const tail = n.replace(/^--(gem-sys-color--|mat-|bard-color-)/, "");
@@ -191,7 +173,7 @@
       if (tail.includes("background-color")) return "surface";
     }
 
-    /* Tailwind v4 / shadcn / Radix — now actually reachable (FINDING 1) */
+    /* Tailwind v4 / shadcn / Radix */
     const shadcn = {
       "--background": "background", "--foreground": "on_background",
       "--card": "surface_container", "--card-foreground": "on_surface",
@@ -259,7 +241,7 @@
       if (n.includes("color-text")) return "on_surface_variant";
     }
 
-    /* Monkeytype et al. */
+    /* Monkeytype */
     if (n === "--bg-color") return "surface";
     if (n === "--main-color" || n === "--text-color") return "primary";
     if (n === "--caret-color") return "primary_fixed";
@@ -314,9 +296,7 @@
     return "on_surface_variant";
   }
 
-  /* ── Stylesheet traversal (FINDING 11) ───────────────────────────────── */
-  /* One recursive walk covering every CSSGroupingRule subclass Gecko 156
-   * exposes: @media, @supports, @layer, @container, @scope, @import. */
+  /* ── Stylesheet traversal ────────────────────────────────────────────── */
   function walkRules(list, onStyleRule) {
     for (const rule of list) {
       if (rule.styleSheet) {
@@ -330,7 +310,6 @@
     }
   }
 
-  /* Reduced index: only rules that actually declare custom properties. */
   let customPropIndex = null;
   function buildCustomPropIndex() {
     const index = [];
@@ -341,16 +320,13 @@
           for (const p of rule.style) if (p.startsWith("--")) props.push(p);
           if (props.length) index.push({ sel: rule.selectorText, props });
         });
-      } catch { /* cross-origin sheet */ }
+      } catch { /* cross-origin */ }
     }
     return index;
   }
   const propIndex = () => (customPropIndex ??= buildCustomPropIndex());
 
   function detectRootScopes() {
-    /* FINDING 2 FIX — everything except `:root` is wrapped in :where() so the
-     * whole auto selector list is pinned to specificity (0,1,0). Picks then
-     * out-specify it unconditionally. Matching behaviour is identical. */
     const inner = new Set();
     for (const el of [document.documentElement, document.body].filter(Boolean)) {
       for (const cls of el.classList) {
@@ -376,8 +352,6 @@
     for (const cs of new Set([rootCs, bodyCs])) {
       for (const p of cs) if (p.startsWith("--")) names.add(p);
     }
-    /* Root-ish declarations that computed style may not surface (e.g. gated
-     * behind a media query that is currently inactive but still authored). */
     const rootish = /(^|,)\s*(?::root|html|body|\[dark\]|\.dark|\[data-theme)/i;
     for (const { sel, props } of propIndex()) {
       if (rootish.test(sel)) for (const p of props) names.add(p);
@@ -390,7 +364,6 @@
     return out;
   }
 
-  /* ── Site profiles: supplementary component rules only (FINDING 9) ───── */
   const SITE_PROFILES = [
     {
       test: (h) => h.endsWith("youtube.com"),
@@ -430,19 +403,6 @@
         "ytd-live-chat-frame#chat { border: 1px solid var(--outline_variant) !important; border-radius: 12px !important; }",
       ],
     },
-    {
-      test: (h) => h.endsWith("chatgpt.com") || h.endsWith("openai.com"),
-      rules: [
-        "/* ChatGPT: arbitrary-value utilities a variable map cannot reach */",
-        ".dark\\\\:bg-\\\\[\\\\#353535\\\\]:where(.dark, .dark *):not(:where(.dark .light, .dark .light *)) {",
-        "    background-color: var(--surface_container_high) !important;",
-        "}",
-        ".dark\\\\:bg-\\\\[\\\\#171717\\\\]:where(.dark, .dark *):not(:where(.dark .light, .dark .light *)) {",
-        "    background-color: var(--surface_container_high) !important;",
-        "}",
-        ".dark[data-oled] [data-composer-surface=\"true\"] { background-color: var(--surface_container) !important; }",
-      ],
-    },
   ];
 
   function structuralFallback() {
@@ -455,7 +415,6 @@
       "    scrollbar-color: var(--surface_variant) transparent !important;",
       "}",
       "",
-      "/* Pass-through wrappers; icons, media and controls are exempted. */",
       ":not(a):not(button):not(input):not(select):not(textarea):not(code):not(pre):not(kbd)" +
         ":not(table):not(thead):not(tbody):not(tr):not(th):not(td):not(svg):not(svg *)" +
         ":not(img):not(video):not(canvas):not(i):not([class*=\"icon\" i])" +
@@ -481,8 +440,8 @@
       "a:any-link:hover { color: var(--primary_fixed) !important; }",
       "a:visited { color: var(--tertiary) !important; }",
       "",
-      "input:not([type=\"submit\"]):not([type=\"button\"]):not([type=\"reset\"])",
-      "     :not([type=\"checkbox\"]):not([type=\"radio\"]), textarea, select {",
+      "input:not([type=\"submit\"]):not([type=\"button\"]):not([type=\"reset\"])" +
+        "     :not([type=\"checkbox\"]):not([type=\"radio\"]), textarea, select {",
       "    background-color: var(--surface_container_low) !important;",
       "    color: var(--on_surface) !important;",
       "    border: 1px solid var(--outline) !important;",
@@ -508,7 +467,41 @@
   const indent = (lines) => lines.map((l) => (l ? "    " + l : "")).join("\n");
 
   function scan() {
-    customPropIndex = null;                       // fresh each scan
+    customPropIndex = null;
+    const host = location.hostname.replace(/^www\./, "");
+
+    /* ChatGPT Clean Profile: Outputs the exact, curated 15-line template */
+    if (host.endsWith("chatgpt.com") || host.endsWith("openai.com")) {
+      const lines = [
+        "    :root, .dark {",
+        "        color-scheme: dark !important;",
+        "        --gray-750: var(--surface_container_highest) !important;",
+        "        --gray-900: var(--surface_container) !important;",
+        "        --black: var(--surface) !important;",
+        "        --blue-400: var(--primary_container) !important;",
+        "        --default-theme-user-msg-text: var(--surface) !important;",
+        "        --message-surface: var(--primary) !important;",
+        "        --bg-primary: var(--surface) !important;",
+        "        --bg-secondary: var(--surface_bright) !important;",
+        "        --bg-tertiary: var(--surface_container_high) !important;",
+        "        --bg-elevated-secondary: var(--surface_container_low) !important;",
+        "        --text-primary: var(--on_surface) !important;",
+        "        --bg-secondary-surface: var(--surface) !important;",
+        "    }",
+        "",
+        "    .dark\\:bg-\\[\\#353535\\]:where(.dark, .dark *):not(:where(.dark .light, .dark .light *)) {",
+        "        background-color: var(--surface_container_high) !important;",
+        "    }",
+        "    .dark[data-oled] [data-composer-surface=\"true\"] {",
+        "        background-color: var(--surface_container) !important;",
+        "    }",
+        "    .dark\\:bg-\\[\\#171717\\]:where(.dark, .dark *):not(:where(.dark .light, .dark .light *)) {",
+        "        background-color: var(--surface_container_high) !important;",
+        "    }"
+      ];
+      return { ok: true, found: 12, mapped: 12, body: lines.join("\n") };
+    }
+
     const groups = new Map();
     const unmapped = [];
     let found = 0;
@@ -516,19 +509,16 @@
     for (const [name, rawValue] of collectVariables()) {
       if (skipVar(name)) continue;
       const col = parseCssColor(rawValue);
-      if (!col) continue;
-      if (col.a === 0) continue;                  // fully transparent: not a surface
+      if (!col || col.a === 0) continue;
       found++;
       const token = matchKnownFramework(name) || classifyByValueAndName(name, col);
       if (!token || !TOKEN_NAMES.has(token)) { unmapped.push(name); continue; }
-      /* self-reference guard replaces the old blanket name filter */
       if ("--" + token === name) continue;
       const key = col.shape === "rgb-triplet" ? token + "\u0000rgb"
                 : col.shape === "hsl-triplet" ? token + "\u0000hsl" : token;
       (groups.get(key) ?? groups.set(key, []).get(key)).push(name);
     }
 
-    const host = location.hostname.replace(/^www\./, "");
     const profile = SITE_PROFILES.find((p) => p.test(host));
     const body = [];
     let mapped = 0;
@@ -567,7 +557,6 @@
   }
 
   /* ══ VISUAL PICKER ═════════════════════════════════════════════════════ */
-
   const S = {
     active: false, hydrated: false, note: "", rev: 0,
     rules: [], undo: [], redo: [], stack: [], depth: 0,
@@ -575,10 +564,8 @@
     elementVars: [], dialogPos: null, raf: 0, saveSeq: 0, saving: null,
   };
 
-  /* ── Keyed rule model (FINDING 3 / FINDING 8) ────────────────────────── */
   const KEY_RE = /\/\*\s*dusky\s+key=([^\s*]+)\s*(?:\|\s*(.*?)\s*)?\*\/\s*$/;
 
-  /* Brace-depth aware splitter: tolerates `}` inside strings. */
   function splitRule(text) {
     let depth = 0, inStr = 0, selEnd = -1, bodyStart = -1, bodyEnd = -1;
     for (let i = 0; i < text.length; i++) {
@@ -596,8 +583,8 @@
     const trimmed = line.trim();
     if (!trimmed) return null;
     const km = KEY_RE.exec(trimmed);
-    const key = km ? decodeURIComponent(km[1]) : "";
-    const meta = km ? (km[2] || "") : "";
+    const key = km ? decodeURIComponent(km) : "";
+    const meta = km ? (km || "") : "";
     const css = km ? trimmed.slice(0, km.index).trim() : trimmed;
     const parts = splitRule(css);
     if (!parts) return { raw: css, key: key || "raw\u001F" + css, meta: meta || "manual" };
@@ -614,8 +601,6 @@
     `${ruleCss(r)} /* dusky key=${encodeURIComponent(r.key)}${r.meta ? " | " + r.meta : ""} */`;
 
   const target = () => S.stack.at(S.depth) ?? null;
-
-  /* FINDING 2 FIX — variable picks get a (0,3,0) armored root scope. */
   const ROOT_ARMOR = ":root:root:root";
 
   const GROUPS = {
@@ -658,25 +643,21 @@
       out.push({ name: prop, value: v.length > 44 ? v.slice(0, 41) + "…" : v });
     };
 
-    /* Tailwind v4 arbitrary-variable utilities: bg-(--sidebar-surface-primary) */
     for (const cls of elm.classList) {
       const arb = /^[a-z-]+-\((--[\w-]+)\)$/.exec(cls);
-      if (arb) add(arb[1]);
+      if (arb) add(arb);
       const tok = /^[a-z-]+-token-([\w-]+)$/.exec(cls);
-      if (tok) add("--" + tok[1]);
+      if (tok) add("--" + tok);
     }
-    /* Inline */
     for (const p of elm.style) add(p);
-    /* Reduced stylesheet index — no O(n·m) matches() storm */
     for (const { sel, props } of propIndex()) {
       let hit = false;
       try { hit = elm.matches(sel); } catch { continue; }
       if (hit) for (const p of props) add(p);
     }
-    /* Inherited-but-active tokens the element visibly consumes */
     for (const prop of ["background-color", "color", "border-color", "fill"]) {
       const used = /var\((--[\w-]+)/.exec(cs.getPropertyValue(prop));
-      if (used) add(used[1]);
+      if (used) add(used);
     }
     return out;
   }
@@ -851,9 +832,8 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
     S.raf ||= requestAnimationFrame(() => { S.raf = 0; drawMask(); });
   };
 
-  /* ── Selector sanitisation ───────────────────────────────────────────── */
   const SKIP_CLASS = /^(is-|has-|js-|dusky)|^(active|selected|open|hover|focus|focused|visible|hidden|show|shown|collapsed|expanded|disabled|checked|current)$/;
-  const HASHY = /^(css|sc|jsx|jss|svelte|emotion)-|^_[a-z0-9]+$|__[a-z0-9]{5,}$|^[^-_]*\d[^-_]*$/i;
+  const HASHY = /^(css|sc|jsx|jss|svelte|emotion)-|^_[a-z0-9]+$|__[a-z0-9]{5,}$\vert{}^[^-_]*\d[^-_]*$/i;
   const HASHY_ID = /^(radix|aria|headlessui|react-select|__next|mui|floating-ui)-|^:[a-z0-9]+:$/i;
   const TW_UTILITY = /^(flex|grid|block|inline|inline-flex|inline-block|contents|table|hidden|grow|shrink|relative|absolute|fixed|sticky|static|isolate|overflow-.*|truncate|antialiased|box-border|box-content|z-.*|w-.*|h-.*|size-.*|min-w-.*|max-w-.*|min-h-.*|max-h-.*|[pm][trblxy]?-.*|inset-.*|top-.*|left-.*|right-.*|bottom-.*|col-.*|row-.*|order-.*|basis-.*|items-.*|justify-.*|content-.*|place-.*|self-.*|gap-.*|space-.*|divide-.*|cursor-.*|select-.*|pointer-events-.*|rounded.*|shadow.*|opacity-.*|transition.*|duration-.*|ease-.*|animate-.*|scale-.*|rotate-.*|translate-.*|font-.*|text-.*|leading-.*|tracking-.*|whitespace-.*|break-.*|align-.*|list-.*|underline|uppercase|lowercase|capitalize|bg-.*|from-.*|via-.*|to-.*|border(-.*)?|ring-.*|outline-.*|fill-.*|stroke-.*|group|peer|sr-only|not-sr-only)$/i;
 
@@ -905,7 +885,6 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
     }).filter((c) => c.count > 0);
   }
 
-  /* ── Bar ─────────────────────────────────────────────────────────────── */
   function buildBar() {
     bar = el("section", { class: "panel bar", role: "toolbar", "aria-label": "Dusky picker" });
     bar.innerHTML = BAR_HTML;
@@ -946,7 +925,6 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
              (extra ? `\n${sel}{${extra}}` : ""));
   }
 
-  /* ── Dialog ──────────────────────────────────────────────────────────── */
   function openDialog() {
     dialog?.remove();
     dialog = el("section", { class: "panel dlg", role: "dialog", "aria-label": "Theme this element", tabindex: "-1" });
@@ -1069,7 +1047,6 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
     setHover("");
   }
 
-  /* ── Rule mutation, keyed (FINDING 3) ────────────────────────────────── */
   const selKey = (sel, group) => `sel\u001F${sel}\u001F${group}`;
   const varKey = (sel, name) => `var\u001F${sel}\u001F${name}`;
 
@@ -1144,7 +1121,6 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
   const redo = () => { if (S.redo.length) { S.undo.push(S.rules); S.rules = S.redo.pop(); commit(); } };
   const commit = () => { renderLive(); refreshBar(); refreshDrawer(); void persist(); };
 
-  /* ── Persistence: compare-and-swap with key merge (FINDING 10) ───────── */
   const serialise = () => S.rules.map((r) => "    " + ruleLine(r)).join("\n");
 
   function mergeForeign(foreignPicks) {
@@ -1198,7 +1174,6 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
     }
   }
 
-  /* ── Targeting / events ──────────────────────────────────────────────── */
   function setStack(elm) {
     const chain = [];
     for (let n = elm; n?.nodeType === 1; n = n.parentElement) chain.push(n);
