@@ -39,5 +39,6 @@
     button.r-1habvwh.r-eqz5dr.r-1wtj0ep { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fbutton.r-1habvwh.r-eqz5dr.r-1wtj0ep%1Fbg | bg: surface */
     div.r-kemksi.r-pm9dpa.r-1rnoaur { background-color: var(--surface_container_lowest) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.r-kemksi.r-pm9dpa.r-1rnoaur%1Fbg | bg: surface_container_lowest */
     div.r-1pz39u2.r-16y2uox.r-1wbh5a2 > div.r-1ny4l3l.r-18u37iz.r-1pi2tsx > div.r-16y2uox.r-1wbh5a2 { background: transparent !important; box-shadow: none !important; } /* dusky key=sel%1Fdiv.r-1pz39u2.r-16y2uox.r-1wbh5a2%20%3E%20div.r-1ny4l3l.r-18u37iz.r-1pi2tsx%20%3E%20div.r-16y2uox.r-1wbh5a2%1Fbg | bg: transparent */
+    li.r-1mmae3n.r-3pj75a.r-1loqt21 { background-color: var(--surface_container_lowest) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fli.r-1mmae3n.r-3pj75a.r-1loqt21%1Fbg | bg: surface_container_lowest */
     /* <<< dusky:picks */
 }
