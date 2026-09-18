@@ -71,4 +71,8 @@
         --bottom-gradient-color: transparent !important;
         --top-gradient-color: transparent !important;
     }
+    /* >>> dusky:picks - managed by the Visual Picker, one rule per line */
+    hallucination-disclaimer.hallucination-disclaimer.ng-tns-c771103021-2.enable-luminous-disclaimer-updates { display: none !important; } /* dusky key=sel%1Fhallucination-disclaimer.hallucination-disclaimer.ng-tns-c771103021-2.enable-luminous-disclaimer-updates%1Fdisplay | hidden */
+    g1-dynamic-upsell-button.ng-star-inserted { display: none !important; } /* dusky key=sel%1Fg1-dynamic-upsell-button.ng-star-inserted%1Fdisplay | hidden */
+    /* <<< dusky:picks */
 }
