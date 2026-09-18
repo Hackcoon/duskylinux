@@ -169,12 +169,15 @@ function _git_dusky_restore() {
             print -ru2 -- 'Refusing to hard-reset non-interactively. Pass -y to force.'
             return 1
         fi
-        if ! read -q "ans?Proceed? [y/N] "; then
+        if ! read -r "ans?Proceed? [Y/n] "; then
             print
             print -ru2 -- 'Aborted.'
             return 1
         fi
-        print
+        if [[ -n $ans && $ans != [Yy]* ]]; then
+            print -ru2 -- 'Aborted.'
+            return 1
+        fi
     fi
     git_dusky reset --hard HEAD
 }
