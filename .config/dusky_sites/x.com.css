@@ -48,5 +48,6 @@
     div.r-1awozwy.r-1867qdf.r-1phboty { background-color: var(--surface_container_lowest) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.r-1awozwy.r-1867qdf.r-1phboty%1Fbg | bg: surface_container_lowest */
     div.r-1awozwy.r-14lw9ot.r-sdzlij { background-color: var(--primary_container) !important; color: var(--on_primary_container) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.r-1awozwy.r-14lw9ot.r-sdzlij%1Fbg | bg: primary_container */
     button.r-1otgn73.r-1awozwy.r-1otebnk { background-color: var(--primary_fixed_dim) !important; } /* dusky key=sel%1Fbutton.r-1otgn73.r-1awozwy.r-1otebnk%1Fbg | bg: primary_fixed_dim */
+    div.r-ero68b.r-16y2uox.r-1h0z5md { background: transparent !important; box-shadow: none !important; } /* dusky key=sel%1Fdiv.r-ero68b.r-16y2uox.r-1h0z5md%1Fbg | bg: transparent */
     /* <<< dusky:picks */
 }
