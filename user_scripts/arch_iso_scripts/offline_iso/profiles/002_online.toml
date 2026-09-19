@@ -23,6 +23,7 @@ scripts = [
     "U | interactive | 030_partitioning.py --no-encrypt",
     "U | 040_disk_mount.py --auto",
     "U | 051_pacman_repo_switch.py --online",
+    "U | 050_mirrorlist.sh",
     "U | 060_console_fix.sh",
     "U | 070_pacstrap_and_disable_mkinitcpio.py --auto",
     "U | 080_script_directories_population_in_chroot.sh",
@@ -32,6 +33,7 @@ scripts = [
 [phase2]
 scripts = [
     "U | 051_pacman_repo_switch.py --online",
+    "U | 050_mirrorlist.sh",
     "U | 100_etc_skel.sh --auto",
     "U | 101_skel_files_precision_edit.sh --inject",
     "U | 103_configure_hyprland_gpu.py --auto",
