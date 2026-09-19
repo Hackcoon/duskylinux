@@ -103,6 +103,12 @@ def run(*cmd, check=True, capture=True, input_text=None, timeout=300):
                 err = err.strip()
                 if err: console.print(f"[red]Details: {err}[/red]")
         raise
+    except OSError:
+        # Best-effort calls (check=False) must not kill the whole installer
+        # when a binary is missing or unreadable - report failure instead.
+        if check:
+            raise
+        return subprocess.CompletedProcess(argv, 127, stdout="", stderr=f"{argv[0]}: not available")
 
 def print_banner(boot_mode: str):
     txt = Text.from_markup(f"[bold cyan]DUSKY[/] Partitioning [dim]{boot_mode}[/]", justify="center")
@@ -906,6 +912,14 @@ def get_partitions_list(disk):
     except:
         return []
 
+def _same_dev(a, b):
+    if not a or not b:
+        return False
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except Exception:
+        return str(a) == str(b)
+
 def prompt_root_and_efi(target_dev, boot_mode, has_win, win_esp):
     show_partitions_table(target_dev)
     parts = get_partitions_list(target_dev)
@@ -943,36 +957,51 @@ def prompt_root_and_efi(target_dev, boot_mode, has_win, win_esp):
                     sz = p.get("size","")
                     fstype = p.get("fstype","") or "no-fs"
                     label = f"{path} {sz} {fstype}".strip()
-                    if path == root:
+                    if _same_dev(path, root):
                         # Same partition for ROOT and EFI means mkfs.fat would
                         # overwrite the fresh btrfs root in format_root_and_efi,
                         # and 040 then dies with a bare "not btrfs". Keep it
                         # selectable but loudly marked so nobody picks it blind.
                         label += "  [SAME AS ROOT - DO NOT PICK]"
                     efi_opts.append((label, path))
-                if efi_opts:
-                    efi_sel = arrow_menu(f"Select EFI on {target_dev}", efi_opts, default_idx=0)
-                    if efi_sel is None:
-                        return None, None, None
-                    if efi_sel == root:
-                        console.print("[red]EFI and ROOT cannot be the same partition - the EFI format would wipe the freshly formatted root.[/red]")
-                        continue
-                    efi = efi_sel
-                    break
-                else:
+
+                # Allow manual entry so single-partition disks or secondary-drive ESPs aren't trapped
+                efi_opts.append(("Specify EFI partition manually (e.g. from another disk)...", "__manual__"))
+
+                # Choose best default cursor index (first valid non-root candidate)
+                default_idx = 0
+                for idx, (_, val) in enumerate(efi_opts):
+                    if val != "__manual__" and not _same_dev(val, root):
+                        default_idx = idx
+                        p_fs = next((p.get("fstype","") for p in parts if _same_dev(p.get("path"), val)), "")
+                        if p_fs.lower() in ("vfat", "fat32") or (has_win and win_esp and _same_dev(val, win_esp)):
+                            break
+
+                efi_sel = arrow_menu(f"Select EFI on {target_dev}", efi_opts, default_idx=default_idx)
+                if efi_sel is None:
+                    return None, None, None
+                if _same_dev(efi_sel, root):
+                    console.print("[red]EFI and ROOT cannot be the same partition - the EFI format would wipe the freshly formatted root.[/red]")
+                    continue
+                if efi_sel == "__manual__":
                     while True:
                         try:
-                            raw = Prompt.ask("Enter EFI partition (q to abort)", console=console)
+                            raw = Prompt.ask("Enter EFI partition (e.g. /dev/nvme0n1p1, q to abort)", console=console)
                             if raw.lower() in ("q","quit"):
                                 return None, None, None
                             ep = validate_part_input(raw)
-                            if str(ep) == root:
+                            if _same_dev(ep, root):
                                 console.print("[red]EFI and ROOT cannot be the same partition.[/red]")
                                 continue
                             efi = str(ep)
                             break
                         except Exception as e:
                             console.print(f"[red]{e}[/red]")
+                    if efi:
+                        break
+                    continue
+                efi = efi_sel
+                break
         else:
             while True:
                 try:
@@ -980,14 +1009,14 @@ def prompt_root_and_efi(target_dev, boot_mode, has_win, win_esp):
                     if raw.lower() in ("q","quit"):
                         return None, None, None
                     ep = validate_part_input(raw)
-                    if str(ep) == root:
+                    if _same_dev(ep, root):
                         console.print("[red]EFI and ROOT cannot be the same partition.[/red]")
                         continue
                     efi = str(ep)
                     break
                 except Exception as e:
                     console.print(f"[red]{e}[/red]")
-        if has_win and efi == win_esp:
+        if has_win and win_esp and _same_dev(efi, win_esp):
             format_efi = Confirm.ask(f"EFI {efi} looks like Windows ESP {win_esp}. Format? [red]NO keeps Windows[/red]", console=console, default=False)
         else:
             ans = Prompt.ask(f"Format EFI {efi} as {DUSKY_EFI_LABEL}? (y/n/q)", choices=["y","n","q"], default="y", show_choices=False, console=console)
@@ -1072,7 +1101,7 @@ def format_root_and_efi(root_part, efi_part, format_efi, do_encrypt, boot_mode, 
         
     if boot_mode == "UEFI" and efi_part:
         if format_efi:
-            if has_win and efi_part == win_esp:
+            if has_win and win_esp and _same_dev(efi_part, win_esp):
                 console.print("[yellow]Preserving Windows ESP[/yellow]")
             else:
                 for attempt in range(1, 4):
@@ -1090,6 +1119,7 @@ def format_root_and_efi(root_part, efi_part, format_efi, do_encrypt, boot_mode, 
                     run("fatlabel",efi_part,DUSKY_EFI_LABEL, check=False, capture=True)
                 except:
                     pass
+    run("udevadm", "settle", "--timeout=5", check=False, capture=True)
     return btrfs_target
 
 def choose_strategy_interactive():

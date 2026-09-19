@@ -428,12 +428,16 @@ def determine_root_partition(auto_mode):
 
 def probe_fstype(dev):
     """
-    Direct blkid probe, bypassing the udev database. lsblk reads fstype from
+    Direct blkid probe, bypassing the udev database and cache. lsblk reads fstype from
     udev's cache, which can be stale or empty for a partition that was just
     formatted this boot (or when udevd is wedged), which used to abort the
     install with a bare 'not btrfs' even though the filesystem was fine.
     """
-    r=run("blkid","-o","value","-s","TYPE",str(dev),check=False,capture=True)
+    r=run("blkid","-p","-c","/dev/null","-o","value","-s","TYPE",str(dev),check=False,capture=True)
+    val=(r.stdout or "").strip().lower()
+    if val:
+        return val
+    r=run("blkid","-c","/dev/null","-o","value","-s","TYPE",str(dev),check=False,capture=True)
     return (r.stdout or "").strip().lower()
 
 def validate_root_state(mapped_root):
@@ -465,7 +469,7 @@ def validate_efi_partition(part):
     if EFI_GPT_TYPE not in out and "vfat" not in out and "fat32" not in out:
         # Same stale-udev concern as validate_root_state: ask blkid directly.
         btype=probe_fstype(part)
-        pt=run("blkid","-o","value","-s","PARTTYPE",str(part),check=False,capture=True)
+        pt=run("blkid","-p","-c","/dev/null","-o","value","-s","PART_ENTRY_TYPE",str(part),check=False,capture=True)
         out=f"{out} {btype} {(pt.stdout or '').lower()}"
     if EFI_GPT_TYPE not in out and "vfat" not in out and "fat32" not in out:
         console.print(f"[red]{part} is not an EFI System Partition (no ESP type, not vfat).[/red]")
