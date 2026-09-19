@@ -65,6 +65,26 @@ def main() -> None:
         Path("/etc/systemd/zram-generator.conf.d/99-elite-zram0.conf"),
         Path("/etc/systemd/zram-generator.conf.d/99-memtune.conf"),
         Path("/etc/systemd/zram-generator.conf.d/99-elite-zram1.conf"),
+        # Legacy OOM configurations
+        Path("/etc/systemd/user/app.slice.d/10-oomd.conf"),
+        Path("/etc/systemd/user/background.slice.d/10-oomd.conf"),
+        Path("/etc/systemd/user/session.slice.d/10-oomd-avoid.conf"),
+        Path("/etc/systemd/system/session-.scope.d/10-compositor-protect.conf"),
+        Path("/etc/systemd/system/user@.service.d/10-oom-score.conf"),
+        Path("/etc/systemd/user.conf.d/10-oom-default.conf"),
+        Path("/etc/systemd/oomd/rules.d/30-desktop-pressure.oomrule"),
+        Path("/etc/systemd/oomd/rules.d/30-desktop-swap.oomrule"),
+        Path("/etc/systemd/system.control/user.slice.d/50-ManagedOOMSwap.conf"),
+        Path("/etc/systemd/user/pipewire.service.d/10-oom-shield.conf"),
+        Path("/etc/systemd/user/wireplumber.service.d/10-oom-shield.conf"),
+        Path("/etc/systemd/user/pipewire-pulse.service.d/10-oom-shield.conf"),
+        Path("/etc/systemd/user/xdg-desktop-portal.service.d/10-oom-shield.conf"),
+        Path("/etc/systemd/user/xdg-desktop-portal-hyprland.service.d/10-oom-shield.conf"),
+        Path("/etc/systemd/user/xdg-desktop-portal-gtk.service.d/10-oom-shield.conf"),
+        Path("/etc/systemd/user/dbus.service.d/10-oom-shield.conf"),
+        Path("/etc/systemd/user/mako.service.d/10-oom-shield.conf"),
+        Path("/etc/systemd/system/user.slice.d/90-desktop-protection.conf"),
+        Path("/etc/systemd/system/user-.slice.d/90-desktop-protection.conf"),
     )
 
     changes_made = False

@@ -52,23 +52,49 @@ except ImportError:
     HAVE_RICH = False
     console = None  # type: ignore
 
-PRESSURE_RULE: Final[str] = """[Rule]
-MemoryPressureAbove=35%
-LastingSec=8s
-Action=kill-by-pgscan
-"""
+def get_ram_tier() -> str:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    gib = kb / 1024 / 1024
+                    if gib < 7.0:
+                        return "S"
+                    elif gib < 14.0:
+                        return "M"
+                    elif gib < 28.0:
+                        return "L"
+                    else:
+                        return "P"
+    except Exception:
+        pass
+    return "M"
 
-SWAP_RULE: Final[str] = """[Rule]
-MemoryPressureAbove=25%
-SwapUsageMax=90%
-LastingSec=10s
-Action=kill-by-swap
-"""
+TIER_PROFILES: Final[dict[str, dict[str, str]]] = {
+    "S": {
+        "pressure_above": "30%", "pressure_lasting": "3s",
+        "swap_max": "85%", "swap_pressure": "10%", "swap_lasting": "2s",
+        "bg_pressure_above": "20%", "bg_pressure_lasting": "2s",
+    },
+    "M": {
+        "pressure_above": "35%", "pressure_lasting": "5s",
+        "swap_max": "85%", "swap_pressure": "10%", "swap_lasting": "2s",
+        "bg_pressure_above": "20%", "bg_pressure_lasting": "3s",
+    },
+    "L": {
+        "pressure_above": "40%", "pressure_lasting": "5s",
+        "swap_max": "90%", "swap_pressure": "15%", "swap_lasting": "3s",
+        "bg_pressure_above": "25%", "bg_pressure_lasting": "3s",
+    },
+    "P": {
+        "pressure_above": "40%", "pressure_lasting": "10s",
+        "swap_max": "90%", "swap_pressure": "20%", "swap_lasting": "5s",
+        "bg_pressure_above": "25%", "bg_pressure_lasting": "5s",
+    },
+}
 
 OOMD_TUNE: Final[str] = """[OOM]
-DefaultMemoryPressureLimit=50%
-DefaultMemoryPressureDurationSec=15s
-SwapUsedLimit=90%
 PrekillHookTimeoutSec=0s
 """
 
@@ -76,25 +102,22 @@ APP_SLICE: Final[str] = """[Slice]
 ManagedOOMMemoryPressure=auto
 ManagedOOMSwap=auto
 ManagedOOMPreference=none
-OOMRules=30-dusky-pressure 30-dusky-swap
 MemoryAccounting=yes
+OOMRules=
+OOMRules=30-dusky-pressure 30-dusky-swap
 """
 
 BACKGROUND_SLICE: Final[str] = """[Slice]
 ManagedOOMMemoryPressure=auto
 ManagedOOMSwap=auto
 ManagedOOMPreference=none
-OOMRules=30-dusky-pressure 30-dusky-swap
 MemoryAccounting=yes
-"""
-
-USER_SLICE_PROTECTION: Final[str] = """[Slice]
-MemoryLow=512M
+OOMRules=
+OOMRules=30-dusky-background 30-dusky-swap
 """
 
 SESSION_SLICE: Final[str] = """[Slice]
 ManagedOOMPreference=avoid
-MemoryLow=512M
 MemoryAccounting=yes
 """
 
@@ -107,7 +130,6 @@ MemoryAccounting=yes
 USER_MANAGER_SCORE: Final[str] = """[Service]
 OOMScoreAdjust=-100
 OOMPolicy=continue
-MemoryLow=512M
 """
 
 USER_CONF: Final[str] = """[Manager]
@@ -116,9 +138,10 @@ DefaultMemoryPressureWatch=yes
 """
 
 OOM_SHIELD: Final[str] = """[Service]
+Slice=session.slice
 OOMScoreAdjust=-100
 OOMPolicy=continue
-ManagedOOMPreference=omit
+ManagedOOMPreference=avoid
 MemoryAccounting=yes
 """
 
@@ -135,13 +158,23 @@ CRITICAL_USER: Final[tuple[str, ...]] = (
 DUSKY_RUN_WRAPPER: Final[str] = """#!/bin/bash
 set -euo pipefail
 if [[ $# -eq 0 ]]; then
-  echo "usage: dusky-run <cmd> [args...]" >&2; exit 1
+  echo "usage: dusky-run [--background] <cmd> [args...]" >&2; exit 1
 fi
-if ! printf '%d\\n' 200 > /proc/self/oom_score_adj 2>/dev/null; then
+slice="app.slice"
+score=200
+if [[ "$1" == "--background" ]]; then
+  slice="background.slice"
+  score=300
+  shift
+fi
+if [[ $# -eq 0 ]]; then
+  echo "usage: dusky-run [--background] <cmd> [args...]" >&2; exit 1
+fi
+if ! printf '%d\\n' "$score" > /proc/self/oom_score_adj 2>/dev/null; then
   echo "dusky-run: warning: cannot set oom_score_adj" >&2
 fi
 app_name="$(basename "${1}")"
-exec systemd-run --user --scope --slice=app.slice --unit="app-${app_name}-${RANDOM}" --collect \\
+exec systemd-run --user --scope --slice="$slice" --unit="app-${app_name}-${RANDOM}" --collect \\
   --property=OOMPolicy=continue \\
   --property=ManagedOOMPreference=none \\
   --property=MemoryAccounting=yes \\
@@ -155,41 +188,45 @@ class FileSpec:
     mode: int = 0o644
     desc: str
 
-def specs() -> list[FileSpec]:
+def specs(tier: str) -> list[FileSpec]:
+    prof = TIER_PROFILES[tier]
+
+    pressure_rule = f"""[Rule]
+MemoryPressureAbove={prof['pressure_above']}
+LastingSec={prof['pressure_lasting']}
+Action=kill-by-pgscan
+"""
+
+    swap_rule = f"""[Rule]
+SwapUsageMax={prof['swap_max']}
+MemoryPressureAbove={prof['swap_pressure']}
+LastingSec={prof['swap_lasting']}
+Action=kill-by-swap
+"""
+
+    bg_pressure_rule = f"""[Rule]
+MemoryPressureAbove={prof['bg_pressure_above']}
+LastingSec={prof['bg_pressure_lasting']}
+Action=kill-by-pgscan
+"""
+
     s: list[FileSpec] = [
-        FileSpec(dest=Path("/etc/systemd/oomd/rules.d/30-dusky-pressure.oomrule"), content=PRESSURE_RULE, desc="Pressure rule (kill-by-pgscan @ 35% 8s)"),
-        FileSpec(dest=Path("/etc/systemd/oomd/rules.d/30-dusky-swap.oomrule"), content=SWAP_RULE, desc="Swap rule (kill-by-swap @ 90% + 25% pressure 10s)"),
-        FileSpec(dest=Path("/etc/systemd/oomd.conf.d/10-desktop-tune.conf"), content=OOMD_TUNE, desc="oomd global tuning + 0s prekill hook"),
-        FileSpec(dest=Path("/etc/systemd/user/app.slice.d/90-desktop-oomd.conf"), content=APP_SLICE, desc="app.slice rules (30-dusky-*)"),
-        FileSpec(dest=Path("/etc/systemd/user/background.slice.d/90-desktop-oomd.conf"), content=BACKGROUND_SLICE, desc="background.slice rules (30-dusky-*)"),
-        FileSpec(dest=Path("/etc/systemd/user/session.slice.d/90-desktop-oomd.conf"), content=SESSION_SLICE, desc="session.slice protection (MemoryLow=512M)"),
-        FileSpec(dest=Path("/etc/systemd/system/user.slice.d/90-desktop-protection.conf"), content=USER_SLICE_PROTECTION, desc="user.slice ancestor protection (MemoryLow=512M)"),
-        FileSpec(dest=Path("/etc/systemd/system/user-.slice.d/90-desktop-protection.conf"), content=USER_SLICE_PROTECTION, desc="user-.slice ancestor protection (MemoryLow=512M)"),
-        FileSpec(dest=Path("/etc/systemd/system/session-.scope.d/90-desktop-oomd.conf"), content=COMPOSITOR_SCOPE, desc="session-*.scope compositor protect"),
-        FileSpec(dest=Path("/etc/systemd/system/user@.service.d/90-desktop-oom-score.conf"), content=USER_MANAGER_SCORE, desc="user@ service -100"),
-        FileSpec(dest=Path("/etc/systemd/user.conf.d/90-desktop-oom.conf"), content=USER_CONF, desc="DefaultOOMScoreAdjust 100"),
-        FileSpec(dest=Path("/etc/systemd/system/systemd-oomd.service.d/90-desktop-oomd.conf"), content=OOMD_SERVICE_SHIELD, desc="systemd-oomd daemon shield -1000"),
+        FileSpec(dest=Path("/etc/systemd/oomd/rules.d/30-dusky-pressure.oomrule"), content=pressure_rule, desc=f"Pressure rule (app pgscan @ {prof['pressure_above']} {prof['pressure_lasting']})"),
+        FileSpec(dest=Path("/etc/systemd/oomd/rules.d/30-dusky-swap.oomrule"), content=swap_rule, desc=f"Swap rule (swap @ {prof['swap_max']} + {prof['swap_pressure']} {prof['swap_lasting']})"),
+        FileSpec(dest=Path("/etc/systemd/oomd/rules.d/30-dusky-background.oomrule"), content=bg_pressure_rule, desc=f"Background pressure rule (bg pgscan @ {prof['bg_pressure_above']} {prof['bg_pressure_lasting']})"),
+        FileSpec(dest=Path("/etc/systemd/oomd.conf.d/10-desktop-tune.conf"), content=OOMD_TUNE, desc="oomd global tuning (0s prekill hook)"),
+        FileSpec(dest=Path("/etc/systemd/user/app.slice.d/90-desktop-oomd.conf"), content=APP_SLICE, desc="app.slice rules (30-dusky-pressure, 30-dusky-swap)"),
+        FileSpec(dest=Path("/etc/systemd/user/background.slice.d/90-desktop-oomd.conf"), content=BACKGROUND_SLICE, desc="background.slice rules (30-dusky-background, 30-dusky-swap)"),
+        FileSpec(dest=Path("/etc/systemd/user/session.slice.d/90-desktop-oomd.conf"), content=SESSION_SLICE, desc="session.slice protection (avoid)"),
+        FileSpec(dest=Path("/etc/systemd/system/session-.scope.d/90-desktop-oomd.conf"), content=COMPOSITOR_SCOPE, desc="session-*.scope compositor protect (continue, avoid)"),
+        FileSpec(dest=Path("/etc/systemd/system/user@.service.d/90-desktop-oom-score.conf"), content=USER_MANAGER_SCORE, desc="user@ service score (-100, continue)"),
+        FileSpec(dest=Path("/etc/systemd/user.conf.d/90-desktop-oom.conf"), content=USER_CONF, desc="user manager default score (100, pressure watch)"),
+        FileSpec(dest=Path("/etc/systemd/system/systemd-oomd.service.d/90-desktop-oomd.conf"), content=OOMD_SERVICE_SHIELD, desc="systemd-oomd daemon shield (-1000)"),
         FileSpec(dest=Path("/usr/local/bin/dusky-run"), content=DUSKY_RUN_WRAPPER, mode=0o755, desc="dusky-run wrapper"),
     ]
     for svc in CRITICAL_USER:
         s.append(FileSpec(dest=Path(f"/etc/systemd/user/{svc}.d/90-desktop-oom.conf"), content=OOM_SHIELD, desc=f"Shield {svc}"))
     return s
-
-def obsolete_paths() -> tuple[Path, ...]:
-    paths: list[Path] = [
-        Path("/etc/systemd/user/app.slice.d/10-oomd.conf"),
-        Path("/etc/systemd/user/background.slice.d/10-oomd.conf"),
-        Path("/etc/systemd/user/session.slice.d/10-oomd-avoid.conf"),
-        Path("/etc/systemd/system/session-.scope.d/10-compositor-protect.conf"),
-        Path("/etc/systemd/system/user@.service.d/10-oom-score.conf"),
-        Path("/etc/systemd/user.conf.d/10-oom-default.conf"),
-        Path("/etc/systemd/oomd/rules.d/30-desktop-pressure.oomrule"),
-        Path("/etc/systemd/oomd/rules.d/30-desktop-swap.oomrule"),
-        Path("/etc/systemd/system.control/user.slice.d/50-ManagedOOMSwap.conf"),
-    ]
-    for svc in CRITICAL_USER:
-        paths.append(Path(f"/etc/systemd/user/{svc}.d/10-oom-shield.conf"))
-    return tuple(paths)
 
 def atomic_install(spec: FileSpec) -> str:
     d = spec.dest
@@ -216,14 +253,6 @@ def atomic_install(spec: FileSpec) -> str:
             tmp_path.unlink(missing_ok=True)
         except Exception:
             pass
-
-def remove_if_present(path: Path) -> str:
-    if not os.path.lexists(str(path)):
-        return "absent"
-    if path.is_dir() and not path.is_symlink():
-        raise RuntimeError(f"Refusing to remove directory: {path}")
-    path.unlink()
-    return "removed"
 
 def reload_user_manager() -> None:
     users: list[tuple[int, str]] = []
@@ -276,7 +305,10 @@ def reload_user_manager() -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Deploy Hyprland/Desktop OOM config (Arch latest, systemd 261+)")
     ap.add_argument("-n", "--dry-run", action="store_true", help="Show what would change")
+    ap.add_argument("--tier", choices=["S", "M", "L", "P"], default=None, help="Override detected RAM tier (S, M, L, P)")
     args = ap.parse_args()
+
+    tier = args.tier or get_ram_tier()
 
     if not args.dry_run and os.geteuid() != 0:
         if HAVE_RICH and console:
@@ -292,8 +324,7 @@ def main() -> None:
             print("[ERROR] cgroup v2 is required for systemd-oomd", file=sys.stderr)
         sys.exit(1)
 
-    all_specs = specs()
-    obsoletes = obsolete_paths()
+    all_specs = specs(tier)
 
     if args.dry_run:
         if HAVE_RICH and console:
@@ -301,48 +332,45 @@ def main() -> None:
             t.add_column("Action"); t.add_column("Destination"); t.add_column("Description"); t.add_column("Mode")
             for x in all_specs:
                 t.add_row("install", str(x.dest), x.desc, oct(x.mode))
-            for p in obsoletes:
-                if os.path.lexists(str(p)):
-                    t.add_row("remove", str(p), "obsolete", "-")
-            console.print(Panel.fit("[bold cyan]DRY RUN: systemd 261+ OOM & Compositor Configuration[/]", box=box.DOUBLE))
+            console.print(Panel.fit(f"[bold cyan]DRY RUN: systemd 261+ OOM & Compositor Configuration (Tier: {tier})[/]", box=box.DOUBLE))
             console.print(t)
         else:
-            print("--- DRY RUN PLAN ---")
+            print(f"--- DRY RUN PLAN (Tier: {tier}) ---")
             for x in all_specs:
                 print(f"INSTALL: {x.dest} ({x.desc}) [Mode: {oct(x.mode)}]")
-            for p in obsoletes:
-                if os.path.lexists(str(p)):
-                    print(f"REMOVE:  {p}")
         return
 
-    console.print(Panel.fit("[bold cyan]Deploying systemd 261+ OOM Configuration (<32GB Optimized)[/]", box=box.DOUBLE))
+    if HAVE_RICH and console:
+        console.print(Panel.fit(f"[bold cyan]Deploying systemd 261+ OOM Configuration (Tier {tier} Optimized)[/]", box=box.DOUBLE))
+    else:
+        print(f"Deploying systemd 261+ OOM Configuration (Tier {tier} Optimized)")
 
     updated = 0
-    with Progress(SpinnerColumn(), BarColumn(), TextColumn("{task.description}"), console=console) as prog:
-        task = prog.add_task("Installing configurations", total=len(all_specs))
-        results: list[tuple[FileSpec, str]] = []
+    if HAVE_RICH and console:
+        with Progress(SpinnerColumn(), BarColumn(), TextColumn("{task.description}"), console=console) as prog:
+            task = prog.add_task("Installing configurations", total=len(all_specs))
+            results: list[tuple[FileSpec, str]] = []
+            for sp in all_specs:
+                st = atomic_install(sp)
+                results.append((sp, st))
+                if st == "updated":
+                    updated += 1
+                prog.advance(task)
+
+        for sp, st in results:
+            col = "green" if st == "updated" else "dim"
+            console.print(f"[{col}]{st.upper():11}[/] {sp.dest} [dim]({sp.desc})[/]")
+    else:
         for sp in all_specs:
             st = atomic_install(sp)
-            results.append((sp, st))
             if st == "updated":
                 updated += 1
-            prog.advance(task)
-
-    removed = 0
-    for path in obsoletes:
-        st = remove_if_present(path)
-        if st == "removed":
-            removed += 1
-
-    for sp, st in results:
-        col = "green" if st == "updated" else "dim"
-        console.print(f"[{col}]{st.upper():11}[/] {sp.dest} [dim]({sp.desc})[/]")
+            print(f"{st.upper():11} {sp.dest} ({sp.desc})")
 
     subprocess.run(["systemctl", "daemon-reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     reload_user_manager()
 
     cmds = [
-        ["systemctl", "unmask", "systemd-oomd"],
         ["systemctl", "enable", "--now", "systemd-oomd"],
         ["systemctl", "restart", "systemd-oomd"],
     ]
@@ -353,16 +381,21 @@ def main() -> None:
         ["systemctl", "is-active", "--quiet", "systemd-oomd"],
         check=False
     ).returncode == 0
-    status_str = "[green]active[/]" if oomd_active else "[red]inactive[/]"
+    status_str = "[green]active[/]" if (HAVE_RICH and oomd_active) else ("active" if oomd_active else "inactive")
 
-    console.print(Panel.fit(
-        f"[bold green]✔ {updated} updated, {len(all_specs)-updated} up-to-date\n"
-        f"✔ Removed {removed} obsolete files\n"
-        f"✔ systemd-oomd status: {status_str} with SwapUsageMax=90% (ZRAM safe)\n"
+    prof = TIER_PROFILES[tier]
+    msg = (
+        f"✔ {updated} updated, {len(all_specs)-updated} up-to-date\n"
+        f"✔ systemd-oomd tier: {tier} (App: {prof['pressure_above']}/{prof['pressure_lasting']}, Swap: {prof['swap_max']}+{prof['swap_pressure']}/{prof['swap_lasting']}, Bg: {prof['bg_pressure_above']}/{prof['bg_pressure_lasting']})\n"
+        f"✔ systemd-oomd status: {status_str}\n"
         f"✔ Verify with: oomctl dump && systemctl status systemd-oomd\n"
-        f"✔ Note: Re-login required for DefaultOOMScoreAdjust to apply to newly spawned sessions[/]",
-        box=box.ROUNDED))
+        f"✔ Note: Re-login required for DefaultOOMScoreAdjust to apply to newly spawned sessions"
+    )
+
+    if HAVE_RICH and console:
+        console.print(Panel.fit(f"[bold green]{msg}[/]", box=box.ROUNDED))
+    else:
+        print(msg)
 
 if __name__ == "__main__":
     main()
-
