@@ -255,7 +255,18 @@ def build_cmdlines(topo: Dict, luks: Dict, hooks_str: str) -> Tuple[str, str, st
     if luks["found"]:
         if " sd-encrypt " in hooks_str:
             console.print("[green]Using sd-encrypt hook (systemd native)[/green]")
-            luks_part = f"rd.luks.name={luks['LUKS_UUID']}={luks['MAPPER_NAME']} rd.luks.options=discard root=UUID={topo['ROOT_UUID']}"
+            sd_luks_opts = ["discard"]
+            try:
+                bname = Path(luks["BACKING_DEV"]).resolve().name
+                rot_cand = Path(f"/sys/class/block/{bname}/queue/rotational")
+                if not rot_cand.exists():
+                    parent_name = re.sub(r"p?\d+$", "", bname)
+                    rot_cand = Path(f"/sys/class/block/{parent_name}/queue/rotational")
+                if rot_cand.exists() and rot_cand.read_text().strip() == "0":
+                    sd_luks_opts += ["no-read-workqueue", "no-write-workqueue"]
+            except Exception:
+                pass
+            luks_part = f"rd.luks.name={luks['LUKS_UUID']}={luks['MAPPER_NAME']} rd.luks.options={','.join(sd_luks_opts)} root=UUID={topo['ROOT_UUID']}"
         elif " encrypt " in hooks_str:
             console.print("[yellow]Using legacy encrypt hook[/yellow]")
             luks_part = f"cryptdevice=UUID={luks['LUKS_UUID']}:{luks['MAPPER_NAME']}:allow-discards root=/dev/mapper/{luks['MAPPER_NAME']}"

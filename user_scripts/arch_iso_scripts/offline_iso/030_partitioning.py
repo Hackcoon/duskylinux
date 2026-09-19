@@ -1011,7 +1011,19 @@ def format_root_and_efi(root_part, efi_part, format_efi, do_encrypt, boot_mode, 
             if r.returncode != 0:
                 console.print(f"[red]luksFormat fail {r.returncode}[/red]")
                 sys.exit(1)
-            ro = run("cryptsetup","open","--type","luks2","--allow-discards","--key-file","-",root_part,TARGET_CRYPT_NAME, input_text=luks_ba, check=False, capture=True)
+            crypt_open_args = ["cryptsetup", "open", "--type", "luks2", "--allow-discards"]
+            try:
+                pname = Path(root_part).resolve().name
+                rot_cand = Path(f"/sys/class/block/{pname}/queue/rotational")
+                if not rot_cand.exists():
+                    parent_name = re.sub(r"p?\d+$", "", pname)
+                    rot_cand = Path(f"/sys/class/block/{parent_name}/queue/rotational")
+                if rot_cand.exists() and rot_cand.read_text().strip() == "0":
+                    crypt_open_args += ["--perf-no_read_workqueue", "--perf-no_write_workqueue"]
+            except Exception:
+                pass
+            crypt_open_args += ["--key-file", "-", root_part, TARGET_CRYPT_NAME]
+            ro = run(*crypt_open_args, input_text=luks_ba, check=False, capture=True)
             if ro.returncode != 0:
                 console.print("[red]cryptsetup open fail[/red]")
                 sys.exit(1)
