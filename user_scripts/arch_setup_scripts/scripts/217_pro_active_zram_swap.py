@@ -366,7 +366,7 @@ def reclaim_cgroup_chunked(cgroup_dir: Path, target_bytes: int, label: str) -> t
 def perform_reclaim(force: bool = False, boot_flush: bool = False) -> None:
     """
     Executes a bounded slice-level memory reclaim sweep via Linux Kernel MGLRU.
-    If boot_flush=True: runs one-time baseline sweep at 45s boot, bypassing the 70% threshold
+    If boot_flush=True: runs one-time baseline sweep at 60s boot, bypassing the 70% threshold
     and 30% cap, letting MGLRU reclaim all cold startup residue into zRAM.
     """
     load_runtime_config()
@@ -457,8 +457,10 @@ def perform_reclaim(force: bool = False, boot_flush: bool = False) -> None:
         if total_requested >= budget_limit:
             break
         anon_bytes = get_cgroup_anon_bytes(cgroup_target)
+        if anon_bytes <= 0:
+            continue
         remaining_budget = budget_limit - total_requested
-        target_reclaim = min(int(anon_bytes * effective_ratio), remaining_budget) if anon_bytes > 0 else remaining_budget
+        target_reclaim = min(int(anon_bytes * effective_ratio), remaining_budget)
         if target_reclaim <= 0:
             continue
         req, stl = reclaim_cgroup_chunked(cgroup_target, target_reclaim, label)
@@ -474,17 +476,18 @@ def perform_reclaim(force: bool = False, boot_flush: bool = False) -> None:
         system_slice = Path("/sys/fs/cgroup/system.slice")
         if system_slice.exists() and (system_slice / "memory.reclaim").exists():
             sys_anon = get_cgroup_anon_bytes(system_slice)
-            remaining_budget = budget_limit - total_requested
-            sys_cap = remaining_budget if boot_flush else min(128 * 1024 * 1024, remaining_budget)
-            target_sys = min(int(sys_anon * effective_ratio), sys_cap) if sys_anon > 0 else sys_cap
-            if target_sys > 0:
-                req, stl = reclaim_cgroup_chunked(system_slice, target_sys, "system.slice")
-                total_requested += req
-                total_stolen += stl
-                if stl > 0:
-                    sys_mb = sys_anon / (1024 * 1024)
-                    cap_str = "100% (boot)" if boot_flush else f"{int(RECLAIM_RATIO*100)}%"
-                    ok(f"Reclaimed {stl / (1024*1024):.1f} MB cold pages from system.slice (anon: {sys_mb:.1f} MB, cap: {cap_str})")
+            if sys_anon > 0:
+                remaining_budget = budget_limit - total_requested
+                sys_cap = remaining_budget if boot_flush else min(128 * 1024 * 1024, remaining_budget)
+                target_sys = min(int(sys_anon * effective_ratio), sys_cap)
+                if target_sys > 0:
+                    req, stl = reclaim_cgroup_chunked(system_slice, target_sys, "system.slice")
+                    total_requested += req
+                    total_stolen += stl
+                    if stl > 0:
+                        sys_mb = sys_anon / (1024 * 1024)
+                        cap_str = "100% (boot)" if boot_flush else f"{int(RECLAIM_RATIO*100)}%"
+                        ok(f"Reclaimed {stl / (1024*1024):.1f} MB cold pages from system.slice (anon: {sys_mb:.1f} MB, cap: {cap_str})")
 
     elapsed_ms = (time.perf_counter() - start_time) * 1000
     zram_info = ""
