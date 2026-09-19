@@ -14,6 +14,9 @@ user_scripts/theme_matugen/firefox/config.json
 *.o
 *.so
 
+# macOS metadata
+.DS_Store
+
 # Python compilation cache files
 __pycache__/
 *.pyc
