@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-#  Dusky RAM Analyzer & Balloon Benchmark  -  v2.7 (Arch Linux Bleeding-Edge)
+#  Dusky RAM Analyzer & Balloon Benchmark  -  v2.8 (Arch Linux Bleeding-Edge)
 #  Target : Arch Linux (rolling) | Python 3.14+ | Linux 7.x | Textual 8.x+
 #  Scope  : Interactive mouse-driven & keyboard-driven TUI for ZRAM / Memory
 #           forensics and multi-category synthetic memory pressure ballooning:
@@ -9,6 +9,7 @@
 #           - [3] Clean Page Cache (reclaimable file cache, disk-backed fsync)
 #           - [4] Dirty Page Cache (unflushed disk writes, writeback testing)
 #           - [5] Shmem / Tmpfs (/dev/shm shared memory)
+#           - [6] Thrash / Stress (rapid cyclic anon memory pressure & thrash test)
 # =============================================================================
 
 import argparse
@@ -341,27 +342,63 @@ def get_zram() -> dict:
     return agg
 
 
-def get_psi() -> dict[str, float]:
+def parse_psi_text(text: str, prefix: str) -> dict[str, float]:
     out: dict[str, float] = {}
-    try:
-        text = Path("/proc/pressure/memory").read_text()
-    except OSError:
-        return out
     for line in text.splitlines():
         parts = line.split()
         if not parts:
             continue
+        kind = parts[0]  # 'some' or 'full'
         for item in parts[1:]:
             key, sep, val = item.partition("=")
             if sep:
                 try:
-                    out[f"{parts[0]}.{key}"] = float(val)
+                    out[f"{prefix}.{kind}.{key}"] = float(val)
                 except ValueError:
                     pass
     return out
 
 
-VMSTAT_KEYS = ("pswpin", "pswpout", "pgmajfault", "oom_kill")
+def get_psi() -> dict:
+    """Collects Pressure Stall Information across memory, cpu, io, and user cgroups."""
+    out: dict = {}
+    for res in ("memory", "cpu", "io"):
+        try:
+            p = Path(f"/proc/pressure/{res}")
+            if p.is_file():
+                out.update(parse_psi_text(p.read_text(), res))
+        except OSError:
+            pass
+
+    # Inspect CGroup memory pressure for the active user slice / desktop application slice
+    uid = os.getuid()
+    cgroup_paths = [
+        ("app.slice", Path(f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/memory.pressure")),
+        (f"user-{uid}.slice", Path(f"/sys/fs/cgroup/user.slice/user-{uid}.slice/memory.pressure")),
+        ("user.slice", Path("/sys/fs/cgroup/user.slice/memory.pressure")),
+        ("system.slice", Path("/sys/fs/cgroup/system.slice/memory.pressure")),
+    ]
+    for label, cp in cgroup_paths:
+        try:
+            if cp.is_file():
+                cg_data = parse_psi_text(cp.read_text(), "cgroup")
+                out.update(cg_data)
+                out["cgroup.label"] = label
+                break
+        except OSError:
+            continue
+    return out
+
+
+VMSTAT_KEYS = (
+    "pswpin",
+    "pswpout",
+    "pgmajfault",
+    "oom_kill",
+    "pgscan_kswapd",
+    "pgscan_direct",
+    "compact_stall",
+)
 
 
 def get_vmstat() -> dict[str, int]:
@@ -380,14 +417,57 @@ def get_vmstat() -> dict[str, int]:
     return out
 
 
+def get_oomd_info() -> dict:
+    """Zero-fork inspection of systemd-oomd daemon state and configured slice rules."""
+    active = False
+    if Path("/run/systemd/units/invocation:systemd-oomd.service").is_symlink() or \
+       Path("/run/systemd/units/invocation:systemd-oomd.service").exists():
+        active = True
+    else:
+        try:
+            for p in Path("/proc").iterdir():
+                if p.name.isdigit():
+                    comm_path = p / "comm"
+                    if comm_path.is_file() and comm_path.read_text().strip() == "systemd-oomd":
+                        active = True
+                        break
+        except OSError:
+            pass
+
+    rules: list[dict[str, str]] = []
+    for rdir in (Path("/etc/systemd/oomd/rules.d"), Path("/usr/lib/systemd/oomd/rules.d")):
+        try:
+            if rdir.is_dir():
+                for rf in sorted(rdir.glob("*.oomrule")):
+                    content = rf.read_text()
+                    r_swap = re.search(r"SwapUsageMax\s*=\s*([0-9%]+)", content)
+                    r_psi = re.search(r"MemoryPressureAbove\s*=\s*([0-9%]+)", content)
+                    r_last = re.search(r"LastingSec\s*=\s*([0-9a-zA-Z]+)", content)
+                    r_act = re.search(r"Action\s*=\s*([^\s\n]+)", content)
+                    rules.append({
+                        "name": rf.stem,
+                        "swap_max": r_swap.group(1) if r_swap else "",
+                        "psi_above": r_psi.group(1) if r_psi else "",
+                        "lasting": r_last.group(1) if r_last else "",
+                        "action": r_act.group(1) if r_act else "",
+                    })
+        except OSError:
+            pass
+
+    return {
+        "active": active,
+        "rules": rules,
+    }
+
+
 class RateMeter:
-    """Tracks per-second throughput rates of monotonic kernel counters."""
+    """Tracks per-second throughput rates of monotonic kernel counters and PSI total stalls."""
 
     def __init__(self) -> None:
-        self._prev: dict[str, int] = {}
+        self._prev: dict[str, int | float] = {}
         self._stamp = time.monotonic()
 
-    def update(self, sample: dict[str, int]) -> dict[str, float]:
+    def update(self, sample: dict[str, int | float]) -> dict[str, float]:
         now = time.monotonic()
         span = now - self._stamp
         rates: dict[str, float] = {}
@@ -441,6 +521,7 @@ def collect() -> dict:
         "zram": get_zram(),
         "psi": get_psi(),
         "vmstat": get_vmstat(),
+        "oomd": get_oomd_info(),
     }
 
 
@@ -459,6 +540,8 @@ class BalloonManager:
     4. DIRTY CACHE:  File-backed unflushed writes (/var/tmp), periodically redirtied.
                      Tests background writeback (dirty_background_bytes).
     5. SHMEM / TMPFS:Shared memory (/dev/shm). Must be swapped out to ZRAM.
+    6. THRASH/STRESS:Rapid cyclic anonymous page touching loop. Induces direct
+                     memory pressure, page scanning, and swap I/O thrashing.
     """
 
     PATTERN = b"DUSKY_ZRAM_"
@@ -472,10 +555,13 @@ class BalloonManager:
         self.dirty_files: list[tuple[tempfile._TemporaryFileWrapper, mmap.mmap]] = []
         # Store (path, file_obj, mmap_buf) for shmem to ensure robust unlinking
         self.shmem_files: list[tuple[str, object, mmap.mmap]] = []
+        self.thrash_blocks: list[bytearray] = []
 
         self._touch_running = True
         self._touch_thread = threading.Thread(target=self._touch_loop, daemon=True)
         self._touch_thread.start()
+        self._thrash_thread = threading.Thread(target=self._thrash_loop, daemon=True)
+        self._thrash_thread.start()
         atexit.register(self.cleanup)
 
     def _touch_loop(self) -> None:
@@ -493,6 +579,23 @@ class BalloonManager:
                 try:
                     for off in range(0, len(buf), 4096):
                         buf[off] = (buf[off] + 1) % 256
+                except Exception:
+                    pass
+
+    def _thrash_loop(self) -> None:
+        while self._touch_running:
+            if not self.thrash_blocks:
+                time.sleep(0.2)
+                continue
+            for block in list(self.thrash_blocks):
+                try:
+                    blen = len(block)
+                    # Rapid cyclic stride touching to actively dirty pages and trigger page faults / swap thrash
+                    for off in range(0, blen, 4096):
+                        block[off] = (block[off] + 1) & 0xFF
+                        if off + 64 < blen:
+                            block[off + 64] ^= 0xAA
+                    time.sleep(0.02)
                 except Exception:
                     pass
 
@@ -576,6 +679,18 @@ class BalloonManager:
         except (MemoryError, OSError):
             return False
 
+    def add_thrash(self) -> bool:
+        size = self.chunk_mb * MIB
+        try:
+            block = bytearray(size)
+            tmpl = self._template()
+            for off in range(0, size, MIB):
+                block[off:off + MIB] = tmpl
+            self.thrash_blocks.append(block)
+            return True
+        except MemoryError:
+            return False
+
     # --- Free Chunks ---
     def free_dormant(self) -> bool:
         if not self.dormant_blocks:
@@ -646,6 +761,12 @@ class BalloonManager:
                 os.unlink(path)
         except Exception:
             pass
+        return True
+
+    def free_thrash(self) -> bool:
+        if not self.thrash_blocks:
+            return False
+        self.thrash_blocks.pop()
         return True
 
     # --- Actions ---
@@ -742,6 +863,9 @@ class BalloonManager:
         if cat in (None, "shmem"):
             while self.free_shmem():
                 pass
+        if cat in (None, "thrash"):
+            while self.free_thrash():
+                pass
 
     def cleanup(self) -> None:
         self._touch_running = False
@@ -755,6 +879,7 @@ class BalloonManager:
             + len(self.clean_files)
             + len(self.dirty_files)
             + len(self.shmem_files)
+            + len(self.thrash_blocks)
         ) * self.chunk_mb
 
     @property
@@ -765,6 +890,7 @@ class BalloonManager:
             "clean": len(self.clean_files),
             "dirty": len(self.dirty_files),
             "shmem": len(self.shmem_files),
+            "thrash": len(self.thrash_blocks),
         }
 
 
@@ -829,38 +955,126 @@ def panel_memory(snap: dict) -> Panel:
 def panel_pressure(snap: dict) -> Panel:
     psi = snap["psi"]
     rates = snap.get("rates", {})
+    mem = snap.get("mem", {})
+    oomd = snap.get("oomd", {})
     table = new_table()
 
     if psi:
-        some10 = psi.get("some.avg10", 0.0)
-        some60 = psi.get("some.avg60", 0.0)
-        some300 = psi.get("some.avg300", 0.0)
-        full10 = psi.get("full.avg10", 0.0)
-        full60 = psi.get("full.avg60", 0.0)
-        full300 = psi.get("full.avg300", 0.0)
+        mem_some_live = min(100.0, rates.get("memory.some.total", 0.0) / 10000.0)
+        mem_full_live = min(100.0, rates.get("memory.full.total", 0.0) / 10000.0)
 
-        some_st = SUCCESS if some10 < 5.0 else WARNING if some10 < 20.0 else f"bold {ERROR}"
-        full_st = SUCCESS if full10 < 1.0 else WARNING if full10 < 10.0 else f"bold {ERROR}"
+        ms10 = psi.get("memory.some.avg10", 0.0)
+        ms60 = psi.get("memory.some.avg60", 0.0)
+        ms300 = psi.get("memory.some.avg300", 0.0)
+        mf10 = psi.get("memory.full.avg10", 0.0)
+        mf60 = psi.get("memory.full.avg60", 0.0)
+        mf300 = psi.get("memory.full.avg300", 0.0)
 
-        table.add_row("PSI Some [dim]10s/60s/300s[/dim]", f"[{some_st}]{some10:.2f}[/{some_st}] / {some60:.2f} / {some300:.2f}")
-        table.add_row("PSI Full [dim]10s/60s/300s[/dim]", f"[{full_st}]{full10:.2f}[/{full_st}] / {full60:.2f} / {full300:.2f}")
+        ms_color = SUCCESS if ms10 < 5.0 and mem_some_live < 5.0 else WARNING if ms10 < 20.0 and mem_some_live < 20.0 else f"bold {ERROR}"
+        mf_color = SUCCESS if mf10 < 1.0 and mem_full_live < 1.0 else WARNING if mf10 < 10.0 and mem_full_live < 10.0 else f"bold {ERROR}"
+
+        table.add_row(
+            "Memory PSI Some [dim](10s/60s/300s)[/dim]",
+            f"[{ms_color}]{mem_some_live:4.1f}% live[/{ms_color}] • [{ms_color}]{ms10:4.2f}[/{ms_color}]/{ms60:.2f}/{ms300:.2f}",
+        )
+        table.add_row(
+            "Memory PSI Full [dim](OOM Thrash)[/dim]",
+            f"[{mf_color}]{mem_full_live:4.1f}% live[/{mf_color}] • [{mf_color}]{mf10:4.2f}[/{mf_color}]/{mf60:.2f}/{mf300:.2f}",
+        )
+
+        cpu_live = min(100.0, rates.get("cpu.some.total", 0.0) / 10000.0)
+        cpu10 = psi.get("cpu.some.avg10", 0.0)
+        cpu60 = psi.get("cpu.some.avg60", 0.0)
+        cpu_color = SUCCESS if cpu10 < 15.0 and cpu_live < 25.0 else WARNING if cpu10 < 50.0 else f"bold {ERROR}"
+        table.add_row(
+            "CPU PSI Some [dim](Contention)[/dim]",
+            f"[{cpu_color}]{cpu_live:4.1f}% live[/{cpu_color}] • [{cpu_color}]{cpu10:4.2f}[/{cpu_color}]/{cpu60:.2f}",
+        )
+
+        io_live = min(100.0, rates.get("io.some.total", 0.0) / 10000.0)
+        io10 = psi.get("io.some.avg10", 0.0)
+        io_f10 = psi.get("io.full.avg10", 0.0)
+        table.add_row(
+            "I/O PSI Some / Full [dim](Disk/Swap)[/dim]",
+            f"{io_live:4.1f}% live • {io10:.2f} [dim]some[/dim] / {io_f10:.2f} [dim]full[/dim]",
+        )
+
+        if "cgroup.some.avg10" in psi:
+            cg_lbl = psi.get("cgroup.label", "app.slice")
+            cg10 = psi.get("cgroup.some.avg10", 0.0)
+            cg_live = min(100.0, rates.get("cgroup.some.total", 0.0) / 10000.0)
+            cg_color = SUCCESS if cg10 < 10.0 else WARNING if cg10 < 30.0 else f"bold {ERROR}"
+            table.add_row(
+                f"CGroup PSI [dim]({cg_lbl})[/dim]",
+                f"[{cg_color}]{cg_live:4.1f}% live • {cg10:.2f} avg10[/{cg_color}]",
+            )
     else:
-        table.add_row("PSI Pressure", "[dim]n/a[/dim]")
+        table.add_row("Pressure (PSI)", "[dim]kernel PSI disabled or unavailable[/dim]")
 
     table.add_row("", "")
     swap_in = rates.get("pswpin", 0.0) * PAGE_SIZE
     swap_out = rates.get("pswpout", 0.0) * PAGE_SIZE
-    table.add_row("Swap In Rate [dim](Decompr)[/dim]", f"{fmt_bytes(swap_in)}/s")
-    table.add_row("Swap Out Rate [dim](Compress)[/dim]", f"[bold {ACCENT}]{fmt_bytes(swap_out)}/s[/bold {ACCENT}]")
-    table.add_row("Major Page Faults", f"{rates.get('pgmajfault', 0.0):.0f}/s")
-
-    oom_kills = snap["vmstat"].get("oom_kill")
     table.add_row(
-        "OOM Kills [dim](Since Boot)[/dim]",
-        "[dim]n/a[/dim]" if oom_kills is None else (f"[bold {ERROR}]{oom_kills}[/bold {ERROR}]" if oom_kills else "0"),
+        "Swap I/O [dim](Decompr / Compr)[/dim]",
+        f"In: {fmt_bytes(swap_in)}/s • Out: [bold {ACCENT}]{fmt_bytes(swap_out)}/s[/bold {ACCENT}]",
     )
 
-    return Panel(table, title=f"[bold {WARNING}]Memory Pressure (PSI) & Swap I/O Rates", border_style=WARNING, padding=(0, 1))
+    pg_direct = rates.get("pgscan_direct", 0.0)
+    pg_kswapd = rates.get("pgscan_kswapd", 0.0)
+    if pg_direct > 0:
+        scan_str = f"[bold {ERROR}]{pg_direct:.0f}/s direct (thrash!)[/bold {ERROR}] • {pg_kswapd:.0f}/s kswapd"
+    else:
+        scan_str = f"0/s direct • {pg_kswapd:.0f}/s kswapd"
+    table.add_row("Page Reclaim [dim](Direct vs Async)[/dim]", scan_str)
+
+    maj_fault = rates.get("pgmajfault", 0.0)
+    comp_stall = rates.get("compact_stall", 0.0)
+    table.add_row(
+        "Faults / Compaction Stalls",
+        f"{maj_fault:.0f}/s faults • {comp_stall:.0f}/s stalls",
+    )
+
+    table.add_row("", "")
+    oomd_act = oomd.get("active", False)
+    oomd_lbl = f"[bold {SUCCESS}]active (monitoring)[/bold {SUCCESS}]" if oomd_act else "[dim]inactive[/dim]"
+    table.add_row("systemd-oomd Daemon", oomd_lbl)
+
+    rules = oomd.get("rules", [])
+    if rules:
+        rule_snippets = []
+        for r in rules:
+            if r.get("swap_max"):
+                rule_snippets.append(f"Swap≥{r['swap_max']}")
+            if r.get("psi_above"):
+                rule_snippets.append(f"PSI≥{r['psi_above']}({r.get('lasting','')})")
+        tw_str = " • ".join(rule_snippets[:3])
+        table.add_row("Active Kill Tripwires", f"[dim]{tw_str}[/dim]")
+    else:
+        table.add_row("Default Kill Tripwires", "[dim]Swap≥90% • PSI≥60% (30s)[/dim]")
+
+    sw_tot = mem.get("SwapTotal", 0)
+    sw_free = mem.get("SwapFree", 0)
+    sw_used = max(sw_tot - sw_free, 0)
+    sw_frac = sw_used / sw_tot if sw_tot else 0.0
+
+    mem_some_10 = psi.get("memory.some.avg10", 0.0) if psi else 0.0
+    mem_some_cur = rates.get("memory.some.total", 0.0) / 10000.0 if rates else 0.0
+    effective_psi = max(mem_some_10, mem_some_cur)
+
+    if sw_frac >= 0.85 and effective_psi >= 10.0:
+        risk_str = f"[bold white on {ERROR}] CRITICAL (Kill Imminent - Tripwire Active) [/bold white on {ERROR}]"
+    elif sw_frac >= 0.85 or effective_psi >= 35.0:
+        risk_str = f"[bold {ERROR}] HIGH (Tripwire Proximity) [/bold {ERROR}]"
+    elif sw_frac >= 0.70 or effective_psi >= 15.0 or pg_direct > 0:
+        risk_str = f"[{WARNING}] ELEVATED (Reclaim Thrash) [/{WARNING}]"
+    else:
+        risk_str = f"[{SUCCESS}] NORMAL (Safe) [/{SUCCESS}]"
+
+    oom_kills = snap["vmstat"].get("oom_kill", 0)
+    kill_cnt_str = f"[bold {ERROR}]{oom_kills}[/bold {ERROR}]" if oom_kills else "0"
+    table.add_row("OOM Risk / Kills (Boot)", f"{risk_str} • {kill_cnt_str} kills")
+
+    return Panel(table, title=f"[bold {WARNING}]Memory Pressure (PSI) & OOM Dynamics", border_style=WARNING, padding=(0, 1))
 
 
 def panel_processes(procs: list[tuple[int, int, int, str]], total_ram: int) -> Panel:
@@ -930,21 +1144,33 @@ def panel_vm(snap: dict) -> Panel:
     swappiness = read_str("/proc/sys/vm/swappiness")
     page_cluster = read_str("/proc/sys/vm/page-cluster")
     watermark = read_str("/proc/sys/vm/watermark_scale_factor")
+    watermark_boost = read_str("/proc/sys/vm/watermark_boost_factor")
     vfs_pressure = read_str("/proc/sys/vm/vfs_cache_pressure")
     proactiveness = read_str("/proc/sys/vm/compaction_proactiveness")
+    compact_unevict = read_str("/proc/sys/vm/compact_unevictable_allowed")
     min_free = read_int("/proc/sys/vm/min_free_kbytes")
     overcommit = read_str("/proc/sys/vm/overcommit_memory")
+    stat_interval = read_str("/proc/sys/vm/stat_interval")
+    dirty_writeback = read_int("/proc/sys/vm/dirty_writeback_centisecs")
+    max_map = read_int("/proc/sys/vm/max_map_count")
 
     table.add_row("vm.swappiness", cell(swappiness))
     table.add_row(
         "vm.page-cluster [dim](0=opt)[/dim]",
         cell(page_cluster, f"bold {SUCCESS}" if page_cluster == "0" else f"bold {WARNING}"),
     )
-    table.add_row("vm.watermark_scale", cell(watermark))
+    table.add_row("vm.watermark_scale", cell(watermark, f"bold {SUCCESS}" if watermark == "10" else ""))
+    table.add_row("vm.watermark_boost", cell(watermark_boost, f"bold {SUCCESS}" if watermark_boost == "0" else ""))
     table.add_row("vm.vfs_cache_pressure", cell(vfs_pressure))
     table.add_row("vm.compaction_proact", cell(proactiveness))
+    table.add_row("vm.compact_unevict", cell(compact_unevict))
     table.add_row("vm.min_free_kbytes", fmt_bytes(min_free * 1024) if min_free is not None else "[dim]n/a[/dim]")
     table.add_row("vm.overcommit_memory", cell(overcommit))
+    table.add_row("vm.stat_interval", f"{stat_interval}s" if stat_interval not in (MISSING, DENIED) else cell(stat_interval))
+    if dirty_writeback is not None:
+        table.add_row("vm.dirty_writeback", f"{dirty_writeback / 100.0:.1f}s")
+    if max_map is not None:
+        table.add_row("vm.max_map_count", f"{max_map:,}")
 
     dirty_bg = read_int("/proc/sys/vm/dirty_background_bytes")
     dirty_limit = read_int("/proc/sys/vm/dirty_bytes")
@@ -960,6 +1186,12 @@ def panel_vm(snap: dict) -> Panel:
 
     thp_en = read_selected("/sys/kernel/mm/transparent_hugepage/enabled")
     table.add_row("thp.enabled", cell(thp_en))
+    thp_defrag = read_selected("/sys/kernel/mm/transparent_hugepage/defrag")
+    table.add_row("thp.defrag", cell(thp_defrag))
+    thp_shmem = read_selected("/sys/kernel/mm/transparent_hugepage/shmem_enabled")
+    table.add_row("thp.shmem_enabled", cell(thp_shmem))
+    khuge_ptes = read_str("/sys/kernel/mm/transparent_hugepage/khugepaged/max_ptes_none")
+    table.add_row("khugepaged.max_ptes_none", cell(khuge_ptes))
 
     zswap = read_str("/sys/module/zswap/parameters/enabled")
     if zswap not in (MISSING, DENIED) and zswap.upper().startswith("Y"):
@@ -983,6 +1215,7 @@ def panel_balloon(mgr: BalloonManager, active_category: str) -> Panel:
         ("clean", "[3] Clean Cache", "Reclaimable File Cache"),
         ("dirty", "[4] Dirty Cache", "Unwritten Disk Writes"),
         ("shmem", "[5] Shmem Tmpfs", "/dev/shm Swappable"),
+        ("thrash", "[6] Thrash Stress", "Active Cyclic RW"),
     ]
 
     for key, name, desc in categories:
@@ -1033,7 +1266,7 @@ class ShortcutsScreen(ModalScreen[None]):
             text.append("Synthetic Balloon Categories\n", style=f"bold {ACCENT}")
             text.append("  1: Dormant Anon (Cold Swap)       2: Active Anon (Foreground LRU)\n")
             text.append("  3: Clean Cache (Reclaimable)      4: Dirty Cache (Unwritten Disk)\n")
-            text.append("  5: Shmem / Tmpfs (/dev/shm)\n\n")
+            text.append("  5: Shmem / Tmpfs (/dev/shm)       6: Thrash / Stress (Cyclic Pressure)\n\n")
 
             text.append("Memory Pressure Actions\n", style=f"bold {ACCENT}")
             text.append("  + / =  Allocate +1 chunk          - / _  Free -1 chunk\n")
@@ -1319,6 +1552,7 @@ class DuskyRAMAnalyzer(App):
         ("3", "set_type('clean')", "Clean"),
         ("4", "set_type('dirty')", "Dirty"),
         ("5", "set_type('shmem')", "Shmem"),
+        ("6", "set_type('thrash')", "Thrash"),
         ("+", "add_chunk", "Add"),
         ("=", "add_chunk", "Add"),
         ("-", "free_chunk", "Free"),
@@ -1383,6 +1617,7 @@ class DuskyRAMAnalyzer(App):
                     yield Button("3:Clean", id="type_clean", classes="type-btn")
                     yield Button("4:Dirty", id="type_dirty", classes="type-btn")
                     yield Button("5:Shmem", id="type_shmem", classes="type-btn")
+                    yield Button("6:Thrash", id="type_thrash", classes="type-btn")
                 yield Static(classes="spacer")
                 with Horizontal(classes="btn-group"):
                     yield Button("󰌌 F1 Help", id="btn_help")
@@ -1421,7 +1656,14 @@ class DuskyRAMAnalyzer(App):
     def refresh_dashboards(self) -> None:
         try:
             snap = collect()
-            snap["rates"] = self.rates.update(snap["vmstat"])
+            counters: dict[str, int | float] = dict(snap["vmstat"])
+            for k, v in snap["psi"].items():
+                if k.endswith(".total"):
+                    try:
+                        counters[k] = float(v)
+                    except (ValueError, TypeError):
+                        pass
+            snap["rates"] = self.rates.update(counters)
             tot_ram = snap["mem"].get("MemTotal", 0)
 
             self.w_mem.update(panel_memory(snap))
@@ -1450,7 +1692,7 @@ class DuskyRAMAnalyzer(App):
 
     def action_set_type(self, cat: str) -> None:
         self.active_category = cat
-        for c in ("dormant", "active", "clean", "dirty", "shmem"):
+        for c in ("dormant", "active", "clean", "dirty", "shmem", "thrash"):
             try:
                 btn = self.query_one(f"#type_{c}", Button)
                 if c == cat:
@@ -1483,6 +1725,7 @@ class DuskyRAMAnalyzer(App):
                     "clean": self.balloon.add_clean,
                     "dirty": self.balloon.add_dirty,
                     "shmem": self.balloon.add_shmem,
+                    "thrash": self.balloon.add_thrash,
                 }.get(cat)
                 success = fn() if fn else False
                 if success:
@@ -1506,6 +1749,7 @@ class DuskyRAMAnalyzer(App):
             "clean": self.balloon.free_clean,
             "dirty": self.balloon.free_dirty,
             "shmem": self.balloon.free_shmem,
+            "thrash": self.balloon.free_thrash,
         }.get(cat)
         if fn and fn():
             self.notify_status(f"Freed -{self.balloon.chunk_mb} MiB {cat.upper()} (Total: {self.balloon.total_mb} MiB)")
