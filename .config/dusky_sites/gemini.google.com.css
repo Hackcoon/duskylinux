@@ -84,5 +84,6 @@
     div.scroll-container { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.scroll-container%1Fbg | bg: surface */
     div[data-test-id="overflow-container"] { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv%5Bdata-test-id%3D%22overflow-container%22%5D%1Fbg | bg: surface */
     input-area-v2.ng-tns-c1873170697-4.ng-tns-c2287058552-3.ui-improvements-phase-1 { background-color: var(--surface_container_high) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Finput-area-v2.ng-tns-c1873170697-4.ng-tns-c2287058552-3.ui-improvements-phase-1%1Fbg | bg: surface_container_high */
+    input-container.hide-on-print.ng-tns-c2287058552-3.ng-tns-c1211221456-2 { background-color: var(--surface_container_low) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Finput-container.hide-on-print.ng-tns-c2287058552-3.ng-tns-c1211221456-2%1Fbg | bg: surface_container_low */
     /* <<< dusky:picks */
 }
