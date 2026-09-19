@@ -1561,22 +1561,22 @@ case "$MODE" in
                             send_osd "$tot_fmt"
                             ;;
                         network-down-session)
-                            send_osd "$s_rx_fmt ${s_rx_u:-MB}"
+                            send_osd "$s_rx_fmt"
                             ;;
                         network-up-session)
-                            send_osd "$s_tx_fmt ${s_tx_u:-MB}"
+                            send_osd "$s_tx_fmt"
                             ;;
                         network-session)
-                            send_osd "$s_tot_fmt ${s_tot_u:-MB}"
+                            send_osd "$s_tot_fmt"
                             ;;
                         network-boot-down)
-                            send_osd "$b_rx_fmt ${b_rx_u:-MB}"
+                            send_osd "$b_rx_fmt"
                             ;;
                         network-boot-up)
-                            send_osd "$b_tx_fmt ${b_tx_u:-MB}"
+                            send_osd "$b_tx_fmt"
                             ;;
                         network-boot)
-                            send_osd "$b_tot_fmt ${b_tot_u:-GB}"
+                            send_osd "$b_tot_fmt"
                             ;;
                         network|*)
                             if [[ -r "$STATE_FILE" ]] && read -r _u _up _down _c < "$STATE_FILE" 2>/dev/null && [[ -n "${_c:-}" ]]; then
