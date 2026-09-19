@@ -35,6 +35,8 @@ print_help() {
 ${C_BOLD}Usage:${C_RESET} ${SCRIPT_NAME} [OPTIONS]
 
 Optimize systemd-journald volatile RAM consumption, disk retention, and flush policies.
+• <= 16GB class: RuntimeMaxUse=8M, RuntimeMaxFileSize=2M, Audit=no (ultra-lean RAM)
+• > 16GB class:  RuntimeMaxUse=32M, RuntimeMaxFileSize=4M, Audit=keep
 
 Options:
   -f, --force-rotate   Force journal rotation and vacuuming even if config is unchanged
@@ -63,12 +65,46 @@ fi
 
 log_info "Initializing systemd-journald memory and throughput optimizer..."
 
+# --- Dynamic Hardware & Memory Tier Detection ---
+declare -i RAM_KB=0
+if [[ $(< /proc/meminfo) =~ MemTotal:[[:space:]]+([0-9]+) ]]; then
+    RAM_KB=$(( BASH_REMATCH[1] ))
+else
+    RAM_KB=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+fi
+
+declare -i RAM_MB=$(( RAM_KB / 1024 ))
+declare -i RAM_GB=$(( (RAM_MB + 512) / 1024 ))
+
+# 16GB tier cutoff: 17,825,792 KiB (17 GiB accounts for 16GB DIMMs with iGPU/UMA carve-outs)
+# <= 16GB class: RuntimeMaxUse=8M, RuntimeMaxFileSize=2M, Audit=no (ultra-low boot RAM)
+# > 16GB class:  RuntimeMaxUse=32M, RuntimeMaxFileSize=4M, Audit=keep (high headroom)
+RUNTIME_MAX_USE="32M"
+RUNTIME_MAX_FILE_SIZE="4M"
+AUDIT_POLICY="keep"
+TIER_DESC=""
+
+if (( RAM_KB <= 17825792 )); then
+    RUNTIME_MAX_USE="8M"
+    RUNTIME_MAX_FILE_SIZE="2M"
+    AUDIT_POLICY="no"
+    TIER_DESC="Efficiency (<=16GB class, ${RAM_GB}GB detected) -> RuntimeMaxUse=8M, Audit=no"
+else
+    RUNTIME_MAX_USE="32M"
+    RUNTIME_MAX_FILE_SIZE="4M"
+    AUDIT_POLICY="keep"
+    TIER_DESC="Performance (>16GB class, ${RAM_GB}GB detected) -> RuntimeMaxUse=32M, Audit=keep"
+fi
+
+log_info "Detected Memory Tier: ${C_BOLD}${TIER_DESC}${C_RESET}"
+
 tmp_conf="$(umask 077 && mktemp)"
 trap 'rm -f "$tmp_conf"' EXIT
 
-cat > "$tmp_conf" <<'EOF'
+cat > "$tmp_conf" <<EOF
 # Managed by 213_systemd_journaling_optimizer.sh
 # Scope: Cap volatile RAM consumption in /run/log/journal and persistent storage in /var/log/journal
+# Tier: ${TIER_DESC}
 
 [Journal]
 Storage=persistent
@@ -80,9 +116,9 @@ SystemMaxFileSize=16M
 SystemMaxFiles=7
 SystemKeepFree=500M
 
-# Volatile tmpfs caps (/run/log/journal - RAM use): max 32M total, rotated at 4M
-RuntimeMaxUse=32M
-RuntimeMaxFileSize=4M
+# Volatile tmpfs caps (/run/log/journal - RAM use): max ${RUNTIME_MAX_USE} total, rotated at ${RUNTIME_MAX_FILE_SIZE}
+RuntimeMaxUse=${RUNTIME_MAX_USE}
+RuntimeMaxFileSize=${RUNTIME_MAX_FILE_SIZE}
 RuntimeMaxFiles=4
 RuntimeKeepFree=16M
 
@@ -101,8 +137,8 @@ RateLimitBurst=1000
 # Note: To enable debug log storage temporarily, create a drop-in with MaxLevelStore=debug.
 MaxLevelStore=info
 
-# Audit subsystem ingestion disable: eliminates duplicate kernel audit log buffers in userspace
-Audit=no
+# Audit subsystem ingestion: eliminate duplicate buffers on <=16GB, keep external policy on >16GB
+Audit=${AUDIT_POLICY}
 
 # Duplicate log forwarding suppression (saves IPC, CPU cycles, and memory buffers)
 ForwardToSyslog=no

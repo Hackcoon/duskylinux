@@ -20,6 +20,8 @@ from typing import NoReturn
 
 SYSTEMD_CONF_DIR = Path("/etc/systemd/system.conf.d")
 DROPIN_FILE = SYSTEMD_CONF_DIR / "99-default-accounting.conf"
+USER_CONF_DIR = Path("/etc/systemd/user.conf.d")
+USER_DROPIN_FILE = USER_CONF_DIR / "99-default-accounting.conf"
 
 VALID_KEYS = [
     "DefaultMemoryAccounting",
@@ -103,39 +105,10 @@ def get_manager_defaults() -> dict[str, str]:
         out.setdefault(k, "")
     return out
 
-def is_oomd_active() -> bool:
-    try:
-        r = run("systemctl", "is-active", "--quiet", "systemd-oomd.service", check=False)
-        return r.returncode == 0
-    except Exception:
-        return False
 
-def check_oomd_slice_accounting() -> bool:
-    candidate_paths = [
-        Path("/etc/systemd/user/app.slice.d/90-desktop-oomd.conf"),
-        Path("/etc/systemd/user/app.slice.d/10-oomd.conf"),
-        Path("/etc/systemd/system/app.slice.d/90-desktop-oomd.conf"),
-    ]
-    for p in candidate_paths:
-        if p.exists():
-            try:
-                content = p.read_text(encoding="utf-8")
-                if "MemoryAccounting=yes" in content:
-                    return True
-            except Exception:
-                pass
-    return False
 
 def write_dropin_atomic(target: Path, content: str) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        backup_path = target.with_suffix(".conf.bak")
-        try:
-            shutil.copy2(target, backup_path)
-            info(f"Created backup at {backup_path}")
-        except Exception as e:
-            warn(f"Failed to create backup of {target}: {e}")
-
     fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.tmp.")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -206,7 +179,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--restore", action="store_true", help="Remove drop-in configuration and restore system defaults")
     ap.add_argument("-f", "--force", action="store_true", help="Rewrite drop-in even if already matching")
     ap.add_argument("-q", "--quiet", action="store_true", help="Suppress info/ok messages")
-    ap.add_argument("-y", "--yes", action="store_true", help="Bypass systemd-oomd slice accounting check")
+    ap.add_argument("-y", "--yes", action="store_true", help="Accept defaults non-interactively")
     ap.add_argument("--no-color", action="store_true", help="Disable colored output")
     args = ap.parse_args(argv)
 
@@ -224,13 +197,17 @@ def main(argv: list[str]) -> int:
             target = DESIRED_STATE[k]
             status_tag = f"{C.GRN}[MATCH]{C.RST}" if cur == target else f"{C.YLW}[DIFF (target: {target})]{C.RST}"
             print(f"  {k:25} = {cur:<10} {status_tag}")
-        dropin_status = f"{C.GRN}present{C.RST}" if DROPIN_FILE.exists() else f"{C.DIM}absent{C.RST}"
-        print(f"\nDrop-in ({DROPIN_FILE}): {dropin_status}\n")
+        sys_dropin_status = f"{C.GRN}present{C.RST}" if DROPIN_FILE.exists() else f"{C.DIM}absent{C.RST}"
+        user_dropin_status = f"{C.GRN}present{C.RST}" if USER_DROPIN_FILE.exists() else f"{C.DIM}absent{C.RST}"
+        print(f"\nSystem Drop-in ({DROPIN_FILE}): {sys_dropin_status}")
+        print(f"User Drop-in   ({USER_DROPIN_FILE}): {user_dropin_status}\n")
         return 0
 
     payload = generate_payload()
     if args.dry_run:
-        print(f"\n{C.BOLD}[DRY RUN] Target file: {DROPIN_FILE}{C.RST}\n")
+        print(f"\n{C.BOLD}[DRY RUN] Target files:{C.RST}")
+        print(f"  System: {DROPIN_FILE}")
+        print(f"  User:   {USER_DROPIN_FILE}\n")
         print(payload)
         return 0
 
@@ -244,48 +221,33 @@ def main(argv: list[str]) -> int:
         die("systemd does not appear to be running as PID 1 (no /run/systemd/system). Are you in a chroot/container?")
 
     if args.restore:
-        if not DROPIN_FILE.exists():
-            ok("No optimizer drop-in exists to remove.")
+        removed_any = False
+        for target in (DROPIN_FILE, USER_DROPIN_FILE):
+            if target.exists():
+                try:
+                    target.unlink()
+                    ok(f"Removed {target}")
+                    removed_any = True
+                except Exception as e:
+                    die(f"Failed to remove {target}: {e}")
+        if not removed_any:
+            ok("No optimizer drop-ins exist to remove.")
             return 0
-        try:
-            DROPIN_FILE.unlink()
-            ok(f"Removed {DROPIN_FILE}")
-            backup_path = DROPIN_FILE.with_suffix(".conf.bak")
-            if backup_path.exists():
-                backup_path.unlink()
-                ok(f"Removed backup file {backup_path}")
-        except Exception as e:
-            die(f"Failed to remove {DROPIN_FILE}: {e}")
         reexec_systemd_manager()
         ok("Restore complete. Manager defaults reset to system defaults.")
         return 0
 
-    if is_oomd_active() and not args.yes and not args.dry_run:
-        if not check_oomd_slice_accounting():
-            warn("systemd-oomd is active, but explicit MemoryAccounting=yes was not detected in /etc/systemd/user/app.slice.d/.")
-            warn("Disabling DefaultMemoryAccounting globally without explicit slice accounting will blind systemd-oomd to desktop apps.")
-            warn("Please deploy 211_systemd_oomd_zram.py first, or pass --yes to proceed anyway.")
-            if sys.stdin.isatty():
-                try:
-                    ans = input("Continue anyway? [y/N]: ").strip().lower()
-                    if ans not in ("y", "yes"):
-                        info("Aborted by user.")
-                        return 1
-                except (EOFError, KeyboardInterrupt):
-                    print()
-                    return 130
-            else:
-                die("systemd-oomd is active and explicit slice accounting is missing. Run 211 first or pass --yes to override.")
-
     vals = get_manager_defaults()
     already_opt = all(vals.get(k) == DESIRED_STATE[k] for k in VALID_KEYS)
-    if already_opt and not args.force and DROPIN_FILE.exists():
+    if already_opt and not args.force and DROPIN_FILE.exists() and USER_DROPIN_FILE.exists():
         ok("Systemd manager defaults are already fully optimized.")
         return 0
 
     try:
         write_dropin_atomic(DROPIN_FILE, payload)
         ok(f"Wrote atomic configuration to {DROPIN_FILE} (0644)")
+        write_dropin_atomic(USER_DROPIN_FILE, payload)
+        ok(f"Wrote atomic configuration to {USER_DROPIN_FILE} (0644)")
     except Exception as e:
         die(f"Failed writing drop-in file: {e}")
 
