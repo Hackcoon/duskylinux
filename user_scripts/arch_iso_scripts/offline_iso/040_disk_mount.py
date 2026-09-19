@@ -466,12 +466,12 @@ def validate_root_state(mapped_root):
 def validate_efi_partition(part):
     r=run("lsblk","-ndlo","FSTYPE,PARTTYPE",str(part),check=False,capture=True)
     out=r.stdout.lower()
-    if EFI_GPT_TYPE not in out and "vfat" not in out and "fat32" not in out:
+    if EFI_GPT_TYPE not in out and "0xef" not in out and "vfat" not in out and "fat32" not in out:
         # Same stale-udev concern as validate_root_state: ask blkid directly.
         btype=probe_fstype(part)
         pt=run("blkid","-p","-c","/dev/null","-o","value","-s","PART_ENTRY_TYPE",str(part),check=False,capture=True)
         out=f"{out} {btype} {(pt.stdout or '').lower()}"
-    if EFI_GPT_TYPE not in out and "vfat" not in out and "fat32" not in out:
+    if EFI_GPT_TYPE not in out and "0xef" not in out and "vfat" not in out and "fat32" not in out:
         console.print(f"[red]{part} is not an EFI System Partition (no ESP type, not vfat).[/red]")
         console.print("[yellow]Pick the small vfat/EFI partition (on Windows dual-boot that is the existing Windows EFI, ~100M-1G), not the Windows data partition.[/yellow]")
         sys.exit(1)
