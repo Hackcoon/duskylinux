@@ -80,6 +80,12 @@ def run(*cmd, check=True, capture=True, input_text=None, timeout=300):
                 err = err.strip()
                 if err: console.print(f"[red]Details: {err}[/red]")
         raise
+    except OSError:
+        # Best-effort calls (check=False) must not kill the whole installer
+        # when a binary is missing or unreadable - report failure instead.
+        if check:
+            raise
+        return subprocess.CompletedProcess(argv, 127, stdout="", stderr=f"{argv[0]}: not available")
 
 def detect_boot_mode():
     try:
@@ -420,20 +426,50 @@ def determine_root_partition(auto_mode):
             sys.exit(1)
     return mapped_root, root_part, root_disk
 
+def probe_fstype(dev):
+    """
+    Direct blkid probe, bypassing the udev database. lsblk reads fstype from
+    udev's cache, which can be stale or empty for a partition that was just
+    formatted this boot (or when udevd is wedged), which used to abort the
+    install with a bare 'not btrfs' even though the filesystem was fine.
+    """
+    r=run("blkid","-o","value","-s","TYPE",str(dev),check=False,capture=True)
+    return (r.stdout or "").strip().lower()
+
 def validate_root_state(mapped_root):
     if not mapped_root.exists():
         console.print(f"[red]{mapped_root} not found[/red]")
         sys.exit(1)
     r=run("lsblk","-ndlo","FSTYPE",str(mapped_root),check=False,capture=True)
-    if r.stdout.strip()!="btrfs":
-        console.print(f"[red]{mapped_root} not btrfs[/red]")
+    fstype=r.stdout.strip().lower()
+    if fstype!="btrfs":
+        # udev may not know about a filesystem created moments ago in 030;
+        # trust a direct blkid probe before declaring the partition bad.
+        fstype=probe_fstype(mapped_root) or fstype
+    if fstype!="btrfs":
+        console.print(f"[red]{mapped_root} is '{fstype or 'no filesystem'}', expected btrfs.[/red]")
+        console.print("[yellow]This usually means the partition selected as ROOT in the partitioning step was never formatted:[/yellow]")
+        console.print("[yellow]- re-run the installer, pick the partitioning step again, and make sure the partition you plan to boot from is selected as ROOT[/yellow]")
+        console.print("[yellow]- if you are dual-booting, ROOT is your NEW linux partition, not the Windows data (ntfs) or the EFI (vfat) partition[/yellow]")
+        try:
+            r2=run("lsblk","-f",str(mapped_root),check=False,capture=True)
+            if r2.stdout.strip():
+                console.print(Panel.fit(r2.stdout, title="device details", box=box.ROUNDED, border_style="dim"))
+        except Exception:
+            pass
         sys.exit(1)
 
 def validate_efi_partition(part):
     r=run("lsblk","-ndlo","FSTYPE,PARTTYPE",str(part),check=False,capture=True)
     out=r.stdout.lower()
     if EFI_GPT_TYPE not in out and "vfat" not in out and "fat32" not in out:
-        console.print(f"[red]{part} not ESP[/red]")
+        # Same stale-udev concern as validate_root_state: ask blkid directly.
+        btype=probe_fstype(part)
+        pt=run("blkid","-o","value","-s","PARTTYPE",str(part),check=False,capture=True)
+        out=f"{out} {btype} {(pt.stdout or '').lower()}"
+    if EFI_GPT_TYPE not in out and "vfat" not in out and "fat32" not in out:
+        console.print(f"[red]{part} is not an EFI System Partition (no ESP type, not vfat).[/red]")
+        console.print("[yellow]Pick the small vfat/EFI partition (on Windows dual-boot that is the existing Windows EFI, ~100M-1G), not the Windows data partition.[/yellow]")
         sys.exit(1)
 
 def is_mounted(dev):

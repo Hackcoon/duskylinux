@@ -917,7 +917,7 @@ def prompt_root_and_efi(target_dev, boot_mode, has_win, win_esp):
             fstype = p.get("fstype","") or "no-fs"
             label = f"{path} {sz} {fstype} {p.get('partlabel','')}".strip()
             root_opts.append((label, path))
-        root_sel = arrow_menu(f"Select ROOT on {target_dev}", root_opts, default_idx=len(root_opts)-1 if root_opts else 0)
+        root_sel = arrow_menu(f"Select ROOT on {target_dev} (the partition dusky installs to - it WILL be formatted)", root_opts, default_idx=len(root_opts)-1 if root_opts else 0)
         if root_sel is None:
             return None, None, None
         root = root_sel
@@ -936,29 +936,43 @@ def prompt_root_and_efi(target_dev, boot_mode, has_win, win_esp):
     format_efi = True
     if boot_mode == "UEFI":
         if parts:
-            efi_opts = []
-            for p in parts:
-                path = p.get("path","")
-                sz = p.get("size","")
-                fstype = p.get("fstype","") or "no-fs"
-                label = f"{path} {sz} {fstype}".strip()
-                efi_opts.append((label, path))
-            if efi_opts:
-                efi_sel = arrow_menu(f"Select EFI on {target_dev}", efi_opts, default_idx=0)
-                if efi_sel is None:
-                    return None, None, None
-                efi = efi_sel
-            else:
-                while True:
-                    try:
-                        raw = Prompt.ask(f"Enter EFI partition (q to abort)", console=console)
-                        if raw.lower() in ("q","quit"):
-                            return None, None, None
-                        ep = validate_part_input(raw)
-                        efi = str(ep)
-                        break
-                    except Exception as e:
-                        console.print(f"[red]{e}[/red]")
+            while True:
+                efi_opts = []
+                for p in parts:
+                    path = p.get("path","")
+                    sz = p.get("size","")
+                    fstype = p.get("fstype","") or "no-fs"
+                    label = f"{path} {sz} {fstype}".strip()
+                    if path == root:
+                        # Same partition for ROOT and EFI means mkfs.fat would
+                        # overwrite the fresh btrfs root in format_root_and_efi,
+                        # and 040 then dies with a bare "not btrfs". Keep it
+                        # selectable but loudly marked so nobody picks it blind.
+                        label += "  [SAME AS ROOT - DO NOT PICK]"
+                    efi_opts.append((label, path))
+                if efi_opts:
+                    efi_sel = arrow_menu(f"Select EFI on {target_dev}", efi_opts, default_idx=0)
+                    if efi_sel is None:
+                        return None, None, None
+                    if efi_sel == root:
+                        console.print("[red]EFI and ROOT cannot be the same partition - the EFI format would wipe the freshly formatted root.[/red]")
+                        continue
+                    efi = efi_sel
+                    break
+                else:
+                    while True:
+                        try:
+                            raw = Prompt.ask("Enter EFI partition (q to abort)", console=console)
+                            if raw.lower() in ("q","quit"):
+                                return None, None, None
+                            ep = validate_part_input(raw)
+                            if str(ep) == root:
+                                console.print("[red]EFI and ROOT cannot be the same partition.[/red]")
+                                continue
+                            efi = str(ep)
+                            break
+                        except Exception as e:
+                            console.print(f"[red]{e}[/red]")
         else:
             while True:
                 try:
@@ -966,6 +980,9 @@ def prompt_root_and_efi(target_dev, boot_mode, has_win, win_esp):
                     if raw.lower() in ("q","quit"):
                         return None, None, None
                     ep = validate_part_input(raw)
+                    if str(ep) == root:
+                        console.print("[red]EFI and ROOT cannot be the same partition.[/red]")
+                        continue
                     efi = str(ep)
                     break
                 except Exception as e:
