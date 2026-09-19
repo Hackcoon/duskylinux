@@ -136,7 +136,7 @@ elif (( SYSTEM_RAM_KB >= 14680064 )); then
     PROFILE_NAME="BALANCED_EFFICIENCY (16-24GB class)"
     EXPECTED_SWAPPINESS=180
     EXPECTED_VFS_PRESSURE=125
-    EXPECTED_SCALE_FACTOR=50             # 50 = ~80-140MB kswapd runway to prevent direct reclaim stalls
+    EXPECTED_SCALE_FACTOR=10             # 10 maximizes MemAvailable across efficiency tiers
     EXPECTED_COMPACTION=10               # 10 keeps order-4/order-9 blocks available
     EXPECTED_DIRTY_BYTES=268435456       # 256MiB cap
     EXPECTED_DIRTY_BG_BYTES=67108864     # 64MiB background flush
@@ -145,7 +145,7 @@ elif (( SYSTEM_RAM_KB >= 7340032 )); then
     PROFILE_NAME="DYNAMIC_EFFICIENCY (8-12GB class)"
     EXPECTED_SWAPPINESS=180
     EXPECTED_VFS_PRESSURE=125
-    EXPECTED_SCALE_FACTOR=75             # 75 = ~60-100MB kswapd runway
+    EXPECTED_SCALE_FACTOR=10             # 10 (vanilla kernel default) maximizes MemAvailable / lowest idle RAM
     EXPECTED_COMPACTION=0                # 0 disables proactive compaction to conserve battery
     EXPECTED_DIRTY_BYTES=134217728       # 128MiB cap
     EXPECTED_DIRTY_BG_BYTES=33554432     # 32MiB background flush
@@ -154,7 +154,7 @@ else
     PROFILE_NAME="DYNAMIC_EFFICIENCY (<8GB class)"
     EXPECTED_SWAPPINESS=180
     EXPECTED_VFS_PRESSURE=125
-    EXPECTED_SCALE_FACTOR=100            # 100 = 1% RAM runway (~40-70MB)
+    EXPECTED_SCALE_FACTOR=10             # 10 maximizes MemAvailable on low-RAM systems
     EXPECTED_COMPACTION=0                # 0 disables proactive compaction to conserve battery
     EXPECTED_DIRTY_BYTES=134217728       # 128MiB cap
     EXPECTED_DIRTY_BG_BYTES=33554432     # 32MiB background flush
