@@ -38,8 +38,8 @@ print_help() {
 ${C_BOLD:-}Usage:${C_RESET:-} ${SCRIPT_NAME} [OPTIONS]
 
   --auto, -a         Auto-detect RAM size and set dynamic THP profile (default)
-  --aggressive, -A   Force >=32GB class "Performance" THP allocation (Looser limits, 4096 scan)
-  --standard, -S     Force <32GB class "Strict RAM Savings" THP allocation (Tight limits, 1024 scan)
+  --aggressive, -A   Force >=64GB class "Extreme Performance" THP allocation (511 max_ptes, 10s scan)
+  --standard, -S     Force <16GB class "Dynamic Efficiency" THP allocation (128 max_ptes, 60s scan)
   --dry-run, -n      Print the generated systemd-tmpfiles config and exit
   --help, -h         Show this help menu
 HELP_EOF
@@ -78,7 +78,10 @@ else
     die "FATAL: Could not parse /proc/meminfo."
 fi
 
-declare -i THRESHOLD_KB=29360128  # 28 GiB cutoff for >=32GB class
+declare -i THRESHOLD_64G_KB=58720256 # 56 GiB cutoff for >=64GB class
+declare -i THRESHOLD_32G_KB=29360128 # 28 GiB cutoff for >=32GB class
+declare -i THRESHOLD_16G_KB=14680064 # 14 GiB cutoff for >=16GB class
+declare -i THRESHOLD_8G_KB=7340032   # 7 GiB cutoff for >=8GB class
 declare -i IS_PERF_MODE=0
 
 declare -i EXPECTED_MAX_PTES
@@ -87,45 +90,54 @@ declare -i EXPECTED_MAX_PTES_SHARED
 declare -i EXPECTED_SCAN_SLEEP
 declare -i EXPECTED_PAGES_TO_SCAN
 readonly EXPECTED_ALLOC_SLEEP=60000
-readonly EXPECTED_KHUGEPAGED_DEFRAG=0
+readonly EXPECTED_KHUGEPAGED_DEFRAG=1
 
-# Unified 4-Tier THP Demarcation
-# S:  < 7 GiB       -> max_ptes_none = 0 (strict zero hole allocation, no padding bloat)
-# M:  7 - < 14 GiB  -> max_ptes_none = 0
-# L:  14 - < 28 GiB -> max_ptes_none = 0
-# XL: >= 28 GiB     -> max_ptes_none = 0
+# Unified Dynamic THP Demarcation:
+# S:  < 7 GiB       -> max_ptes_none = 128, defrag = 1, scan_sleep = 60s
+# M:  7 - < 14 GiB  -> max_ptes_none = 128, defrag = 1, scan_sleep = 60s
+# L:  14 - < 28 GiB -> max_ptes_none = 300, defrag = 1, scan_sleep = 30s
+# P:  28 - < 56 GiB -> max_ptes_none = 300, defrag = 1, scan_sleep = 10s
+# XL: >= 56 GiB     -> max_ptes_none = 511, defrag = 1, scan_sleep = 10s
 
-if [[ "$MODE" == "AGGRESSIVE" ]] || { [[ "$MODE" == "AUTO" ]] && (( SYSTEM_RAM_KB >= THRESHOLD_KB )); }; then
+if [[ "$MODE" == "AGGRESSIVE" ]] || { [[ "$MODE" == "AUTO" ]] && (( SYSTEM_RAM_KB >= THRESHOLD_64G_KB )); }; then
     IS_PERF_MODE=1
-    EXPECTED_MODE="PERFORMANCE_LEAN (>=32GB class)"
-    EXPECTED_MAX_PTES=0                 # Zero hole allocation (prevents memory bloat)
+    EXPECTED_MODE="EXTREME_PERFORMANCE (>=64GB class)"
+    EXPECTED_MAX_PTES=511               # Kernel maximum (N-1), maximizes hugepage coverage
     EXPECTED_MAX_PTES_SWAP=0            # Forbid swapping pages back IN from ZRAM
     EXPECTED_MAX_PTES_SHARED=0          # Forbid shared mapping inflation
-    EXPECTED_SCAN_SLEEP=15000
+    EXPECTED_SCAN_SLEEP=10000           # 10s rapid scanning
     EXPECTED_PAGES_TO_SCAN=4096
-elif (( SYSTEM_RAM_KB >= 14680064 )); then
+elif [[ "$MODE" == "AUTO" ]] && (( SYSTEM_RAM_KB >= THRESHOLD_32G_KB )); then
+    IS_PERF_MODE=1
+    EXPECTED_MODE="PERFORMANCE_LEAN (32GB class)"
+    EXPECTED_MAX_PTES=300               # Progressive padding up to ~60% holes
+    EXPECTED_MAX_PTES_SWAP=0
+    EXPECTED_MAX_PTES_SHARED=0
+    EXPECTED_SCAN_SLEEP=10000           # 10s rapid scanning
+    EXPECTED_PAGES_TO_SCAN=4096
+elif [[ "$MODE" == "AUTO" ]] && (( SYSTEM_RAM_KB >= THRESHOLD_16G_KB )); then
     IS_PERF_MODE=1
     EXPECTED_MODE="BALANCED_PERFORMANCE (16-24GB class)"
-    EXPECTED_MAX_PTES=0                 # Zero hole allocation
-    EXPECTED_MAX_PTES_SWAP=0            # Forbid swapping pages back IN from ZRAM
-    EXPECTED_MAX_PTES_SHARED=0          # Forbid shared mapping inflation
-    EXPECTED_SCAN_SLEEP=30000
+    EXPECTED_MAX_PTES=300               # Progressive padding up to ~60% holes
+    EXPECTED_MAX_PTES_SWAP=0
+    EXPECTED_MAX_PTES_SHARED=0
+    EXPECTED_SCAN_SLEEP=30000           # 30s balanced sleep
     EXPECTED_PAGES_TO_SCAN=2048
-elif (( SYSTEM_RAM_KB >= 7340032 )); then
+elif [[ "$MODE" == "AUTO" ]] && (( SYSTEM_RAM_KB >= THRESHOLD_8G_KB )); then
     IS_PERF_MODE=0
     EXPECTED_MODE="DYNAMIC_EFFICIENCY (8-12GB class)"
-    EXPECTED_MAX_PTES=0                 # Zero hole allocation
-    EXPECTED_MAX_PTES_SWAP=0            # Forbid swapping pages back IN from ZRAM
-    EXPECTED_MAX_PTES_SHARED=0          # Forbid shared mapping inflation
-    EXPECTED_SCAN_SLEEP=60000
+    EXPECTED_MAX_PTES=128               # Gentle padding up to 25% holes
+    EXPECTED_MAX_PTES_SWAP=0
+    EXPECTED_MAX_PTES_SHARED=0
+    EXPECTED_SCAN_SLEEP=60000           # 60s idle sleep prevents CPU churn
     EXPECTED_PAGES_TO_SCAN=1024
 else
     IS_PERF_MODE=0
     EXPECTED_MODE="COMPACT_EFFICIENCY (<8GB class)"
-    EXPECTED_MAX_PTES=0                 # Zero hole allocation
-    EXPECTED_MAX_PTES_SWAP=0            # Forbid swapping pages back IN from ZRAM
-    EXPECTED_MAX_PTES_SHARED=0          # Forbid shared mapping inflation
-    EXPECTED_SCAN_SLEEP=60000
+    EXPECTED_MAX_PTES=128               # Gentle padding up to 25% holes
+    EXPECTED_MAX_PTES_SWAP=0
+    EXPECTED_MAX_PTES_SHARED=0
+    EXPECTED_SCAN_SLEEP=60000           # 60s idle sleep prevents CPU churn
     EXPECTED_PAGES_TO_SCAN=1024
 fi
 
@@ -316,12 +328,12 @@ log_success "Verified live sysfs kernel values:"
 log_success "  enabled = [${EXPECTED_ENABLED}]"
 log_success "  defrag = [${EXPECTED_DEFRAG}]"
 log_success "  shmem_enabled = [${EXPECTED_SHMEM}]"
-log_success "  max_ptes_none = ${actual_ptes} (0=strict zero hole allocation, no padding bloat)"
+log_success "  max_ptes_none = ${actual_ptes} (padding limit: ${EXPECTED_MAX_PTES})"
 log_success "  max_ptes_shared = ${actual_ptes_shared} (0=prevent shared page inflation)"
 log_success "  max_ptes_swap = ${actual_ptes_swap} (0=prevent swap-in uncompress)"
 log_success "  scan_sleep_millisecs = ${actual_scan_sleep} (idle sleep)"
 log_success "  pages_to_scan = ${actual_pages_to_scan}"
-log_success "  use_zero_page = 1, shrink_underused = 1, khugepaged/defrag = 0"
+log_success "  use_zero_page = 1, shrink_underused = 1, khugepaged/defrag = ${EXPECTED_KHUGEPAGED_DEFRAG}"
 log_success "  Active Profile: [${C_BOLD:-}${EXPECTED_MODE}${C_RESET:-}]"
 
 exit 0
