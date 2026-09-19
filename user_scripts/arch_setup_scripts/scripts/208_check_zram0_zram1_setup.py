@@ -205,6 +205,37 @@ def main() -> int:
                 else:
                     warn(f"/dev/zram0 swap priority is low ({prio_found}). ZRAM should have higher priority than disk swap.")
 
+            # Check relative priority with any disk swaps
+            if Path("/proc/swaps").exists():
+                disk_swaps = []
+                for line in Path("/proc/swaps").read_text().splitlines():
+                    parts = line.split()
+                    if len(parts) >= 5 and parts[0] != "Filename" and not parts[0].startswith("/dev/zram"):
+                        try:
+                            disk_swaps.append((parts[0], int(parts[4])))
+                        except ValueError:
+                            pass
+                if disk_swaps and prio_found is not None:
+                    for d_name, d_prio in disk_swaps:
+                        if prio_found <= d_prio:
+                            warn(f"PRIORITY INVERSION: Disk swap '{d_name}' priority ({d_prio}) >= zram0 priority ({prio_found})! ZRAM should have higher priority.")
+                        else:
+                            ok(f"Swap priority topology verified: zram0 ({prio_found}) > disk swap '{d_name}' ({d_prio}).")
+
+        disksize_path = Path("/sys/block/zram0/disksize")
+        if disksize_path.exists():
+            try:
+                disksize_bytes = int(disksize_path.read_text().strip())
+                audit_summary["zram0"]["disksize_bytes"] = disksize_bytes
+                disksize_gib = disksize_bytes / (1024**3)
+                if mem_total_bytes > 0:
+                    pct = (disksize_bytes / mem_total_bytes) * 100
+                    ok(f"/dev/zram0 logical capacity: {disksize_gib:.2f} GiB ({pct:.0f}% of RAM).")
+                else:
+                    ok(f"/dev/zram0 logical capacity: {disksize_gib:.2f} GiB.")
+            except Exception as e:
+                warn(f"Could not read zram0 disksize: {e}")
+
         mm_stat_path = Path("/sys/block/zram0/mm_stat")
         if mm_stat_path.exists():
             try:
@@ -229,6 +260,13 @@ def main() -> int:
                             ok(f"/dev/zram0 memory resident limit active: {limit_mib:.1f} MiB (~{pct:.0f}% of RAM).")
                         else:
                             ok(f"/dev/zram0 memory resident limit active: {limit_mib:.1f} MiB.")
+
+                    if orig_size > 0 and compr_size > 0:
+                        ratio = orig_size / compr_size
+                        eff = (1.0 - (compr_size / orig_size)) * 100
+                        ok(f"/dev/zram0 compression efficiency: {ratio:.2f}:1 ({eff:.1f}% savings) | Stored: {orig_size/(1024**2):.1f}MB -> Compr: {compr_size/(1024**2):.1f}MB -> Physical Pool: {mem_used/(1024**2):.1f}MB")
+                    elif orig_size == 0:
+                        ok("/dev/zram0 compression pool is currently idle (0 MB swapped).")
                 else:
                     fail(f"Invalid mm_stat format for zram0 (found {len(stats)} columns, expected >= 4).")
             except Exception as e:

@@ -164,10 +164,11 @@ fi
 readonly EXPECTED_PAGE_CLUSTER=0        # Disables swap readahead
 readonly EXPECTED_BOOST_FACTOR=0        # Disables watermark boosting
 readonly EXPECTED_MAX_MAP_COUNT=2147483642 # SteamOS & modern Proton/Wine standard
-readonly EXPECTED_DIRTY_WRITEBACK_CENTISECS=1500 # 15s flusher wakeups (fewer SSD/CPU wakeups on battery)
+readonly EXPECTED_DIRTY_WRITEBACK_CENTISECS=500  # 5s flusher wakeups (smooth NVMe/SSD dirty writes, prevents freeze spikes)
 readonly EXPECTED_DIRTY_EXPIRE_CENTISECS=3000    # 30s dirty expiration bounds unwritten data age
-readonly EXPECTED_STAT_INTERVAL=10               # 10s per-CPU vmstat fold-in cuts idle timer interrupts
+readonly EXPECTED_STAT_INTERVAL=1                # 1s per-CPU vmstat fold-in ensures accurate real-time PSI and systemd-oomd metrics
 readonly EXPECTED_VFS_DENOM=100               # Linux 7.2+ explicit VFS cache pressure denominator
+readonly EXPECTED_COMPACT_UNEVIC=1               # 1 allows full compaction across all pages (maximizes contiguous allocation success rate)
 
 log_info "Initializing VM Swappiness & Paging Optimizer..."
 log_info "Detected RAM: ${C_BOLD}${SYSTEM_RAM_GB} GB${C_RESET} (${SYSTEM_RAM_KB} KiB)"
@@ -198,6 +199,7 @@ vm.vfs_cache_pressure_denom = ${EXPECTED_VFS_DENOM}
 vm.watermark_scale_factor = ${EXPECTED_SCALE_FACTOR}
 vm.watermark_boost_factor = ${EXPECTED_BOOST_FACTOR}
 vm.compaction_proactiveness = ${EXPECTED_COMPACTION}
+vm.compact_unevictable_allowed = ${EXPECTED_COMPACT_UNEVIC}
 
 # --- WRITEBACK (NVMe & SSD PROTECTION) ---
 vm.dirty_bytes = ${EXPECTED_DIRTY_BYTES}
@@ -269,6 +271,7 @@ verify_param "vm.vfs_cache_pressure_denom" "$EXPECTED_VFS_DENOM"
 verify_param "vm.watermark_scale_factor" "$EXPECTED_SCALE_FACTOR"
 verify_param "vm.watermark_boost_factor" "$EXPECTED_BOOST_FACTOR"
 verify_param "vm.compaction_proactiveness" "$EXPECTED_COMPACTION"
+verify_param "vm.compact_unevictable_allowed" "$EXPECTED_COMPACT_UNEVIC"
 verify_param "vm.page-cluster" "$EXPECTED_PAGE_CLUSTER"
 verify_param "vm.dirty_background_bytes" "$EXPECTED_DIRTY_BG_BYTES"
 verify_param "vm.dirty_bytes" "$EXPECTED_DIRTY_BYTES"

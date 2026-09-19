@@ -43,8 +43,10 @@ Configure high-efficiency ZRAM swap for Arch Linux (Linux 7.2+, systemd 261+).
 
 Options:
   --size, -s <expr>           ZRAM size expression (auto-detected if omitted)
-                              • < 32GB class  -> "ram * 1.5" (150% RAM - Expands tight memory)
-                              • >= 32GB class -> "ram / 2"   (50% RAM - Massive headroom)
+                              • Continuous formula: min(ram, 16384) + max(ram - 32768, 0) / 2
+                                - <= 16GB class: 100% RAM (1:1) -> Minimal boot metadata overhead
+                                - 16-32GB class: 16GB ceiling
+                                - >= 32GB class: 50% RAM (0.5x)
   --resident-limit, -r <expr> Resident memory limit expression (default: 0 / unlimited)
   --priority, -p <prio>       Swap priority (default: 32767 - Maximum priority over disk)
   --algorithm, -a <algo>      Compression algorithm (default: "zstd(level=2)")
@@ -65,20 +67,13 @@ fi
 declare -i RAM_MB=$(( RAM_KB / 1024 ))
 declare -i RAM_GB=$(( (RAM_MB + 512) / 1024 ))
 
-AUTO_SIZE_EXPR="ram"
+# Unified Continuous Memory Formula:
+# <= 16GB class: 1:1 RAM (100% RAM) - saves slot table metadata on boot vs 1.5x
+# 16-32GB class: 16GB ceiling
+# >= 32GB class: 50% RAM (0.5x RAM)
+AUTO_SIZE_EXPR="min(ram, 16384) + max(ram - 32768, 0) / 2"
 AUTO_LIMIT_EXPR="0"
-TIER_DESC=""
-
-# Unified Tier Demarcation (28 GiB / 29,360,128 KiB accounts for 32GB systems with iGPU reservations)
-if (( RAM_KB < 29360128 )); then
-    AUTO_SIZE_EXPR="ram * 1.5"
-    AUTO_LIMIT_EXPR="0"
-    TIER_DESC="Standard (<32GB class, ${RAM_GB}GB detected) -> Size: 150% (1.5x RAM), Resident Cap: unlimited (0)"
-else
-    AUTO_SIZE_EXPR="ram / 2"
-    AUTO_LIMIT_EXPR="0"
-    TIER_DESC="High-Capacity (>=32GB class, ${RAM_GB}GB detected) -> Size: 50% (0.5x RAM), Resident Cap: unlimited (0)"
-fi
+TIER_DESC="Continuous Formula: min(ram, 16384) + max(ram - 32768, 0) / 2 (${RAM_GB}GB detected) -> Resident Cap: unlimited (0)"
 
 ZRAM_SIZE_EXPR=""
 ZRAM_RESIDENT_LIMIT_EXPR=""
@@ -156,7 +151,17 @@ if [[ ! -x "$GENERATOR_BIN" ]]; then
     log_success "zram-generator successfully installed."
 fi
 
-if grep -Eq '(^|[[:space:]])systemd\.zram=0([[:space:]]|$)' /proc/cmdline; then
+# Robust cmdline check: last recognized systemd.zram boolean wins
+declare -i ZRAM_CMDLINE_DISABLED=0
+if [[ -r /proc/cmdline ]]; then
+    for token in $(< /proc/cmdline); do
+        case "$token" in
+            systemd.zram=0|systemd.zram=no|systemd.zram=false|systemd.zram=off) ZRAM_CMDLINE_DISABLED=1 ;;
+            systemd.zram=1|systemd.zram=yes|systemd.zram=true|systemd.zram=on|systemd.zram) ZRAM_CMDLINE_DISABLED=0 ;;
+        esac
+    done
+fi
+if (( ZRAM_CMDLINE_DISABLED == 1 )); then
     die "FATAL: Kernel cmdline explicitly disables zram device creation via systemd.zram=0."
 fi
 
@@ -195,11 +200,6 @@ fi
 readonly CONFIG_DIR="/etc/systemd/zram-generator.conf.d"
 readonly CONFIG_FILE="${CONFIG_DIR}/99-zram0.conf"
 install -d -m 0755 "$CONFIG_DIR"
-
-# Clean up legacy config files
-rm -f "${CONFIG_DIR}/99-elite-zram.conf" \
-      "${CONFIG_DIR}/99-elite-zram0.conf" \
-      "${CONFIG_DIR}/99-memtune.conf"
 
 tmp_config="$(umask 077 && mktemp)"
 trap 'rm -f "$tmp_config"' EXIT

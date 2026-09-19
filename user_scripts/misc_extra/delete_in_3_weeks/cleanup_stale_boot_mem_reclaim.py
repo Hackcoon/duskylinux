@@ -59,6 +59,12 @@ def main() -> None:
         Path("/etc/systemd/system/timers.target.wants/dusky_boot_mem_reclaim.timer"),
         Path("/etc/systemd/system/multi-user.target.wants/dusky_boot_mem_reclaim.service"),
         Path("/usr/local/bin/dusky_boot_mem_reclaim"),
+        # Legacy ZRAM generator configs
+        Path("/etc/systemd/zram-generator.conf"),
+        Path("/etc/systemd/zram-generator.conf.d/99-elite-zram.conf"),
+        Path("/etc/systemd/zram-generator.conf.d/99-elite-zram0.conf"),
+        Path("/etc/systemd/zram-generator.conf.d/99-memtune.conf"),
+        Path("/etc/systemd/zram-generator.conf.d/99-elite-zram1.conf"),
     )
 
     changes_made = False
