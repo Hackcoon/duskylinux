@@ -20,9 +20,21 @@ No backwards compat - pure 2026 methodology
 Pipeline: 070 masks hooks -> 120 optimizer -> 150 mkinitcpio -P (embeds microcode) -> 151 THIS (bootloader; grub-mkconfig sees final initramfs)
 """
 from __future__ import annotations
-import os, sys, re, json, shlex, shutil, signal, subprocess
+import os, sys, re, json, shlex, shutil, signal, subprocess, atexit
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+_udev_mounted = False
+
+def _cleanup_udev_mount():
+    global _udev_mounted
+    if _udev_mounted:
+        try:
+            subprocess.run(["umount", "-l", "/run/udev"], check=False, capture_output=True)
+        except Exception:
+            pass
+
+atexit.register(_cleanup_udev_mount)
 
 def _ensure_rich():
     import importlib.util
@@ -207,6 +219,15 @@ def ensure_esp():
     fstype = r.stdout.strip().splitlines()[0].strip().lower() if r.stdout.strip() else ""
     if fstype not in ("vfat", "fat32", "msdos"):
         console.print(f"[red]{ESP_MNT} is {fstype}, but systemd-boot requires FAT32[/red]"); sys.exit(1)
+    try:
+        stat = os.statvfs(str(ESP_MNT))
+        free_mb = (stat.f_bavail * stat.f_frsize) / (1024 * 1024)
+        total_mb = (stat.f_blocks * stat.f_frsize) / (1024 * 1024)
+        console.print(f"[cyan]ESP capacity: {total_mb:.1f} MiB total, {free_mb:.1f} MiB available[/cyan]")
+        if free_mb < 150:
+            console.print(f"[yellow]WARNING: Low ESP space ({free_mb:.1f} MiB available). Arch kernels & initramfs require sufficient space.[/yellow]")
+    except Exception as e:
+        console.print(f"[dim]Could not query ESP space: {e}[/dim]")
 
 def get_kernels() -> List[Tuple[Path, str]]:
     kernels = []
@@ -276,8 +297,11 @@ def generate_secondary_linux_bls_entries(esp_mnt: Path):
             console.print(f"[green]Generated secondary Linux BLS entry: {conf_path}[/green]")
 
 def ensure_udev_bind_mount_in_chroot():
+    global _udev_mounted
     run_udev_data = Path("/run/udev/data")
     if not run_udev_data.exists():
+        return
+    if is_mountpoint(Path("/run/udev")):
         return
     chroot_udev = Path("/run/udev")
     if not chroot_udev.exists():
@@ -286,8 +310,10 @@ def ensure_udev_bind_mount_in_chroot():
         except Exception:
             return
     try:
-        run("mount", "--bind", "/run/udev", "/run/udev", check=False, capture=True)
-        console.print("[green]Bind-mounted /run/udev for bootctl sd-device PARTUUID resolution[/green]")
+        r = run("mount", "--bind", "/run/udev", "/run/udev", check=False, capture=True)
+        if r.returncode == 0:
+            _udev_mounted = True
+            console.print("[green]Bind-mounted /run/udev for bootctl sd-device PARTUUID resolution[/green]")
     except Exception:
         pass
 
@@ -313,9 +339,28 @@ def install_systemd_boot_uefi(primary_opts: str, fallback_opts: str):
         console.print("[cyan]Fresh install...[/cyan]")
         r = run("bootctl", "install", f"--esp-path={ESP_MNT}", "--variables=yes", "--efi-boot-option-description-with-device=yes", "--graceful", check=False)
         if r.returncode != 0:
-            console.print("[yellow]bootctl install non-zero (common in chroot), verifying...[/yellow]")
-            if run("bootctl", "is-installed", f"--esp-path={ESP_MNT}", check=False).returncode != 0:
-                console.print("[red]bootctl installation failed[/red]"); sys.exit(1)
+            console.print("[yellow]bootctl install non-zero, trying fallback with --no-variables...[/yellow]")
+            run("bootctl", "install", f"--esp-path={ESP_MNT}", "--no-variables", "--graceful", check=False)
+
+    # Ensure systemd-bootx64.efi is present in ESP
+    systemd_efi = ESP_MNT / "EFI" / "systemd" / "systemd-bootx64.efi"
+    if not systemd_efi.is_file():
+        systemd_src = Path("/usr/lib/systemd/boot/efi/systemd-bootx64.efi")
+        if systemd_src.is_file():
+            systemd_efi.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(systemd_src, systemd_efi)
+            console.print(f"[green]Copied {systemd_src} -> {systemd_efi}[/green]")
+
+    # Ensure removable media EFI fallback exists for strict/legacy laptop EFI firmware (InsydeH2O)
+    fallback_efi = ESP_MNT / "EFI" / "BOOT" / "BOOTX64.EFI"
+    if systemd_efi.is_file() and not fallback_efi.is_file():
+        fallback_efi.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(systemd_efi, fallback_efi)
+        console.print(f"[green]Copied removable fallback EFI: {fallback_efi}[/green]")
+
+    if not systemd_efi.is_file() and not fallback_efi.is_file():
+        console.print("[red]bootctl installation failed: No EFI binaries found or deployed![/red]")
+        sys.exit(1)
 
     # Post-bootctl NVRAM sanity check & fix:
     # If bootctl created an NVRAM entry with zeroed GPT GUID (common inside chroot without udev data),
@@ -350,14 +395,6 @@ def install_systemd_boot_uefi(primary_opts: str, fallback_opts: str):
                     run("efibootmgr", "-c", "-d", str(parent_disk), "-p", part_num, "-L", "Linux Boot Manager", "-l", r"\EFI\systemd\systemd-bootx64.efi", check=False)
     except Exception as e:
         console.print(f"[yellow]NVRAM sanity check warning: {e}[/yellow]")
-
-    # Ensure removable media EFI fallback exists for strict/legacy laptop EFI firmware (InsydeH2O)
-    fallback_efi = ESP_MNT / "EFI" / "BOOT" / "BOOTX64.EFI"
-    systemd_efi = ESP_MNT / "EFI" / "systemd" / "systemd-bootx64.efi"
-    if systemd_efi.is_file() and not fallback_efi.is_file():
-        fallback_efi.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(systemd_efi, fallback_efi)
-        console.print(f"[green]Copied removable fallback EFI: {fallback_efi}[/green]")
 
     console.print("[green]systemd-boot deployed, random-seed auto-handled since systemd 257+[/green]")
 

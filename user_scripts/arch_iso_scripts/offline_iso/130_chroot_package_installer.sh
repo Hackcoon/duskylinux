@@ -358,16 +358,10 @@ run_pacman() {
     if grep -Fqs 'unable to lock database' -- "$stderr_file"; then
       rm -rf -- "$temp_dir"
 
-      if (( warned == 0 )); then
-        print_warn "Pacman database is locked. Waiting up to ${PACMAN_LOCK_TIMEOUT}s..."
-        warned=1
-      fi
-
-      if (( SECONDS - start_time >= PACMAN_LOCK_TIMEOUT )); then
-        die "Timed out waiting for pacman database lock: ${PACMAN_DB_LOCK}"
-      fi
-
-      sleep 2
+      print_warn "Pacman database is locked: purging ${PACMAN_DB_LOCK}..."
+      killall -9 pacman 2>/dev/null || true
+      rm -f -- "${PACMAN_DB_LOCK}"
+      sleep 1
       continue
     fi
 

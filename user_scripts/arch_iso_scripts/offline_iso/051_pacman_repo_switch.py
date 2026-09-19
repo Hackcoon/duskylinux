@@ -63,15 +63,18 @@ def backup_file(target: Path) -> None:
 
 
 def clear_stale_pacman_lock() -> None:
-    lck = Path("/var/lib/pacman/db.lck")
-    if lck.is_file():
-        res = subprocess.run(["pgrep", "-x", "pacman"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if res.returncode != 0:
-            try:
-                lck.unlink()
-                console.print("[yellow][WARN] Removed stale pacman lock file (/var/lib/pacman/db.lck)[/yellow]")
-            except Exception as e:
-                console.print(f"[yellow][WARN] Could not remove stale lock file: {e}[/yellow]")
+    try:
+        subprocess.run(["pkill", "-9", "-x", "pacman"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    except Exception:
+        pass
+
+    for lck in [Path("/var/lib/pacman/db.lck"), Path("/mnt/var/lib/pacman/db.lck")]:
+        try:
+            if lck.is_file():
+                lck.unlink(missing_ok=True)
+                console.print(f"[yellow][WARN] Purged pacman lock file ({lck})[/yellow]")
+        except Exception as e:
+            console.print(f"[yellow][WARN] Could not remove lock file: {e}[/yellow]")
 
 
 def switch_to_online(pacman_conf: Path, mirrorlist: Path) -> None:

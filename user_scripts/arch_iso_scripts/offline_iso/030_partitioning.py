@@ -766,10 +766,29 @@ def write_gpt_sfdisk(disk, boot_mode, encrypt, efi_size="1.3G"):
         sfdisk_input += f'size=+, type={root_type}, name="{DUSKY_ROOT_PARTNAME}"\n'
     console.print(f"[cyan]Writing GPT to {disk} (wipe) EFI={efi_size}[/cyan]")
     
-    # Freeze udev execution queue during wipefs/sfdisk to prevent udev locks
+    # 1. Annihilate existing GPT structures (primary and backup header/table) and MBR
+    console.print(f"[cyan]Destroying all GPT/MBR structures and backup tables on {disk}...[/cyan]")
+    run("sgdisk", "--zap-all", disk, check=False, capture=True)
+    run("wipefs", "--all", "--force", disk, check=False, capture=True)
+    try:
+        # Zero out the first 10MB (20480 sectors) to eliminate MBR, primary GPT, and initial filesystem headers
+        run("dd", "if=/dev/zero", f"of={disk}", "bs=512", "count=20480", "conv=fsync", check=False, capture=True)
+        r_sz = run("blockdev", "--getsz", disk, check=False, capture=True)
+        if r_sz.returncode == 0 and r_sz.stdout.strip().isdigit():
+            total_sectors = int(r_sz.stdout.strip())
+            if total_sectors > 20480:
+                # Zero out the last 10MB (20480 sectors) to completely eliminate secondary/backup GPT down to the final byte
+                run("dd", "if=/dev/zero", f"of={disk}", "bs=512", f"seek={total_sectors - 20480}", "count=20480", "conv=fsync", check=False, capture=True)
+    except Exception:
+        pass
+    run("blockdev", "--rereadpt", disk, check=False, capture=True)
+    run("udevadm", "settle", "--timeout=5", check=False, capture=True)
+
+    # 2. Write new GPT partition table
+    # Freeze udev execution queue during sfdisk to prevent udev locks
     run("udevadm", "control", "--stop-exec-queue", check=False, capture=True)
     try:
-        run("wipefs", "--all", "--force", "--lock=yes", disk, check=False, capture=True)
+        run("wipefs", "--all", "--force", disk, check=False, capture=True)
         try:
             run("sfdisk", "--force", "--wipe", "always", "--wipe-partitions", "always", "--label", "gpt", "--lock=yes", disk, input_text=sfdisk_input, capture=True)
         except subprocess.CalledProcessError:
@@ -1211,7 +1230,8 @@ def strategy_wipe(target_dev, boot_mode, do_encrypt, efi_size, has_win, win_esp,
             console.print(f"[yellow]Partition {root_part} still busy, waiting... ({_settle+1}/5)[/yellow]")
             time.sleep(2)
 
-    format_root_and_efi(root_part, efi_part, True, do_encrypt, boot_mode, has_win, win_esp, creds, luks_ba)
+    # When wiping the entire drive, always format the EFI partition (never preserve old Windows ESP on target disk)
+    format_root_and_efi(root_part, efi_part, True, do_encrypt, boot_mode, False, None, creds, luks_ba)
 
     env=f'PROVISIONED_ROOT_PART="{root_part}"\n'
     if efi_part:
