@@ -164,7 +164,7 @@ CORE_SYSTEM_DEFS = {
     ),
     "dusky_boot_zram_flush.timer": (
         "Dusky Boot ZRAM Flush Timer",
-        "One-shot boot memory flush timer. Triggers 45s after boot to flush cold startup memory into ZRAM swap, minimizing idle memory footprint.",
+        "One-shot boot memory flush timer. Triggers 60s after boot to flush cold startup memory into ZRAM swap, minimizing idle memory footprint.",
     ),
     "dusky_pro_active_zram_swap.timer": (
         "Proactive ZRAM Swap Timer",

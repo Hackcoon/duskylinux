@@ -49,8 +49,8 @@ RAM_TIER_MAX_MB: int = 16384             # Target <=16 GB RAM tier by default; s
 ENABLE_ON_LARGE_RAM: bool = False        # Allow override for machines with > 16 GB RAM
 TIMER_INTERVAL: str = "6min"             # Dynamic periodic timer recurrence interval written into systemd timer unit
 MAX_PER_RUN_MB: int = 256                # Capped at 256 MiB per periodic sweep to prevent background stutter
-BOOT_FLUSH_MAX_MB: int = 1024            # Budget for one-time 45s boot flush to minimize baseline idle RAM
-BOOT_FLUSH_DELAY: str = "45s"            # Time after boot to fire the one-shot baseline memory flush
+BOOT_FLUSH_MAX_MB: int = 1024            # Budget for one-time 60s boot flush to minimize baseline idle RAM
+BOOT_FLUSH_DELAY: str = "60s"            # Time after boot to fire the one-shot baseline memory flush
 
 def get_total_ram_bytes() -> int:
     try:
@@ -245,19 +245,37 @@ def get_system_pressure() -> float:
         pass
     return 0.0
 
-def find_app_slices() -> list[Path]:
-    """Finds all user-level app.slice instances across all active user sessions."""
+def find_user_slices(include_all: bool = False) -> list[tuple[Path, str]]:
+    """
+    Finds user-level cgroup targets across all active user sessions.
+    If include_all is False (periodic sweeps): targets only app.slice (desktop applications).
+    If include_all is True (one-shot boot flush): targets app.slice, session.slice (daemons/portals),
+    and active session scopes (e.g. session-*.scope / Hyprland).
+    """
     user_slice = Path("/sys/fs/cgroup/user.slice")
-    targets: list[Path] = []
+    targets: list[tuple[Path, str]] = []
     if not user_slice.exists():
         return targets
     for user_sub in user_slice.glob("user-*.slice"):
-        name = user_sub.name
-        if name.startswith("user-") and name.endswith(".slice"):
-            uid_str = name[5:-6]
-            app_slice = user_sub / f"user@{uid_str}.service" / "app.slice"
-            if app_slice.exists() and (app_slice / "memory.reclaim").exists():
-                targets.append(app_slice)
+        if not (user_sub.is_dir() and user_sub.name.startswith("user-")):
+            continue
+        uid_str = user_sub.name[5:-6]
+        user_service = user_sub / f"user@{uid_str}.service"
+        # Always target app.slice (desktop apps)
+        app_slice = user_service / "app.slice"
+        if app_slice.exists() and (app_slice / "memory.reclaim").exists():
+            targets.append((app_slice, f"{user_sub.name}/app.slice"))
+
+        if include_all:
+            # Target user background services & portals
+            sess_slice = user_service / "session.slice"
+            if sess_slice.exists() and (sess_slice / "memory.reclaim").exists():
+                targets.append((sess_slice, f"{user_sub.name}/session.slice"))
+
+            # Target login and compositor session scopes (e.g. session-1.scope)
+            for scope in user_sub.glob("session-*.scope"):
+                if scope.is_dir() and (scope / "memory.reclaim").exists():
+                    targets.append((scope, f"{user_sub.name}/{scope.name}"))
     return targets
 
 def get_cgroup_anon_bytes(cgroup_dir: Path) -> int:
@@ -433,23 +451,23 @@ def perform_reclaim(force: bool = False, boot_flush: bool = False) -> None:
     total_requested = 0
     total_stolen = 0
 
-    # 5. Reclaim from user application cold pools (app.slice) via MGLRU
-    app_slices = find_app_slices()
-    for app_slice in app_slices:
+    # 5. Reclaim from user application and session cold pools via MGLRU
+    user_targets = find_user_slices(include_all=boot_flush)
+    for cgroup_target, label in user_targets:
         if total_requested >= budget_limit:
             break
-        anon_bytes = get_cgroup_anon_bytes(app_slice)
+        anon_bytes = get_cgroup_anon_bytes(cgroup_target)
         remaining_budget = budget_limit - total_requested
         target_reclaim = min(int(anon_bytes * effective_ratio), remaining_budget) if anon_bytes > 0 else remaining_budget
         if target_reclaim <= 0:
             continue
-        req, stl = reclaim_cgroup_chunked(app_slice, target_reclaim, "app.slice")
+        req, stl = reclaim_cgroup_chunked(cgroup_target, target_reclaim, label)
         total_requested += req
         total_stolen += stl
         if stl > 0:
             anon_mb = anon_bytes / (1024 * 1024)
             cap_str = "100% (boot)" if boot_flush else f"{int(RECLAIM_RATIO*100)}%"
-            ok(f"Reclaimed {stl / (1024*1024):.1f} MB cold pages from {app_slice.parent.parent.name}/app.slice (anon: {anon_mb:.1f} MB, cap: {cap_str})")
+            ok(f"Reclaimed {stl / (1024*1024):.1f} MB cold pages from {label} (anon: {anon_mb:.1f} MB, cap: {cap_str})")
 
     # 6. Reclaim remaining budget from system services cold pool (system.slice) via MGLRU
     if total_requested < budget_limit:
@@ -520,7 +538,7 @@ def show_status() -> None:
         try:
             res = subprocess.run(["systemctl", "is-active", u], capture_output=True, text=True, check=False)
             active = res.stdout.strip() == "active"
-            label = "Boot Timer (45s)   " if "boot" in u else "Periodic Timer (6m) "
+            label = f"Boot Timer ({BOOT_FLUSH_DELAY})   " if "boot" in u else "Periodic Timer (6m) "
             print(f"{label}: {C.GRN if active else C.RED}{res.stdout.strip()}{C.RST}")
         except Exception:
             pass

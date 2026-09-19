@@ -78,8 +78,8 @@ def get_setup_script_path() -> Path:
 
 DEFAULT_RATIO = 0.30        # 30% slice anon reclaim cap
 DEFAULT_BUDGET_MB = 256     # 256 MB per periodic run
-DEFAULT_BOOT_FLUSH_MAX_MB = 1024 # 1024 MB max for one-shot 45s boot flush
-DEFAULT_BOOT_FLUSH_DELAY = "45s" # Delay after boot for one-shot flush
+DEFAULT_BOOT_FLUSH_MAX_MB = 1024 # 1024 MB max for one-shot 60s boot flush
+DEFAULT_BOOT_FLUSH_DELAY = "60s" # Delay after boot for one-shot flush
 DEFAULT_CHUNK_MB = 32       # 32 MB write chunks per yield
 DEFAULT_ZRAM_LIMIT = 0.90   # 90% full zram abort
 DEFAULT_RAM_THRESHOLD = 0.70 # 70% RAM usage threshold to trigger sweep
@@ -642,7 +642,7 @@ def print_full_status() -> None:
     boot_color = C.GRN if boot_active else C.YLW
     boot_word = "ACTIVE (Enabled)" if boot_active else "INACTIVE / ELAPSED"
     print(f"  {C.BOLD}Periodic Timer:{C.RST}    {status_color}{status_word}{C.RST}")
-    print(f"  {C.BOLD}Boot Flush Timer:{C.RST}  {boot_color}{boot_word}{C.RST} (one-shot 45s after boot)")
+    print(f"  {C.BOLD}Boot Flush Timer:{C.RST}  {boot_color}{boot_word}{C.RST} (one-shot 60s after boot)")
     print(f"  {C.BOLD}Sweep Frequency:{C.RST}   {C.CYN}{interval}{C.RST}")
     print(f"  {C.BOLD}RAM Trigger Cap:{C.RST}   {C.CYN}{ram_threshold}{C.RST} (only sweeps when RAM >= {ram_threshold})")
     print(f"  {C.BOLD}Slice Reclaim Cap:{C.RST} {C.CYN}{ratio}{C.RST} anon memory per cgroup slice")
