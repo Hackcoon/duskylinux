@@ -138,8 +138,8 @@ def build_standard_glance(suffix, label_name, group_name="Modules", expanded=Fal
         "gpu-power": 130, "gpu-usage": 100, "gpu-mem": 160,
         "disk": 260, "disk-read": 190, "disk-write": 190, "disk-temp": 100,
         "network": 190, "network-down": 110, "network-up": 110, "network-combined": 110,
-        "network-down-session": 120, "network-up-session": 120, "network-session": 120,
-        "network-boot-down": 120, "network-boot-up": 120, "network-boot": 120,
+        "network-down-session": 100, "network-up-session": 100, "network-session": 100,
+        "network-boot-down": 100, "network-boot-up": 100, "network-boot": 100,
         "uptime": 170, "workspace": 140, "hud": 180, "world-clock": 140
     }
     
