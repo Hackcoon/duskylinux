@@ -1036,10 +1036,52 @@ case "$MODE" in
             if [[ -n "$bat_dir" ]]; then
                 if [[ "$MODE" == "--battery-percent" ]]; then
                     cap="?"
-                    if { read -r cap < "$bat_dir/capacity"; } 2>/dev/null && [[ "$cap" =~ ^[0-9]+$ ]]; then
+                    { read -r cap < "$bat_dir/capacity"; } 2>/dev/null || cap="?"
+                    if [[ "$cap" =~ ^[0-9]+$ ]] && (( cap <= 100 )); then
                         send_osd "${cap}%"
                     else
-                        send_osd "Bat: N/A"
+                        # Fallback: derive capacity from energy (or charge*volt) when missing/malformed/bogus (>100)
+                        cap="?"
+                        energy_now="" energy_full=""
+                        { read -r energy_now < "$bat_dir/energy_now"; } 2>/dev/null || energy_now=""
+                        { read -r energy_full < "$bat_dir/energy_full"; } 2>/dev/null || energy_full=""
+                        if [[ ! "$energy_full" =~ ^[0-9]+$ ]] || (( energy_full <= 0 )); then
+                            { read -r energy_full < "$bat_dir/energy_full_design"; } 2>/dev/null || energy_full=""
+                        fi
+                        if [[ "$energy_now" =~ ^[0-9]+$ && "$energy_full" =~ ^[0-9]+$ ]] && (( energy_full > 0 )); then
+                            cap=$(( (energy_now * 100 + energy_full / 2) / energy_full ))
+                            (( cap > 100 )) && cap=100
+                            send_osd "${cap}%"
+                        else
+                            _pv=""
+                            for _vf in voltage_now voltage_avg voltage_min_design voltage_max_design; do
+                                if { read -r _vv < "$bat_dir/$_vf"; } 2>/dev/null && [[ "$_vv" =~ ^-?[0-9]+$ ]]; then
+                                    _vv=${_vv#-}
+                                    if (( _vv > 0 )); then _pv="$_vv"; break; fi
+                                fi
+                            done
+                            unset _vf _vv
+                            _cn="" _cf=""
+                            { read -r _cn < "$bat_dir/charge_now"; } 2>/dev/null || _cn=""
+                            { read -r _cf < "$bat_dir/charge_full"; } 2>/dev/null || _cf=""
+                            if [[ ! "$_cf" =~ ^[0-9]+$ ]]; then
+                                { read -r _cf < "$bat_dir/charge_full_design"; } 2>/dev/null || _cf=""
+                            fi
+                            if [[ -n "$_pv" && "$_cn" =~ ^[0-9]+$ && "$_cf" =~ ^[0-9]+$ ]] && (( _cf > 0 )); then
+                                _en=$(( _cn * _pv / 1000000 ))
+                                _ef=$(( _cf * _pv / 1000000 ))
+                                if (( _ef > 0 )); then
+                                    cap=$(( (_en * 100 + _ef / 2) / _ef ))
+                                    (( cap > 100 )) && cap=100
+                                    send_osd "${cap}%"
+                                else
+                                    send_osd "Bat: N/A"
+                                fi
+                            else
+                                send_osd "Bat: N/A"
+                            fi
+                            unset _pv _cn _cf _en _ef
+                        fi
                     fi
                     sleep 1
                     continue
@@ -1049,36 +1091,114 @@ case "$MODE" in
                 stat="Unknown"
                 { read -r cap < "$bat_dir/capacity"; } 2>/dev/null || cap="?"
                 { read -r stat < "$bat_dir/status"; } 2>/dev/null || stat="Unknown"
+                [[ "$cap" =~ ^[0-9]+$ ]] || cap="?"
 
-                # Read power or compute from voltage & current
+                # Voltage fallback chain (batstat): voltage_now -> voltage_avg -> *_design
+                volt=""
+                for _vf in voltage_now voltage_avg voltage_min_design voltage_max_design; do
+                    if { read -r _vv < "$bat_dir/$_vf"; } 2>/dev/null && [[ "$_vv" =~ ^-?[0-9]+$ ]]; then
+                        _vv=${_vv#-}
+                        if (( _vv > 0 )); then
+                            volt="$_vv"
+                            break
+                        fi
+                    fi
+                done
+                unset _vf _vv
+
+                # Capacity clamp + energy/charge fallback (borrowed from batstat: bogus EC can report >100)
+                if [[ "$cap" == "?" ]] || (( cap > 100 )); then
+                    energy_now="" energy_full=""
+                    { read -r energy_now < "$bat_dir/energy_now"; } 2>/dev/null || energy_now=""
+                    { read -r energy_full < "$bat_dir/energy_full"; } 2>/dev/null || energy_full=""
+                    if [[ ! "$energy_full" =~ ^[0-9]+$ ]] || (( energy_full <= 0 )); then
+                        { read -r energy_full < "$bat_dir/energy_full_design"; } 2>/dev/null || energy_full=""
+                    fi
+                    if [[ "$energy_now" =~ ^[0-9]+$ && "$energy_full" =~ ^[0-9]+$ ]] && (( energy_full > 0 )); then
+                        cap=$(( (energy_now * 100 + energy_full / 2) / energy_full ))
+                    elif [[ -n "$volt" ]]; then
+                        # Charge-only batteries (like BAT1): derive from charge * volt
+                        _cn="" _cf=""
+                        { read -r _cn < "$bat_dir/charge_now"; } 2>/dev/null || _cn=""
+                        { read -r _cf < "$bat_dir/charge_full"; } 2>/dev/null || _cf=""
+                        if [[ ! "$_cf" =~ ^[0-9]+$ ]]; then
+                            { read -r _cf < "$bat_dir/charge_full_design"; } 2>/dev/null || _cf=""
+                        fi
+                        if [[ "$_cn" =~ ^[0-9]+$ && "$_cf" =~ ^[0-9]+$ ]] && (( _cf > 0 )); then
+                            _en=$(( _cn * volt / 1000000 ))
+                            _ef=$(( _cf * volt / 1000000 ))
+                            if (( _ef > 0 )); then
+                                cap=$(( (_en * 100 + _ef / 2) / _ef ))
+                            elif [[ "$cap" =~ ^[0-9]+$ ]]; then
+                                : # keep clamped numeric value below
+                            else
+                                cap="?"
+                            fi
+                        elif [[ "$cap" =~ ^[0-9]+$ ]]; then
+                            : # keep clamped numeric value below
+                        else
+                            cap="?"
+                        fi
+                        unset _cn _cf _en _ef
+                    elif [[ "$cap" =~ ^[0-9]+$ ]]; then
+                        : # keep clamped numeric value below
+                    else
+                        cap="?"
+                    fi
+                fi
+                if [[ "$cap" =~ ^[0-9]+$ ]]; then
+                    (( cap > 100 )) && cap=100
+                else
+                    cap="?"
+                fi
+
+                # Power: power_now -> power_avg -> current_now/current_avg * volt (full precision)
                 watts_str="N/A"
                 pwr=0
                 has_power=false
 
-                if [[ -f "$bat_dir/power_now" ]]; then
-                    raw_pwr=""
-                    if { read -r raw_pwr < "$bat_dir/power_now"; } 2>/dev/null && [[ "$raw_pwr" =~ ^-?[0-9]+$ ]]; then
-                        pwr=${raw_pwr#-}
-                        watts_int=$(( pwr / 1000000 ))
-                        watts_frac=$(( (pwr % 1000000) / 100000 ))
-                        watts_str="${watts_int}.${watts_frac}W"
+                for _pf in power_now power_avg; do
+                    if [[ -f "$bat_dir/$_pf" ]]; then
+                        raw_pwr=""
+                        if { read -r raw_pwr < "$bat_dir/$_pf"; } 2>/dev/null && [[ "$raw_pwr" =~ ^-?[0-9]+$ ]]; then
+                            raw_pwr=${raw_pwr#-}
+                            if (( raw_pwr > 0 )); then
+                                pwr=$raw_pwr
+                                has_power=true
+                                break
+                            fi
+                        fi
+                    fi
+                done
+                unset _pf
+
+                if [[ "$has_power" == false && -n "$volt" ]]; then
+                    for _cf in current_now current_avg; do
+                        if [[ -f "$bat_dir/$_cf" ]]; then
+                            curr="" volt_use="$volt"
+                            if { read -r curr < "$bat_dir/$_cf"; } 2>/dev/null &&
+                                [[ "$curr" =~ ^-?[0-9]+$ ]]; then
+                                c_abs=${curr#-}
+                                if (( c_abs > 0 )); then
+                                    # Full-precision: c*volt/1e6 (safe: <=2e14 << 2^63-1)
+                                    pwr=$(( c_abs * volt_use / 1000000 ))
+                                    has_power=true
+                                    break
+                                fi
+                            fi
+                        fi
+                    done
+                    unset _cf curr volt_use c_abs
+                    # Zero current with valid voltage (threshold-held) is 0.0W, not N/A
+                    if [[ "$has_power" == false ]] && [[ -f "$bat_dir/current_now" || -f "$bat_dir/current_avg" ]]; then
+                        pwr=0
                         has_power=true
                     fi
                 fi
 
-                if [[ "$has_power" == false ]] && [[ -f "$bat_dir/current_now" && -f "$bat_dir/voltage_now" ]]; then
-                    curr="" volt=""
-                    if { read -r curr < "$bat_dir/current_now"; } 2>/dev/null &&
-                       { read -r volt < "$bat_dir/voltage_now"; } 2>/dev/null &&
-                       [[ "$curr" =~ ^-?[0-9]+$ && "$volt" =~ ^[0-9]+$ ]]; then
-                        c_abs=${curr#-}
-                        p_uw=$(( (c_abs / 1000) * (volt / 1000) ))
-                        watts_int=$(( p_uw / 1000000 ))
-                        watts_frac=$(( (p_uw % 1000000) / 100000 ))
-                        watts_str="${watts_int}.${watts_frac}W"
-                        pwr=$p_uw
-                        has_power=true
-                    fi
+                if [[ "$has_power" == true ]]; then
+                    watts_x10=$(( (pwr + 50000) / 100000 ))
+                    watts_str="$((watts_x10 / 10)).$((watts_x10 % 10))W"
                 fi
 
                 if [[ "$MODE" == "--battery-watts" ]]; then
@@ -1087,48 +1207,96 @@ case "$MODE" in
                     continue
                 fi
 
-                # Compute remaining time if requested (energy/power first, fallback to charge/current if energy failed)
+                # Compute remaining time (energy/power first, fallback to charge/current; rounded minutes)
                 time_str=""
                 if [[ "$stat" == "Discharging" ]]; then
                     if [[ "$has_power" == true && -f "$bat_dir/energy_now" ]] && (( pwr > 0 )); then
                         energy_now=""
                         if { read -r energy_now < "$bat_dir/energy_now"; } 2>/dev/null && [[ "$energy_now" =~ ^[0-9]+$ ]]; then
-                            total_mins=$(( (energy_now * 60) / pwr ))
+                            total_mins=$(( (energy_now * 60 + pwr / 2) / pwr ))
                             time_str=$'\n'"$(( total_mins / 60 ))h$(( total_mins % 60 ))m"
                         fi
                     fi
-                    if [[ -z "$time_str" ]] && [[ -f "$bat_dir/charge_now" && -f "$bat_dir/current_now" ]]; then
+                    if [[ -z "$time_str" ]] && [[ "$has_power" == true && -n "$volt" ]] && (( pwr > 0 )) && [[ -f "$bat_dir/charge_now" ]]; then
+                        # Prefer power-consistent estimate (charge*volt/power, like batstat's
+                        # normalized energy/power) when a valid power reading exists
+                        charge_now=""
+                        { read -r charge_now < "$bat_dir/charge_now"; } 2>/dev/null || charge_now=""
+                        if [[ "$charge_now" =~ ^[0-9]+$ ]]; then
+                            _en=$(( charge_now * volt / 1000000 ))
+                            if (( _en > 0 )); then
+                                total_mins=$(( (_en * 60 + pwr / 2) / pwr ))
+                                time_str=$'\n'"$(( total_mins / 60 ))h$(( total_mins % 60 ))m"
+                            fi
+                            unset _en
+                        fi
+                    fi
+                    if [[ -z "$time_str" ]] && [[ -f "$bat_dir/charge_now" ]]; then
                         charge_now="" curr_now=""
-                        if { read -r charge_now < "$bat_dir/charge_now"; } 2>/dev/null &&
-                           { read -r curr_now < "$bat_dir/current_now"; } 2>/dev/null &&
-                           [[ "$charge_now" =~ ^[0-9]+$ && "$curr_now" =~ ^-?[0-9]+$ ]]; then
+                        { read -r charge_now < "$bat_dir/charge_now"; } 2>/dev/null || charge_now=""
+                        for _cf in current_now current_avg; do
+                            if { read -r curr_now < "$bat_dir/$_cf"; } 2>/dev/null && [[ "$curr_now" =~ ^-?[0-9]+$ ]]; then
+                                break
+                            fi
+                            curr_now=""
+                        done
+                        unset _cf
+                        if [[ "$charge_now" =~ ^[0-9]+$ && "$curr_now" =~ ^-?[0-9]+$ ]]; then
                             c_abs=${curr_now#-}
                             if (( c_abs > 0 )); then
-                                total_mins=$(( (charge_now * 60) / c_abs ))
+                                total_mins=$(( (charge_now * 60 + c_abs / 2) / c_abs ))
                                 time_str=$'\n'"$(( total_mins / 60 ))h$(( total_mins % 60 ))m"
                             fi
                         fi
                     fi
                 elif [[ "$stat" == "Charging" ]]; then
-                    if [[ "$has_power" == true && -f "$bat_dir/energy_now" && -f "$bat_dir/energy_full" ]] && (( pwr > 0 )); then
+                    if [[ "$has_power" == true && -f "$bat_dir/energy_now" ]] && (( pwr > 0 )); then
                         energy_now="" energy_full=""
-                        if { read -r energy_now < "$bat_dir/energy_now"; } 2>/dev/null &&
-                           { read -r energy_full < "$bat_dir/energy_full"; } 2>/dev/null &&
-                           [[ "$energy_now" =~ ^[0-9]+$ && "$energy_full" =~ ^[0-9]+$ ]] &&
-                           (( energy_full > energy_now )); then
-                            total_mins=$(( ((energy_full - energy_now) * 60) / pwr ))
+                        { read -r energy_now < "$bat_dir/energy_now"; } 2>/dev/null || energy_now=""
+                        { read -r energy_full < "$bat_dir/energy_full"; } 2>/dev/null || energy_full=""
+                        if [[ ! "$energy_full" =~ ^[0-9]+$ ]]; then
+                            { read -r energy_full < "$bat_dir/energy_full_design"; } 2>/dev/null || energy_full=""
+                        fi
+                        if [[ "$energy_now" =~ ^[0-9]+$ && "$energy_full" =~ ^[0-9]+$ ]] &&
+                            (( energy_full > energy_now )); then
+                            total_mins=$(( ((energy_full - energy_now) * 60 + pwr / 2) / pwr ))
                             time_str=$'\n'"$(( total_mins / 60 ))h$(( total_mins % 60 ))m"
                         fi
                     fi
-                    if [[ -z "$time_str" ]] && [[ -f "$bat_dir/charge_now" && -f "$bat_dir/charge_full" && -f "$bat_dir/current_now" ]]; then
+                    if [[ -z "$time_str" ]] && [[ "$has_power" == true && -n "$volt" ]] && (( pwr > 0 )) && [[ -f "$bat_dir/charge_now" && -f "$bat_dir/charge_full" ]]; then
+                        charge_now="" charge_full=""
+                        { read -r charge_now < "$bat_dir/charge_now"; } 2>/dev/null || charge_now=""
+                        { read -r charge_full < "$bat_dir/charge_full"; } 2>/dev/null || charge_full=""
+                        if [[ ! "$charge_full" =~ ^[0-9]+$ ]]; then
+                            { read -r charge_full < "$bat_dir/charge_full_design"; } 2>/dev/null || charge_full=""
+                        fi
+                        if [[ "$charge_now" =~ ^[0-9]+$ && "$charge_full" =~ ^[0-9]+$ ]] && (( charge_full > charge_now )); then
+                            _rem=$(( (charge_full - charge_now) * volt / 1000000 ))
+                            if (( _rem > 0 )); then
+                                total_mins=$(( (_rem * 60 + pwr / 2) / pwr ))
+                                time_str=$'\n'"$(( total_mins / 60 ))h$(( total_mins % 60 ))m"
+                            fi
+                            unset _rem
+                        fi
+                    fi
+                    if [[ -z "$time_str" ]] && [[ -f "$bat_dir/charge_now" && -f "$bat_dir/charge_full" ]]; then
                         charge_now="" charge_full="" curr_now=""
-                        if { read -r charge_now < "$bat_dir/charge_now"; } 2>/dev/null &&
-                           { read -r charge_full < "$bat_dir/charge_full"; } 2>/dev/null &&
-                           { read -r curr_now < "$bat_dir/current_now"; } 2>/dev/null &&
-                           [[ "$charge_now" =~ ^[0-9]+$ && "$charge_full" =~ ^[0-9]+$ && "$curr_now" =~ ^-?[0-9]+$ ]]; then
+                        { read -r charge_now < "$bat_dir/charge_now"; } 2>/dev/null || charge_now=""
+                        { read -r charge_full < "$bat_dir/charge_full"; } 2>/dev/null || charge_full=""
+                        if [[ ! "$charge_full" =~ ^[0-9]+$ ]]; then
+                            { read -r charge_full < "$bat_dir/charge_full_design"; } 2>/dev/null || charge_full=""
+                        fi
+                        for _cf in current_now current_avg; do
+                            if { read -r curr_now < "$bat_dir/$_cf"; } 2>/dev/null && [[ "$curr_now" =~ ^-?[0-9]+$ ]]; then
+                                break
+                            fi
+                            curr_now=""
+                        done
+                        unset _cf
+                        if [[ "$charge_now" =~ ^[0-9]+$ && "$charge_full" =~ ^[0-9]+$ && "$curr_now" =~ ^-?[0-9]+$ ]]; then
                             c_abs=${curr_now#-}
                             if (( c_abs > 0 && charge_full > charge_now )); then
-                                total_mins=$(( ((charge_full - charge_now) * 60) / c_abs ))
+                                total_mins=$(( ((charge_full - charge_now) * 60 + c_abs / 2) / c_abs ))
                                 time_str=$'\n'"$(( total_mins / 60 ))h$(( total_mins % 60 ))m"
                             fi
                         fi
@@ -1138,6 +1306,10 @@ case "$MODE" in
                 if [[ "$MODE" == "--battery-time" ]]; then
                     if [[ -n "$time_str" ]]; then
                         out_str="${time_str#$'\n'}"
+                    elif [[ "$stat" == "Full" ]]; then
+                        out_str="Full"
+                    elif [[ "$stat" == "Not charging" ]]; then
+                        out_str="Held"
                     else
                         out_str="N/A"
                     fi
