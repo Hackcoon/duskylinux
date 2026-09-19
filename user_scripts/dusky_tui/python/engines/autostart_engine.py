@@ -201,8 +201,53 @@ AUTOSTART_DEFAULTS: dict[str, dict[str, Any]] = {
         "default": False
     },
     "autostart/glance_network": {
-        "pattern": r'dusky_glance\.sh\s+--network',
+        "pattern": r'dusky_glance\.sh\s+--network(?:["\'\s]|$)',
         "canonical": 'hl.exec_cmd("~/user_scripts/rofi/dusky_glance.sh --network")',
+        "default": False
+    },
+    "autostart/glance_network_down": {
+        "pattern": r'dusky_glance\.sh\s+--network-down(?:["\'\s]|$)',
+        "canonical": 'hl.exec_cmd("~/user_scripts/rofi/dusky_glance.sh --network-down")',
+        "default": False
+    },
+    "autostart/glance_network_up": {
+        "pattern": r'dusky_glance\.sh\s+--network-up(?:["\'\s]|$)',
+        "canonical": 'hl.exec_cmd("~/user_scripts/rofi/dusky_glance.sh --network-up")',
+        "default": False
+    },
+    "autostart/glance_network_combined": {
+        "pattern": r'dusky_glance\.sh\s+--network-combined(?:["\'\s]|$)',
+        "canonical": 'hl.exec_cmd("~/user_scripts/rofi/dusky_glance.sh --network-combined")',
+        "default": False
+    },
+    "autostart/glance_network_down_session": {
+        "pattern": r'dusky_glance\.sh\s+--network-down-session(?:["\'\s]|$)',
+        "canonical": 'hl.exec_cmd("~/user_scripts/rofi/dusky_glance.sh --network-down-session")',
+        "default": False
+    },
+    "autostart/glance_network_up_session": {
+        "pattern": r'dusky_glance\.sh\s+--network-up-session(?:["\'\s]|$)',
+        "canonical": 'hl.exec_cmd("~/user_scripts/rofi/dusky_glance.sh --network-up-session")',
+        "default": False
+    },
+    "autostart/glance_network_session": {
+        "pattern": r'dusky_glance\.sh\s+--network-session(?:["\'\s]|$)',
+        "canonical": 'hl.exec_cmd("~/user_scripts/rofi/dusky_glance.sh --network-session")',
+        "default": False
+    },
+    "autostart/glance_network_boot_down": {
+        "pattern": r'dusky_glance\.sh\s+--network-boot-down(?:["\'\s]|$)',
+        "canonical": 'hl.exec_cmd("~/user_scripts/rofi/dusky_glance.sh --network-boot-down")',
+        "default": False
+    },
+    "autostart/glance_network_boot_up": {
+        "pattern": r'dusky_glance\.sh\s+--network-boot-up(?:["\'\s]|$)',
+        "canonical": 'hl.exec_cmd("~/user_scripts/rofi/dusky_glance.sh --network-boot-up")',
+        "default": False
+    },
+    "autostart/glance_network_boot": {
+        "pattern": r'dusky_glance\.sh\s+--network-boot(?:["\'\s]|$)',
+        "canonical": 'hl.exec_cmd("~/user_scripts/rofi/dusky_glance.sh --network-boot")',
         "default": False
     },
     "autostart/glance_uptime": {

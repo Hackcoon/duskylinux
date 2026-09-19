@@ -90,7 +90,16 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     printf "  \e[32m--temp\e[0m                     Show CPU temperature\n"
     printf "  \e[32m--battery\e[0m                  Show battery status/power\n"
     printf "  \e[32m--disk\e[0m                     Show root disk usage\n"
-    printf "  \e[32m--network\e[0m                  Show live network speed\n"
+    printf "  \e[32m--network\e[0m                  Show live network speed (up & down)\n"
+    printf "  \e[32m--network-down\e[0m             Show live network download speed\n"
+    printf "  \e[32m--network-up\e[0m               Show live network upload speed\n"
+    printf "  \e[32m--network-combined\e[0m         Show live combined network speed\n"
+    printf "  \e[32m--network-down-session\e[0m     Show session downloaded data\n"
+    printf "  \e[32m--network-up-session\e[0m       Show session uploaded data\n"
+    printf "  \e[32m--network-session\e[0m          Show session total traffic\n"
+    printf "  \e[32m--network-boot-down\e[0m        Show boot total downloaded data\n"
+    printf "  \e[32m--network-boot-up\e[0m          Show boot total uploaded data\n"
+    printf "  \e[32m--network-boot\e[0m             Show boot total combined traffic\n"
     printf "  \e[32m--uptime\e[0m                   Show system uptime\n"
     printf "  \e[32m--workspace\e[0m                Show active Hyprland workspace\n"
     printf "  \e[32m--hud [card] [vendor]\e[0m      Show live Gaming HUD\n"
@@ -494,8 +503,8 @@ while true; do
         '󰔟  Time & Focus')
             while true; do
                 tf_opts=(
-                    "󰥔  Clock (no seconds)"
-                    "󰥔  Clock (with seconds)"
+                    "󰥔  Clock (Short)"
+                    "󰥔  Clock (Full)"
                     "󰥔  World Clock"
                     "󰔟  Timer"
                     "󰔚  System Uptime"
@@ -507,30 +516,30 @@ while true; do
                 [[ "$tfchoice" == "  Back" ]] && break
                 
                 case "$tfchoice" in
-                    *"Clock (no seconds)"*)
-                        save_recent "Clock (no seconds)" "--clock-short"
+                    *"Clock (Short)"*|*"Clock (no seconds)"*)
+                        save_recent "Clock (Short)" "--clock-short"
                         "$DAEMON_SCRIPT" --clock-short & disown
                         exit 0
                         ;;
-                    *"Clock (with seconds)"*)
-                        save_recent "Clock (with seconds)" "--clock"
+                    *"Clock (Full)"*|*"Clock (with seconds)"*)
+                        save_recent "Clock (Full)" "--clock"
                         "$DAEMON_SCRIPT" --clock & disown
                         exit 0
                         ;;
                     *"World Clock"*)
                         while true; do
                             wc_opts=(
-                                "🇯🇵  Japan (Tokyo)"
-                                "🇺🇸  New York (East)"
-                                "🇺🇸  Chicago (Central)"
-                                "🇺🇸  Denver (Mountain)"
-                                "🇺🇸  California (West)"
-                                "🇬🇧  London"
-                                "🇨🇳  Beijing"
-                                "🇦🇺  Australia (Sydney)"
-                                "🇦🇪  Dubai"
-                                "🇷🇺  Moscow"
-                                "🇸🇬  Singapore"
+                                "󰥔  Tokyo"
+                                "󰥔  New York"
+                                "󰥔  Chicago"
+                                "󰥔  Denver"
+                                "󰥔  Los Angeles"
+                                "󰥔  London"
+                                "󰥔  Beijing"
+                                "󰥔  Sydney"
+                                "󰥔  Dubai"
+                                "󰥔  Moscow"
+                                "󰥔  Singapore"
                                 "  Back"
                             )
                             wcchoice=$(printf '%s\n' "${wc_opts[@]}" | "${ROFI_SUB[@]}" -p "World Clock") || break
@@ -552,7 +561,7 @@ while true; do
                                     "$DAEMON_SCRIPT" --world-clock "America/Denver" "Denver" & disown
                                     exit 0
                                     ;;
-                                *"California"*)
+                                *"Los Angeles"*|*"California"*)
                                     save_recent "World Clock (California)" "--world-clock America/Los_Angeles California"
                                     "$DAEMON_SCRIPT" --world-clock "America/Los_Angeles" "California" & disown
                                     exit 0
@@ -567,7 +576,7 @@ while true; do
                                     "$DAEMON_SCRIPT" --world-clock "Asia/Shanghai" "Beijing" & disown
                                     exit 0
                                     ;;
-                                *"Australia"*)
+                                *"Sydney"*|*"Australia"*)
                                     save_recent "World Clock (Sydney)" "--world-clock Australia/Sydney Sydney"
                                     "$DAEMON_SCRIPT" --world-clock "Australia/Sydney" "Sydney" & disown
                                     exit 0
@@ -582,7 +591,7 @@ while true; do
                                     "$DAEMON_SCRIPT" --world-clock "Europe/Moscow" "Moscow" & disown
                                     exit 0
                                     ;;
-                                *"Japan"*)
+                                *"Tokyo"*|*"Japan"*)
                                     save_recent "World Clock (Tokyo)" "--world-clock Asia/Tokyo Tokyo"
                                     "$DAEMON_SCRIPT" --world-clock "Asia/Tokyo" "Tokyo" & disown
                                     exit 0
@@ -641,7 +650,7 @@ while true; do
                             [[ -f "$POMO_STATE" ]] && last_pomo=$(<"$POMO_STATE")
                             read -r lw_sec lb_sec <<< "$(parse_pomodoro "$last_pomo")"
                             p_opts=(
-                                "󰐊  Start Last ($(fmt_t "$lw_sec") Work / $(fmt_t "$lb_sec") Break)"
+                                "󰐊  Start Last ($(fmt_t "$lw_sec") / $(fmt_t "$lb_sec"))"
                                 "󰒓  Set in Minutes"
                                 "󰒓  Set in Seconds"
                                 "  Back"
@@ -650,7 +659,7 @@ while true; do
                             [[ "$pchoice" == "  Back" ]] && break
                             
                             if [[ "$pchoice" == *"Start Last"* ]]; then
-                                save_recent "Pomodoro ($(fmt_t "$lw_sec") Work / $(fmt_t "$lb_sec") Break)" "--pomodoro $lw_sec $lb_sec"
+                                save_recent "Pomodoro ($(fmt_t "$lw_sec") / $(fmt_t "$lb_sec"))" "--pomodoro $lw_sec $lb_sec"
                                 "$DAEMON_SCRIPT" --pomodoro "$lw_sec" "$lb_sec" & disown
                                 exit 0
                             elif [[ "$pchoice" == *"Minutes"* ]]; then
@@ -688,8 +697,8 @@ while true; do
             while true; do
                 st_opts=(
                     "󰋊  Root Partition (/)"
-                    "󰆼  Solid State Drives (SSD)"
-                    "󰋊  Hard Disk Drives (HDD)"
+                    "󰆼  Solid State (SSD)"
+                    "󰋊  Hard Disk (HDD)"
                     "  Back"
                 )
                 stchoice=$(printf '%s\n' "${st_opts[@]}" | "${ROFI_SUB[@]}" -p "Storage Type") || break
@@ -700,7 +709,7 @@ while true; do
                     "$DAEMON_SCRIPT" --disk & disown
                     exit 0
                     
-                elif [[ "$stchoice" == *"Solid State Drives"* ]]; then
+                elif [[ "$stchoice" == *"Solid State"* || "$stchoice" == *"SSD"* ]]; then
                     while true; do
                         declare -a ssd_opts=()
                         while IFS=$'\t' read -r name model rota; do
@@ -739,7 +748,7 @@ while true; do
                         done
                     done
 
-                elif [[ "$stchoice" == *"Hard Disk Drives"* ]]; then
+                elif [[ "$stchoice" == *"Hard Disk"* || "$stchoice" == *"HDD"* ]]; then
                     while true; do
                         declare -a hdd_opts=()
                         while IFS=$'\t' read -r name model rota; do
@@ -836,10 +845,10 @@ while true; do
         '󰁹  Battery')
             while true; do
                 b_opts=(
-                    "󰁹  Power Draw Only"
-                    "󰁹  Percent Only"
-                    "󰁹  Time Remaining Only"
                     "󰁹  Standard HUD"
+                    "󰁹  Power Draw"
+                    "󰁹  Percentage"
+                    "󰁹  Time Remaining"
                     "  Back"
                 )
                 bchoice=$(printf '%s\n' "${b_opts[@]}" | "${ROFI_SUB[@]}" -p "Battery") || break
@@ -849,15 +858,15 @@ while true; do
                     save_recent "Battery HUD" "--battery"
                     "$DAEMON_SCRIPT" --battery & disown
                     exit 0
-                elif [[ "$bchoice" == *"Percent Only"* ]]; then
+                elif [[ "$bchoice" == *"Percent"* ]]; then
                     save_recent "Battery Percent" "--battery-percent"
                     "$DAEMON_SCRIPT" --battery-percent & disown
                     exit 0
-                elif [[ "$bchoice" == *"Power Draw Only"* ]]; then
+                elif [[ "$bchoice" == *"Power Draw"* ]]; then
                     save_recent "Battery Power Draw" "--battery-watts"
                     "$DAEMON_SCRIPT" --battery-watts & disown
                     exit 0
-                elif [[ "$bchoice" == *"Time Remaining Only"* ]]; then
+                elif [[ "$bchoice" == *"Time Remaining"* ]]; then
                     save_recent "Battery Time" "--battery-time"
                     "$DAEMON_SCRIPT" --battery-time & disown
                     exit 0
@@ -866,10 +875,116 @@ while true; do
             continue
             ;;
 
-        '󰈀  Network Speed')
-            save_recent "Network Speed" "--network"
-            "$DAEMON_SCRIPT" --network & disown
-            exit 0
+        '󰈀  Network Speed'|'󰈀  Network')
+            while true; do
+                net_categories=(
+                    "󱘖  Live Rates"
+                    "󰇚  Session Data"
+                    "󰋊  Boot Totals"
+                    "  Back"
+                )
+                cat_choice=$(printf '%s\n' "${net_categories[@]}" | "${ROFI_SUB[@]}" -p "Network") || break
+                [[ "$cat_choice" == "  Back" ]] && break
+
+                case "$cat_choice" in
+                    *"Live Rates"*)
+                        while true; do
+                            live_opts=(
+                                "󰈀  Both (Up & Down)"
+                                "󰇚  Download Rate"
+                                "󰕒  Upload Rate"
+                                "󱘖  Combined Rate"
+                                "  Back"
+                            )
+                            choice=$(printf '%s\n' "${live_opts[@]}" | "${ROFI_SUB[@]}" -p "Live Rates") || break
+                            [[ "$choice" == "  Back" ]] && break
+                            case "$choice" in
+                                *"Both"*)
+                                    save_recent "Network Speed" "--network"
+                                    "$DAEMON_SCRIPT" --network & disown
+                                    exit 0
+                                    ;;
+                                *"Download"*)
+                                    save_recent "Network Download" "--network-down"
+                                    "$DAEMON_SCRIPT" --network-down & disown
+                                    exit 0
+                                    ;;
+                                *"Upload"*)
+                                    save_recent "Network Upload" "--network-up"
+                                    "$DAEMON_SCRIPT" --network-up & disown
+                                    exit 0
+                                    ;;
+                                *"Combined"*)
+                                    save_recent "Network Combined Speed" "--network-combined"
+                                    "$DAEMON_SCRIPT" --network-combined & disown
+                                    exit 0
+                                    ;;
+                            esac
+                        done
+                        ;;
+
+                    *"Session Data"*)
+                        while true; do
+                            session_opts=(
+                                "󰇚  Downloaded"
+                                "󰕒  Uploaded"
+                                "󱘖  Total Traffic"
+                                "  Back"
+                            )
+                            choice=$(printf '%s\n' "${session_opts[@]}" | "${ROFI_SUB[@]}" -p "Session Data") || break
+                            [[ "$choice" == "  Back" ]] && break
+                            case "$choice" in
+                                *"Downloaded"*)
+                                    save_recent "Session Downloaded" "--network-down-session"
+                                    "$DAEMON_SCRIPT" --network-down-session & disown
+                                    exit 0
+                                    ;;
+                                *"Uploaded"*)
+                                    save_recent "Session Uploaded" "--network-up-session"
+                                    "$DAEMON_SCRIPT" --network-up-session & disown
+                                    exit 0
+                                    ;;
+                                *"Total Traffic"*)
+                                    save_recent "Session Total Traffic" "--network-session"
+                                    "$DAEMON_SCRIPT" --network-session & disown
+                                    exit 0
+                                    ;;
+                            esac
+                        done
+                        ;;
+
+                    *"Boot Totals"*)
+                        while true; do
+                            boot_opts=(
+                                "󰇚  Downloaded"
+                                "󰕒  Uploaded"
+                                "󱘖  Total Traffic"
+                                "  Back"
+                            )
+                            choice=$(printf '%s\n' "${boot_opts[@]}" | "${ROFI_SUB[@]}" -p "Boot Totals") || break
+                            [[ "$choice" == "  Back" ]] && break
+                            case "$choice" in
+                                *"Downloaded"*)
+                                    save_recent "Boot Downloaded" "--network-boot-down"
+                                    "$DAEMON_SCRIPT" --network-boot-down & disown
+                                    exit 0
+                                    ;;
+                                *"Uploaded"*)
+                                    save_recent "Boot Uploaded" "--network-boot-up"
+                                    "$DAEMON_SCRIPT" --network-boot-up & disown
+                                    exit 0
+                                    ;;
+                                *"Total Traffic"*)
+                                    save_recent "Boot Total Traffic" "--network-boot"
+                                    "$DAEMON_SCRIPT" --network-boot & disown
+                                    exit 0
+                                    ;;
+                            esac
+                        done
+                        ;;
+                esac
+            done
+            continue
             ;;
 
         '󰽽  Workspace')

@@ -51,7 +51,15 @@ case "$MODE" in
 
     --clock|--clock-short|--stopwatch|--cpu-power|--cpu|--ram|\
     --ram-temp|--zram|--temp|--battery|--battery-percent|\
-    --battery-watts|--battery-time|--disk|--network|--uptime|--workspace)
+    --battery-watts|--battery-time|--disk|--network|--network-down|\
+    --network-download|--network-up|--network-upload|--network-combined|\
+    --network-speed|--network-rate|--network-down-session|\
+    --network-session-down|--network-up-session|--network-session-up|\
+    --network-session|--network-session-total|--network-total|\
+    --network-boot-down|--network-boot-up|--network-boot|\
+    --network-down-boot|--network-up-boot|--network-boot-total|\
+    --network-total-down|--network-total-up|\
+    --uptime|--workspace)
         (( $# == 1 )) || usage
         ;;
 
@@ -211,6 +219,19 @@ case "$MODE" in
             die "Missing command: notify-send"
         ;;
 esac
+
+case "$MODE" in
+    --network-download) set -- "--network-down" ;;
+    --network-upload) set -- "--network-up" ;;
+    --network-speed|--network-rate) set -- "--network-combined" ;;
+    --network-session-down) set -- "--network-down-session" ;;
+    --network-session-up) set -- "--network-up-session" ;;
+    --network-session-total|--network-total) set -- "--network-session" ;;
+    --network-down-boot|--network-total-down) set -- "--network-boot-down" ;;
+    --network-up-boot|--network-total-up) set -- "--network-boot-up" ;;
+    --network-boot-total) set -- "--network-boot" ;;
+esac
+MODE="$1"
 
 MODE_BASE="${MODE#--}"
 instance_hash=$(printf '%s\0' "$@" | sha256sum)
@@ -1470,61 +1491,111 @@ case "$MODE" in
         done
         ;;
 
-    --network)
+    --network|--network-down|--network-up|--network-combined|\
+    --network-down-session|--network-up-session|--network-session|\
+    --network-boot-down|--network-boot-up|--network-boot)
         NET_STATE_DIR="${XDG_RUNTIME_DIR:-/run/user/$UID}/waybar-net"
         STATE_FILE="$NET_STATE_DIR/state"
+        EXT_STATE_FILE="$NET_STATE_DIR/state_ext"
         HEARTBEAT_FILE="$NET_STATE_DIR/heartbeat"
         DAEMON_PID_FILE="$NET_STATE_DIR/daemon.pid"
 
-        if [[ -d "$NET_STATE_DIR" ]]; then
+        wake_network_daemon() {
+            [[ -d "$NET_STATE_DIR" ]] || mkdir -p "$NET_STATE_DIR" 2>/dev/null || true
             : > "$HEARTBEAT_FILE" 2>/dev/null || true
+            local d_pid="" _verified=0
             if [[ -r "$DAEMON_PID_FILE" ]]; then
                 read -r d_pid < "$DAEMON_PID_FILE" 2>/dev/null || d_pid=""
                 case "$d_pid" in
                     ""|*[!0-9]*) ;;
                     *)
                         if kill -0 "$d_pid" 2>/dev/null; then
-                            _gfd=""
+                            local _gfd="" _g1="" _g2=""
                             if { exec {_gfd}< "/proc/$d_pid/cmdline"; } 2>/dev/null; then
                                 IFS= read -r -d '' _g1 <&"$_gfd" 2>/dev/null || _g1=""
                                 IFS= read -r -d '' _g2 <&"$_gfd" 2>/dev/null || _g2=""
                                 { exec {_gfd}<&-; } 2>/dev/null
-                                [[ "$_g2" == *network_meter_daemon* ]] && kill -USR1 "$d_pid" 2>/dev/null || true
+                                if [[ "$_g2" == *network_meter_daemon* ]]; then
+                                    _verified=1
+                                    kill -USR1 "$d_pid" 2>/dev/null || true
+                                fi
                             fi
                         fi
                         ;;
                 esac
             fi
-        fi
+            if (( _verified == 0 )); then
+                systemctl --user start network_meter.service 2>/dev/null || true
+            fi
+        }
+
+        wake_network_daemon
 
         while true; do
             [[ -d "$NET_STATE_DIR" ]] && : > "$HEARTBEAT_FILE" 2>/dev/null || true
-            if [[ -r "$DAEMON_PID_FILE" ]]; then
-                read -r _gp < "$DAEMON_PID_FILE" 2>/dev/null || _gp=""
-                case "$_gp" in
-                    ""|*[!0-9]*) ;;
-                    *)
-                        if kill -0 "$_gp" 2>/dev/null; then
-                            _gfd=""
-                            if { exec {_gfd}< "/proc/$_gp/cmdline"; } 2>/dev/null; then
-                                IFS= read -r -d '' _g1 <&"$_gfd" 2>/dev/null || _g1=""
-                                IFS= read -r -d '' _g2 <&"$_gfd" 2>/dev/null || _g2=""
-                                { exec {_gfd}<&-; } 2>/dev/null
-                                [[ "$_g2" == *network_meter_daemon* ]] && kill -USR1 "$_gp" 2>/dev/null || true
-                            fi
+
+            ext_read=0
+            if [[ -r "$EXT_STATE_FILE" ]]; then
+                for ((_rt=0; _rt<5; _rt++)); do
+                    if read -r rx_fmt tx_fmt tot_fmt s_rx_fmt s_tx_fmt s_tot_fmt b_rx_fmt b_tx_fmt b_tot_fmt cls iface s_rx_u s_tx_u s_tot_u b_rx_u b_tx_u b_tot_u _ < "$EXT_STATE_FILE" 2>/dev/null; then
+                        if [[ -n "${cls:-}" && -n "${rx_fmt:-}" ]]; then
+                            ext_read=1
+                            break
                         fi
-                        ;;
-                esac
-                unset _gp _g1 _g2 _gfd
+                    fi
+                done
             fi
-            if [[ -r "$STATE_FILE" ]]; then
-                unit=""; up=""; down=""
+
+            if (( ext_read == 1 )); then
+                if [[ "$cls" == "network-disconnected" || "$iface" == "none" ]]; then
+                    send_osd "Offline"
+                else
+                    case "$MODE_BASE" in
+                        network-down)
+                            send_osd "$rx_fmt"
+                            ;;
+                        network-up)
+                            send_osd "$tx_fmt"
+                            ;;
+                        network-combined)
+                            send_osd "$tot_fmt"
+                            ;;
+                        network-down-session)
+                            send_osd "$s_rx_fmt ${s_rx_u:-MB}"
+                            ;;
+                        network-up-session)
+                            send_osd "$s_tx_fmt ${s_tx_u:-MB}"
+                            ;;
+                        network-session)
+                            send_osd "$s_tot_fmt ${s_tot_u:-MB}"
+                            ;;
+                        network-boot-down)
+                            send_osd "$b_rx_fmt ${b_rx_u:-MB}"
+                            ;;
+                        network-boot-up)
+                            send_osd "$b_tx_fmt ${b_tx_u:-MB}"
+                            ;;
+                        network-boot)
+                            send_osd "$b_tot_fmt ${b_tot_u:-GB}"
+                            ;;
+                        network|*)
+                            if [[ -r "$STATE_FILE" ]] && read -r _u _up _down _c < "$STATE_FILE" 2>/dev/null && [[ -n "${_c:-}" ]]; then
+                                _up="${_up:-0}"; _down="${_down:-0}"; _u="${_u:-B}"
+                                send_osd "${_up}${_u%B} ${_down}${_u%B}"
+                            else
+                                send_osd "${tx_fmt} ${rx_fmt}"
+                            fi
+                            ;;
+                    esac
+                fi
+            elif [[ -r "$STATE_FILE" ]]; then
+                unit=""; up=""; down=""; cls=""
                 for ((_rt=0; _rt<5; _rt++)); do
                     if read -r _u _up _down _c < "$STATE_FILE" 2>/dev/null; then
                         case "${_u:-}" in
                             KB|MB|GB|-)
                                 if [[ -n "${_up:-}" && -n "${_down:-}" && -n "${_c:-}" ]]; then
-                                    unit="$_u"; up="$_up"; down="$_down"
+                                    unit="$_u"; up="$_up"; down="$_down"; cls="$_c"
                                     break
                                 fi
                                 ;;
@@ -1532,10 +1603,34 @@ case "$MODE" in
                     fi
                 done
                 unset _rt _u _up _down _c
-                up="${up:-0}"; down="${down:-0}"; unit="${unit:-B}"
-                short_unit="${unit%B}"
-                send_osd "${up}${short_unit} ${down}${short_unit}"
+                if [[ "$cls" == "network-disconnected" ]]; then
+                    send_osd "Offline"
+                else
+                    up="${up:-0}"; down="${down:-0}"; unit="${unit:-B}"
+                    short_unit="${unit%B}"
+                    case "$MODE_BASE" in
+                        network-down)
+                            send_osd "${down}${short_unit}"
+                            ;;
+                        network-up)
+                            send_osd "${up}${short_unit}"
+                            ;;
+                        network-combined)
+                            send_osd "${down}${short_unit}"
+                            ;;
+                        network-down-session|network-session|network-boot-down|network-boot)
+                            send_osd "${down}"
+                            ;;
+                        network-up-session|network-boot-up)
+                            send_osd "${up}"
+                            ;;
+                        network|*)
+                            send_osd "${up}${short_unit} ${down}${short_unit}"
+                            ;;
+                    esac
+                fi
             else
+                wake_network_daemon
                 send_osd "Offline"
             fi
             sleep 1
