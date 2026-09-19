@@ -357,11 +357,16 @@ def get_disk_swap_size() -> str:
 def get_proactive_swap_status() -> str:
     try:
         res = run_cmd(["systemctl", "is-active", "dusky_pro_active_zram_swap.timer"], check=False)
+        boot = run_cmd(["systemctl", "is-active", "dusky_boot_zram_flush.timer"], check=False)
         if res == "active":
-            return "Active (Timer Scheduled)"
+            if boot == "active":
+                return "Active (Periodic Skimmer & Boot Flush)"
+            return "Active (Periodic Skimmer)"
         srv = run_cmd(["systemctl", "is-active", "dusky_pro_active_zram_swap.service"], check=False)
         if srv == "active":
             return "Active (Running)"
+        if boot == "active":
+            return "Active (Boot Flush Only)"
         return "Disabled"
     except Exception:
         return "Disabled"

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-#d: Proactive idle memory reclaimer & ZRAM swapper (MGLRU Engine)
+#d: Proactive idle memory reclaimer & ZRAM swapper (MGLRU Slice Skimmer & Boot Flush)
+# Target: Arch Linux / Linux Kernel 7.2+ / systemd 261+
 
 from __future__ import annotations
 
@@ -7,8 +8,8 @@ import argparse
 import errno
 import os
 import shutil
-import sys
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -21,11 +22,12 @@ class C:
     GRN = "\033[1;32m"
     YLW = "\033[1;33m"
     BLU = "\033[1;34m"
+    CYN = "\033[1;36m"
     RST = "\033[0m"
 
     @classmethod
     def strip(cls) -> None:
-        for name in ("BOLD", "RED", "GRN", "YLW", "BLU", "RST"):
+        for name in ("BOLD", "RED", "GRN", "YLW", "BLU", "CYN", "RST"):
             setattr(cls, name, "")
 
 def info(msg: str) -> None: print(f"{C.BLU}[INFO]{C.RST} {msg}")
@@ -36,13 +38,19 @@ def die(msg: str, code: int = 1) -> NoReturn:
     err(msg)
     sys.exit(code)
 
-# --- Configuration & Tuning ---
+# --- Configuration & Tuning Defaults ---
 PAGE_SIZE: int = os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else 4096
-CHUNK_SIZE: int = 32 * 1024 * 1024       # 32 MiB write chunks for ultra-low latency
-PSI_SOME_THRESHOLD: float = 0.50         # Abort if some avg10 >= 0.50%
-ZRAM_MAX_USAGE_RATIO: float = 0.95       # Abort sweep if zRAM swap is >= 95% full to protect disk swap
-APP_IDLE_RECLAIM_RATIO: float = 0.40     # Reclaim up to 40% of idle app anon memory to protect warm UI buffers
-RAM_USAGE_THRESHOLD_RATIO: float = 0.80  # Only trigger proactive sweep if total system RAM usage is >= 80%
+CHUNK_SIZE: int = 32 * 1024 * 1024       # 32 MiB write chunks for low-latency MGLRU paging
+PSI_SOME_THRESHOLD: float = 0.50         # Abort sweep if some avg10 >= 0.50%
+ZRAM_MAX_USAGE_RATIO: float = 0.90       # Abort sweep if zRAM swap is >= 90% full to protect disk swap
+RAM_USAGE_THRESHOLD_RATIO: float = 0.70  # Only trigger periodic sweep if total system RAM usage is >= 70%
+RECLAIM_RATIO: float = 0.30              # Reclaim up to 30% of slice anonymous pages per periodic sweep
+RAM_TIER_MAX_MB: int = 16384             # Target <=16 GB RAM tier by default; skip large RAM machines (>16GB)
+ENABLE_ON_LARGE_RAM: bool = False        # Allow override for machines with > 16 GB RAM
+TIMER_INTERVAL: str = "6min"             # Dynamic periodic timer recurrence interval written into systemd timer unit
+MAX_PER_RUN_MB: int = 256                # Capped at 256 MiB per periodic sweep to prevent background stutter
+BOOT_FLUSH_MAX_MB: int = 1024            # Budget for one-time 45s boot flush to minimize baseline idle RAM
+BOOT_FLUSH_DELAY: str = "45s"            # Time after boot to fire the one-shot baseline memory flush
 
 def get_total_ram_bytes() -> int:
     try:
@@ -56,10 +64,7 @@ def get_total_ram_bytes() -> int:
     return 16 * 1024 * 1024 * 1024
 
 def get_ram_usage() -> tuple[int, int, float]:
-    """
-    Returns (used_bytes, total_bytes, usage_ratio) from /proc/meminfo.
-    Uses MemTotal and MemAvailable to calculate actual system memory consumption.
-    """
+    """Returns (used_bytes, total_bytes, usage_ratio) using MemTotal and MemAvailable."""
     total = 0
     available = 0
     try:
@@ -79,14 +84,15 @@ def get_ram_usage() -> tuple[int, int, float]:
     return used, total, ratio
 
 TOTAL_RAM: int = get_total_ram_bytes()
-# Run budget: capped at 256 MiB per sweep to eliminate background micro-stutter
-MAX_PER_RUN: int = min(256 * 1024 * 1024, max(128 * 1024 * 1024, int(TOTAL_RAM * 0.10)))
-
+MAX_PER_RUN: int = MAX_PER_RUN_MB * 1024 * 1024
+BOOT_FLUSH_MAX: int = BOOT_FLUSH_MAX_MB * 1024 * 1024
 CONF_PATH: Path = Path("/etc/dusky/dusky_pro_active_zram_swap.conf")
 
 def load_runtime_config() -> None:
     """Load dynamic overrides from /etc/dusky/dusky_pro_active_zram_swap.conf if present."""
-    global APP_IDLE_RECLAIM_RATIO, MAX_PER_RUN, ZRAM_MAX_USAGE_RATIO, PSI_SOME_THRESHOLD, CHUNK_SIZE, RAM_USAGE_THRESHOLD_RATIO
+    global MAX_PER_RUN, MAX_PER_RUN_MB, ZRAM_MAX_USAGE_RATIO, PSI_SOME_THRESHOLD
+    global CHUNK_SIZE, RAM_USAGE_THRESHOLD_RATIO, TIMER_INTERVAL, ENABLE_ON_LARGE_RAM
+    global RAM_TIER_MAX_MB, RECLAIM_RATIO, BOOT_FLUSH_MAX_MB, BOOT_FLUSH_MAX, BOOT_FLUSH_DELAY
     if not CONF_PATH.exists():
         return
     try:
@@ -98,14 +104,21 @@ def load_runtime_config() -> None:
                 k, v = line.split("=", 1)
                 k = k.strip()
                 v = v.strip().strip("\"'")
-                if k == "APP_IDLE_RECLAIM_RATIO":
+                if k in ("RECLAIM_RATIO", "APP_IDLE_RECLAIM_RATIO"):
                     val = float(v.rstrip("%")) / 100.0 if "%" in v else float(v)
-                    APP_IDLE_RECLAIM_RATIO = max(0.01, min(1.0, val))
+                    RECLAIM_RATIO = max(0.01, min(1.0, val))
                 elif k == "MAX_PER_RUN_MB":
-                    MAX_PER_RUN = int(float(v) * 1024 * 1024)
+                    MAX_PER_RUN_MB = max(32, min(2048, int(float(v))))
+                    MAX_PER_RUN = MAX_PER_RUN_MB * 1024 * 1024
+                elif k == "BOOT_FLUSH_MAX_MB":
+                    BOOT_FLUSH_MAX_MB = max(64, min(4096, int(float(v))))
+                    BOOT_FLUSH_MAX = BOOT_FLUSH_MAX_MB * 1024 * 1024
+                elif k == "BOOT_FLUSH_DELAY":
+                    if v:
+                        BOOT_FLUSH_DELAY = v
                 elif k == "CHUNK_SIZE_MB":
                     mb = int(float(v))
-                    CHUNK_SIZE = max(4, min(512, mb)) * 1024 * 1024
+                    CHUNK_SIZE = max(4, min(256, mb)) * 1024 * 1024
                 elif k == "ZRAM_MAX_USAGE_RATIO":
                     val = float(v.rstrip("%")) / 100.0 if "%" in v else float(v)
                     ZRAM_MAX_USAGE_RATIO = max(0.10, min(1.0, val))
@@ -114,21 +127,15 @@ def load_runtime_config() -> None:
                     RAM_USAGE_THRESHOLD_RATIO = max(0.01, min(1.0, val))
                 elif k == "PSI_SOME_THRESHOLD":
                     PSI_SOME_THRESHOLD = float(v)
+                elif k == "TIMER_INTERVAL":
+                    if v:
+                        TIMER_INTERVAL = v
+                elif k == "ENABLE_ON_LARGE_RAM":
+                    ENABLE_ON_LARGE_RAM = v.lower() in ("1", "true", "yes")
+                elif k == "RAM_TIER_MAX_MB":
+                    RAM_TIER_MAX_MB = int(float(v))
     except Exception:
         pass
-
-# --- Argument Parsing (Executed BEFORE Privilege Escalation) ---
-parser = argparse.ArgumentParser(description="Elite Arch Linux MGLRU Proactive ZRAM Memory Skimmer")
-group = parser.add_mutually_exclusive_group()
-group.add_argument("--run", action="store_true", help="Directly trigger the memory reclaim task")
-group.add_argument("--restore", action="store_true", help="Remove reclaimer binaries, systemd units and timer")
-parser.add_argument("--force", action="store_true", help="Bypass RAM threshold and PSI checks")
-parser.add_argument("--no-color", action="store_true", help="Disable ANSI color output")
-
-args = parser.parse_args()
-
-if args.no_color or not sys.stdout.isatty() or "NO_COLOR" in os.environ:
-    C.strip()
 
 # --- Privilege Escalation ---
 def escalate_privileges() -> None:
@@ -176,10 +183,7 @@ def write_file_atomic(path: Path, content: str, mode: int = 0o644) -> None:
         raise
 
 def get_zram_swap_usage() -> tuple[int, int, float] | None:
-    """
-    Returns (used_bytes, size_bytes, usage_ratio) across all /dev/zram* swap devices in /proc/swaps.
-    Returns None if no /dev/zram devices are active as swap.
-    """
+    """Returns (used_bytes, size_bytes, usage_ratio) across all /dev/zram* devices in /proc/swaps."""
     try:
         with open("/proc/swaps", "r", encoding="utf-8") as fh:
             lines = fh.read().strip().splitlines()
@@ -215,9 +219,7 @@ def has_swap_or_zram() -> bool:
                 return True
     except OSError:
         pass
-    if Path("/dev/zram0").exists():
-        return True
-    return False
+    return Path("/dev/zram0").exists()
 
 def is_cgroup2_mounted() -> bool:
     try:
@@ -235,7 +237,6 @@ def get_system_pressure() -> float:
         with open("/proc/pressure/memory", "r", encoding="utf-8") as f:
             for line in f:
                 if line.startswith("some "):
-                    # some avg10=0.00 avg60=0.00 avg300=0.00 total=...
                     parts = line.split()
                     for p in parts:
                         if p.startswith("avg10="):
@@ -244,36 +245,8 @@ def get_system_pressure() -> float:
         pass
     return 0.0
 
-def get_mem_stats(stat_path: Path) -> dict[str, int]:
-    stats: dict[str, int] = {}
-    if not stat_path.exists():
-        return stats
-    try:
-        with stat_path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                parts = line.split()
-                if len(parts) == 2:
-                    try:
-                        stats[parts[0]] = int(parts[1])
-                    except ValueError:
-                        pass
-    except OSError:
-        pass
-    return stats
-
-def get_cpu_usage_usec(cfile: Path) -> int | None:
-    if not cfile.exists():
-        return None
-    try:
-        with cfile.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                if line.startswith("usage_usec "):
-                    return int(line.split()[1])
-    except Exception:
-        pass
-    return None
-
 def find_app_slices() -> list[Path]:
+    """Finds all user-level app.slice instances across all active user sessions."""
     user_slice = Path("/sys/fs/cgroup/user.slice")
     targets: list[Path] = []
     if not user_slice.exists():
@@ -283,9 +256,23 @@ def find_app_slices() -> list[Path]:
         if name.startswith("user-") and name.endswith(".slice"):
             uid_str = name[5:-6]
             app_slice = user_sub / f"user@{uid_str}.service" / "app.slice"
-            if app_slice.exists():
+            if app_slice.exists() and (app_slice / "memory.reclaim").exists():
                 targets.append(app_slice)
     return targets
+
+def get_cgroup_anon_bytes(cgroup_dir: Path) -> int:
+    """Reads anonymous memory bytes from a cgroup's memory.stat file."""
+    stat_file = cgroup_dir / "memory.stat"
+    if not stat_file.exists():
+        return 0
+    try:
+        with stat_file.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("anon "):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return 0
 
 def parse_proactive_reclaimed_bytes(stat_path: Path) -> int:
     try:
@@ -301,6 +288,10 @@ def parse_proactive_reclaimed_bytes(stat_path: Path) -> int:
     return 0
 
 def reclaim_cgroup_chunked(cgroup_dir: Path, target_bytes: int, label: str) -> tuple[int, int]:
+    """
+    Submits bounded memory reclaim requests in low-latency 32MB chunks with swappiness=max.
+    Delegates cold page identification entirely to the kernel's hardware Multi-Gen LRU (MGLRU).
+    """
     reclaim_file = cgroup_dir / "memory.reclaim"
     stat_file = cgroup_dir / "memory.stat"
     if not reclaim_file.exists():
@@ -310,7 +301,7 @@ def reclaim_cgroup_chunked(cgroup_dir: Path, target_bytes: int, label: str) -> t
     reclaimed_requested = 0
 
     while reclaimed_requested < target_bytes:
-        # 1. zRAM capacity check before each chunk
+        # 1. zRAM saturation guard
         zram_stat = get_zram_swap_usage()
         if zram_stat is None:
             warn(f"No active zRAM swap device detected. Halting sweep on {label} to protect disk swap.")
@@ -324,10 +315,10 @@ def reclaim_cgroup_chunked(cgroup_dir: Path, target_bytes: int, label: str) -> t
             )
             break
 
-        # 2. PSI pre-chunk check
+        # 2. System memory pressure guard
         psi_sys = get_system_pressure()
         if psi_sys >= PSI_SOME_THRESHOLD:
-            warn(f"System memory pressure elevated ({psi_sys:.2f}% >= {PSI_SOME_THRESHOLD}%). Halting sweep.")
+            warn(f"System memory pressure active ({psi_sys:.2f}% >= {PSI_SOME_THRESHOLD}%). Halting sweep.")
             break
 
         chunk = min(CHUNK_SIZE, target_bytes - reclaimed_requested)
@@ -335,14 +326,14 @@ def reclaim_cgroup_chunked(cgroup_dir: Path, target_bytes: int, label: str) -> t
             with reclaim_file.open("w", encoding="utf-8") as fh:
                 fh.write(f"{chunk} swappiness=max\n")
             reclaimed_requested += chunk
-            time.sleep(0.005)  # Yield CPU briefly for foreground tasks
+            time.sleep(0.005)  # Brief 5ms yield for interactive desktop fluidity
         except OSError as e:
             if e.errno == errno.EAGAIN:
-                # Kernel processed all colder pages available
+                # Kernel processed all colder pages available in this MGLRU generation
                 reclaimed_requested += chunk
                 break
             elif e.errno == errno.EINVAL:
-                warn(f"swappiness=max unsupported or invalid parameter on {label}")
+                warn(f"swappiness=max unsupported on {label}")
                 break
             elif e.errno == errno.ENOENT:
                 break
@@ -354,29 +345,55 @@ def reclaim_cgroup_chunked(cgroup_dir: Path, target_bytes: int, label: str) -> t
     actual_stolen = max(0, after_steal - before_steal)
     return reclaimed_requested, actual_stolen
 
-def perform_reclaim(force: bool = False) -> None:
+def perform_reclaim(force: bool = False, boot_flush: bool = False) -> None:
+    """
+    Executes a bounded slice-level memory reclaim sweep via Linux Kernel MGLRU.
+    If boot_flush=True: runs one-time baseline sweep at 45s boot, bypassing the 70% threshold
+    and 30% cap, letting MGLRU reclaim all cold startup residue into zRAM.
+    """
     load_runtime_config()
 
-    # 0. Gate on overall system RAM usage: only reclaim when system RAM usage reaches threshold (default 80%)
     used_b, total_b, ram_ratio = get_ram_usage()
-    if not force and ram_ratio < RAM_USAGE_THRESHOLD_RATIO:
+    total_mb = total_b // (1024 * 1024)
+
+    # 1. RAM Tier Guard: Skip on >16 GB workstations by default to save CPU
+    if not force and not ENABLE_ON_LARGE_RAM and total_mb > RAM_TIER_MAX_MB:
         info(
-            f"RAM usage below threshold: {ram_ratio * 100:.1f}% ({used_b // (1024*1024)} MB / "
-            f"{total_b // (1024*1024)} MB < {int(RAM_USAGE_THRESHOLD_RATIO * 100)}% threshold). "
-            "Skipping proactive sweep to conserve CPU and avoid unnecessary compression."
+            f"RAM tier > 16 GB ({total_mb} MB detected). Skipping memory sweep to conserve CPU "
+            "(large RAM systems have ample memory headroom). Override via ENABLE_ON_LARGE_RAM=true."
         )
         try:
-            state_path = Path("/run/dusky/pro_active_zram_swap.state")
-            write_file_atomic(state_path, f"Idle (RAM: {ram_ratio * 100:.1f}% < {int(RAM_USAGE_THRESHOLD_RATIO * 100)}%)\n", mode=0o644)
+            write_file_atomic(Path("/run/dusky/pro_active_zram_swap.state"), f"Idle (Tier > 16GB: {total_mb} MB)\n", mode=0o644)
         except Exception:
             pass
         return
 
-    info(
-        f"Initiating MGLRU proactive idle memory sweep (RAM usage={ram_ratio*100:.1f}% >= {int(RAM_USAGE_THRESHOLD_RATIO*100)}%, "
-        f"budget={MAX_PER_RUN // (1024*1024)}MB, chunk={CHUNK_SIZE // (1024*1024)}MB, "
-        f"ratio={int(APP_IDLE_RECLAIM_RATIO*100)}%, zram_limit={int(ZRAM_MAX_USAGE_RATIO*100)}%)..."
-    )
+    # 2. RAM Usage Threshold Guard: Applies to periodic runs (bypassed for one-time boot flush)
+    if not boot_flush and not force and ram_ratio < RAM_USAGE_THRESHOLD_RATIO:
+        info(
+            f"RAM usage below threshold: {ram_ratio * 100:.1f}% ({used_b // (1024*1024)} MB / "
+            f"{total_mb} MB < {int(RAM_USAGE_THRESHOLD_RATIO * 100)}% threshold). "
+            "Skipping proactive sweep to conserve CPU and avoid unnecessary compression."
+        )
+        try:
+            write_file_atomic(Path("/run/dusky/pro_active_zram_swap.state"), f"Idle (RAM: {ram_ratio * 100:.1f}% < {int(RAM_USAGE_THRESHOLD_RATIO * 100)}%)\n", mode=0o644)
+        except Exception:
+            pass
+        return
+
+    budget_limit = BOOT_FLUSH_MAX if boot_flush else MAX_PER_RUN
+    effective_ratio = 1.0 if boot_flush else RECLAIM_RATIO
+
+    if boot_flush:
+        info(
+            f"Initiating one-time MGLRU baseline boot memory flush at {BOOT_FLUSH_DELAY} (RAM usage={ram_ratio*100:.1f}%, "
+            f"budget={BOOT_FLUSH_MAX_MB}MB, ratio=100% cold, chunk={CHUNK_SIZE // (1024*1024)}MB, zram_limit={int(ZRAM_MAX_USAGE_RATIO*100)}%)..."
+        )
+    else:
+        info(
+            f"Initiating MGLRU proactive slice sweep (RAM usage={ram_ratio*100:.1f}% >= {int(RAM_USAGE_THRESHOLD_RATIO*100)}%, "
+            f"budget={MAX_PER_RUN_MB}MB, ratio={int(RECLAIM_RATIO*100)}%, chunk={CHUNK_SIZE // (1024*1024)}MB, zram_limit={int(ZRAM_MAX_USAGE_RATIO*100)}%)..."
+        )
 
     if not is_cgroup2_mounted():
         die("cgroup v2 not mounted at /sys/fs/cgroup. Arch uses cgroup2 by default.")
@@ -384,32 +401,30 @@ def perform_reclaim(force: bool = False) -> None:
     if not has_swap_or_zram():
         warn("No active swap or ZRAM detected. Kernel will reject anon reclaim.")
 
-    # 1. Gate on zRAM presence and capacity: never spill cold pages to disk swap
+    # 3. zRAM Swap Guard: Never spill cold pages to disk swap
     zram_stat = get_zram_swap_usage()
     if zram_stat is None:
-        warn("No active zRAM swap device detected in /proc/swaps. Skipping proactive sweep to avoid spilling pages to disk swap.")
+        warn("No active zRAM swap device detected in /proc/swaps. Skipping sweep to avoid spilling pages to disk swap.")
         return
     used_zram_b, size_zram_b, zram_ratio = zram_stat
     if zram_ratio >= ZRAM_MAX_USAGE_RATIO:
         warn(
             f"zRAM swap capacity at {zram_ratio * 100:.1f}% ({used_zram_b / (1024*1024)} MB / "
             f"{size_zram_b / (1024*1024)} MB >= {ZRAM_MAX_USAGE_RATIO * 100:.0f}%). "
-            "Skipping proactive sweep to avoid spilling pages to disk swap."
+            "Skipping sweep to avoid spilling pages to disk swap."
         )
         try:
-            state_path = Path("/run/dusky/pro_active_zram_swap.state")
-            write_file_atomic(state_path, f"Idle (zRAM full: {zram_ratio * 100:.0f}%)\n", mode=0o644)
+            write_file_atomic(Path("/run/dusky/pro_active_zram_swap.state"), f"Idle (zRAM full: {zram_ratio * 100:.0f}%)\n", mode=0o644)
         except Exception:
             pass
         return
 
-    # 2. Gate on system memory pressure
+    # 4. PSI System Pressure Guard
     psi_sys = get_system_pressure()
     if not force and psi_sys >= PSI_SOME_THRESHOLD:
         info(f"System memory pressure active (some avg10={psi_sys:.2f}% >= {PSI_SOME_THRESHOLD}%). Skipping sweep.")
         try:
-            state_path = Path("/run/dusky/pro_active_zram_swap.state")
-            write_file_atomic(state_path, f"Idle (PSI active: {psi_sys:.1f}%)\n", mode=0o644)
+            write_file_atomic(Path("/run/dusky/pro_active_zram_swap.state"), f"Idle (PSI active: {psi_sys:.1f}%)\n", mode=0o644)
         except Exception:
             pass
         return
@@ -418,62 +433,40 @@ def perform_reclaim(force: bool = False) -> None:
     total_requested = 0
     total_stolen = 0
 
-    # 2. Target user application scopes (app.slice)
+    # 5. Reclaim from user application cold pools (app.slice) via MGLRU
     app_slices = find_app_slices()
     for app_slice in app_slices:
-        if total_requested >= MAX_PER_RUN:
+        if total_requested >= budget_limit:
             break
+        anon_bytes = get_cgroup_anon_bytes(app_slice)
+        remaining_budget = budget_limit - total_requested
+        target_reclaim = min(int(anon_bytes * effective_ratio), remaining_budget) if anon_bytes > 0 else remaining_budget
+        if target_reclaim <= 0:
+            continue
+        req, stl = reclaim_cgroup_chunked(app_slice, target_reclaim, "app.slice")
+        total_requested += req
+        total_stolen += stl
+        if stl > 0:
+            anon_mb = anon_bytes / (1024 * 1024)
+            cap_str = "100% (boot)" if boot_flush else f"{int(RECLAIM_RATIO*100)}%"
+            ok(f"Reclaimed {stl / (1024*1024):.1f} MB cold pages from {app_slice.parent.parent.name}/app.slice (anon: {anon_mb:.1f} MB, cap: {cap_str})")
 
-        leaf_cgroups = [
-            p for p in app_slice.iterdir()
-            if p.is_dir() and (p.name.startswith("app-") or p.name.endswith(".scope") or p.name.endswith(".service"))
-        ]
-
-        # First pass: check leaf cgroups for genuinely idle apps
-        for leaf in leaf_cgroups:
-            if total_requested >= MAX_PER_RUN:
-                break
-            stats = get_mem_stats(leaf / "memory.stat")
-            anon = stats.get("anon", 0)
-            if anon < 16 * 1024 * 1024:
-                continue
-
-            # Detect CPU idleness over 50ms window
-            cpu_f = leaf / "cpu.stat"
-            u1 = get_cpu_usage_usec(cpu_f)
-            time.sleep(0.05)
-            u2 = get_cpu_usage_usec(cpu_f)
-            delta_cpu = (u2 - u1) if (u1 is not None and u2 is not None) else 0
-
-            # If CPU advanced less than 5ms over 50ms window, the app is idle
-            if delta_cpu < 5000:
-                target = min(int(anon * APP_IDLE_RECLAIM_RATIO), MAX_PER_RUN - total_requested)
-                if target > 0:
-                    req, stl = reclaim_cgroup_chunked(leaf, target, leaf.name)
-                    total_requested += req
-                    total_stolen += stl
-                    if stl > 0:
-                        ok(f"Reclaimed {stl / (1024*1024):.1f} MB from idle app {leaf.name} (anon={anon/(1024*1024):.1f} MB)")
-
-        # Second pass: reclaim remaining budget from app.slice general cold pool
-        if total_requested < MAX_PER_RUN:
-            remaining = MAX_PER_RUN - total_requested
-            req, stl = reclaim_cgroup_chunked(app_slice, remaining, "app.slice")
-            total_requested += req
-            total_stolen += stl
-            if stl > 0:
-                ok(f"Reclaimed {stl / (1024*1024):.1f} MB from app.slice pool")
-
-    # 3. Target system services cold pool (system.slice)
-    if total_requested < MAX_PER_RUN:
+    # 6. Reclaim remaining budget from system services cold pool (system.slice) via MGLRU
+    if total_requested < budget_limit:
         system_slice = Path("/sys/fs/cgroup/system.slice")
-        if system_slice.exists():
-            remaining = min(128 * 1024 * 1024, MAX_PER_RUN - total_requested)
-            req, stl = reclaim_cgroup_chunked(system_slice, remaining, "system.slice")
-            total_requested += req
-            total_stolen += stl
-            if stl > 0:
-                ok(f"Reclaimed {stl / (1024*1024):.1f} MB from system.slice cold pool")
+        if system_slice.exists() and (system_slice / "memory.reclaim").exists():
+            sys_anon = get_cgroup_anon_bytes(system_slice)
+            remaining_budget = budget_limit - total_requested
+            sys_cap = remaining_budget if boot_flush else min(128 * 1024 * 1024, remaining_budget)
+            target_sys = min(int(sys_anon * effective_ratio), sys_cap) if sys_anon > 0 else sys_cap
+            if target_sys > 0:
+                req, stl = reclaim_cgroup_chunked(system_slice, target_sys, "system.slice")
+                total_requested += req
+                total_stolen += stl
+                if stl > 0:
+                    sys_mb = sys_anon / (1024 * 1024)
+                    cap_str = "100% (boot)" if boot_flush else f"{int(RECLAIM_RATIO*100)}%"
+                    ok(f"Reclaimed {stl / (1024*1024):.1f} MB cold pages from system.slice (anon: {sys_mb:.1f} MB, cap: {cap_str})")
 
     elapsed_ms = (time.perf_counter() - start_time) * 1000
     zram_info = ""
@@ -485,18 +478,56 @@ def perform_reclaim(force: bool = False) -> None:
     except Exception:
         pass
 
-    ok(f"Sweep finished in {elapsed_ms:.1f}ms. Stolen: {total_stolen / (1024*1024):.1f} MB to ZRAM{zram_info}")
+    sweep_tag = "Boot flush" if boot_flush else "Sweep"
+    ok(f"{sweep_tag} finished in {elapsed_ms:.1f}ms. Stolen: {total_stolen / (1024*1024):.1f} MB to ZRAM{zram_info}")
     try:
         state_path = Path("/run/dusky/pro_active_zram_swap.state")
         stolen_mb = total_stolen / (1024 * 1024)
         stolen_str = f"{int(round(stolen_mb))} MB" if stolen_mb >= 10 else f"{stolen_mb:.1f} MB"
         dur_str = f"{elapsed_ms/1000:.1f}s" if elapsed_ms >= 1000 else f"{int(round(elapsed_ms))}ms"
-        write_file_atomic(state_path, f"{stolen_str} ({dur_str})\n", mode=0o644)
+        prefix = "Boot Flush: " if boot_flush else ""
+        write_file_atomic(state_path, f"{prefix}{stolen_str} ({dur_str})\n", mode=0o644)
     except Exception:
         pass
 
-def deploy_systemd_units() -> None:
-    info("Deploying MGLRU proactive ZRAM memory reclaim units...")
+def show_status() -> None:
+    """Displays current system memory, zRAM swap, PSI pressure, and service status."""
+    load_runtime_config()
+    used_b, total_b, ram_ratio = get_ram_usage()
+    psi = get_system_pressure()
+    zram_stat = get_zram_swap_usage()
+
+    print(f"\n{C.BOLD}{C.CYN}=== Dusky MGLRU Proactive ZRAM Swap Status ==={C.RST}")
+    print(f"Total System RAM    : {total_b // (1024*1024)} MB ({total_b / (1024*1024*1024):.1f} GB)")
+    print(f"Current RAM Used    : {used_b // (1024*1024)} MB ({ram_ratio*100:.1f}%) [Periodic Threshold: {int(RAM_USAGE_THRESHOLD_RATIO*100)}%]")
+    print(f"Slice Reclaim Cap   : {int(RECLAIM_RATIO*100)}% anon per periodic sweep [Run Budget: {MAX_PER_RUN_MB} MB max]")
+    print(f"One-Shot Boot Flush : {BOOT_FLUSH_DELAY} after boot [Budget: {BOOT_FLUSH_MAX_MB} MB max, 100% cold pages]")
+    print(f"RAM Tier Policy     : {'<= 16 GB active' if total_b // (1024*1024) <= RAM_TIER_MAX_MB or ENABLE_ON_LARGE_RAM else f'> 16 GB skipped (ENABLE_ON_LARGE_RAM={ENABLE_ON_LARGE_RAM})'}")
+    print(f"Memory Pressure PSI : {psi:.2f}% [Abort Threshold: {PSI_SOME_THRESHOLD:.2f}%]")
+
+    if zram_stat:
+        used_z, size_z, ratio_z = zram_stat
+        print(f"zRAM Swap Usage     : {used_z // (1024*1024)} MB / {size_z // (1024*1024)} MB ({ratio_z*100:.1f}%) [Limit: {int(ZRAM_MAX_USAGE_RATIO*100)}%]")
+    else:
+        print(f"zRAM Swap Usage     : {C.RED}No zRAM swap active!{C.RST}")
+
+    state_file = Path("/run/dusky/pro_active_zram_swap.state")
+    last_state = state_file.read_text().strip() if state_file.exists() else "No sweep recorded yet"
+    print(f"Last Reclaim State  : {last_state}")
+
+    # Check systemd timer & service status
+    for u in ("dusky_boot_zram_flush.timer", "dusky_pro_active_zram_swap.timer"):
+        try:
+            res = subprocess.run(["systemctl", "is-active", u], capture_output=True, text=True, check=False)
+            active = res.stdout.strip() == "active"
+            label = "Boot Timer (45s)   " if "boot" in u else "Periodic Timer (6m) "
+            print(f"{label}: {C.GRN if active else C.RED}{res.stdout.strip()}{C.RST}")
+        except Exception:
+            pass
+    print("=" * 45 + "\n")
+
+def deploy_systemd_units(timer_interval_arg: str = "") -> None:
+    info("Deploying lean MGLRU proactive slice skimmer & one-shot boot flush units...")
 
     install_path = Path("/usr/local/bin/dusky_pro_active_zram_swap")
     current_script = Path(__file__).resolve()
@@ -510,25 +541,32 @@ def deploy_systemd_units() -> None:
         except OSError as e:
             die(f"Failed to install to {install_path}: {e}")
 
-    # Always reset runtime configuration to script defaults
+    timer_int = timer_interval_arg.strip() if timer_interval_arg else TIMER_INTERVAL
+
+    # Always reset runtime configuration to canonical defaults (70% threshold, 30% cap)
     conf_content = f"""# Dusky Proactive ZRAM Swap Runtime Configuration
-# Dynamically consumed by /usr/local/bin/dusky_pro_active_zram_swap
-APP_IDLE_RECLAIM_RATIO={APP_IDLE_RECLAIM_RATIO:.2f}
-MAX_PER_RUN_MB={MAX_PER_RUN // (1024*1024)}
+# Dynamically consumed by /usr/local/bin/dusky_pro_active_zram_swap and gatekeeper
+RAM_USAGE_THRESHOLD_RATIO={RAM_USAGE_THRESHOLD_RATIO:.2f}
+RECLAIM_RATIO={RECLAIM_RATIO:.2f}
+MAX_PER_RUN_MB={MAX_PER_RUN_MB}
+BOOT_FLUSH_MAX_MB={BOOT_FLUSH_MAX_MB}
+BOOT_FLUSH_DELAY={BOOT_FLUSH_DELAY}
 CHUNK_SIZE_MB={CHUNK_SIZE // (1024*1024)}
 ZRAM_MAX_USAGE_RATIO={ZRAM_MAX_USAGE_RATIO:.2f}
-RAM_USAGE_THRESHOLD_RATIO={RAM_USAGE_THRESHOLD_RATIO:.2f}
-TIMER_INTERVAL=6min
+PSI_SOME_THRESHOLD={PSI_SOME_THRESHOLD:.2f}
+ENABLE_ON_LARGE_RAM={'true' if ENABLE_ON_LARGE_RAM else 'false'}
+RAM_TIER_MAX_MB={RAM_TIER_MAX_MB}
+TIMER_INTERVAL={timer_int}
 """
     write_file_atomic(CONF_PATH, conf_content, mode=0o644)
-    ok(f"Runtime configuration reset to script defaults at {CONF_PATH}")
+    ok(f"Runtime configuration reset to defaults at {CONF_PATH}")
 
     gate_path = Path("/usr/local/bin/dusky_pro_active_zram_gate")
     gate_content = r"""#!/usr/bin/env bash
 # Dusky Proactive ZRAM Swap - Ultra-Fast Native Pre-flight Gatekeeper (Kernel 7.2+ / systemd 261+)
-# Executed by systemd via ExecCondition= before spawning Python runtime.
-# Exits 0 if RAM usage >= threshold or --force (proceeds to ExecStart= Python)
-# Exits 1 if RAM usage < threshold (skips ExecStart= completely with zero Python overhead)
+# Executed by systemd via ExecCondition= before spawning Python runtime for periodic sweeps.
+# Exits 0 if RAM usage >= threshold and tier matches (proceeds to ExecStart= Python)
+# Exits 1 if skipped (bypasses ExecStart= completely with zero Python overhead in <2ms)
 
 set -eo pipefail
 export LC_ALL=C
@@ -540,7 +578,9 @@ for arg in "$@"; do
 done
 
 CONF="/etc/dusky/dusky_pro_active_zram_swap.conf"
-thresh_pct=80
+thresh_pct=70
+enable_large_ram="false"
+ram_tier_max_mb=16384
 
 if [[ -f "$CONF" ]]; then
     while read -r line; do
@@ -559,6 +599,20 @@ if [[ -f "$CONF" ]]; then
             elif [[ "$val" =~ ^[0-9]+$ ]]; then
                 thresh_pct=$(( 10#$val ))
             fi
+        elif [[ "$line" =~ ^ENABLE_ON_LARGE_RAM[[:space:]]*=[[:space:]]*(.*) ]]; then
+            val="${BASH_REMATCH[1],,}"
+            val="${val//[[:space:]]/}"
+            val="${val//\"/}"
+            val="${val//\'/}"
+            enable_large_ram="$val"
+        elif [[ "$line" =~ ^RAM_TIER_MAX_MB[[:space:]]*=[[:space:]]*(.*) ]]; then
+            val="${BASH_REMATCH[1]}"
+            val="${val//[[:space:]]/}"
+            val="${val//\"/}"
+            val="${val//\'/}"
+            if [[ "$val" =~ ^[0-9]+$ ]]; then
+                ram_tier_max_mb=$(( 10#$val ))
+            fi
         fi
     done < "$CONF"
 fi
@@ -568,22 +622,29 @@ fi
 
 mem_total=0
 mem_avail=0
-has_tot=0
-has_avail=0
-
 while read -r key val _; do
     case "$key" in
-        MemTotal:)     mem_total=$val; has_tot=1 ;;
-        MemAvailable:) mem_avail=$val; has_avail=1 ;;
+        MemTotal:)     mem_total=$val ;;
+        MemAvailable:) mem_avail=$val ;;
     esac
-    (( has_tot && has_avail )) && break
+    (( mem_total && mem_avail )) && break
 done < /proc/meminfo
 
-if (( !has_tot || !has_avail || mem_total <= 0 )); then
+if (( mem_total <= 0 )); then
     exit 0
 fi
 
-# Clamp mem_avail to [0, mem_total] for absolute robustness
+total_mb=$(( mem_total / 1024 ))
+
+# RAM Tier Guard: On systems > 16 GB, skip unless explicitly enabled in conf
+if (( total_mb > ram_tier_max_mb )) && [[ "$enable_large_ram" != "true" && "$enable_large_ram" != "1" && "$enable_large_ram" != "yes" ]]; then
+    printf '[INFO] RAM tier > %d MB (%d MB detected). Skipping proactive sweep to conserve CPU (large RAM tier has ample headroom).\n' \
+        "$ram_tier_max_mb" "$total_mb"
+    mkdir -p /run/dusky 2>/dev/null || true
+    printf 'Idle (Tier > 16GB: %d MB)\n' "$total_mb" > /run/dusky/pro_active_zram_swap.state 2>/dev/null || true
+    exit 1
+fi
+
 (( mem_avail < 0 )) && mem_avail=0
 (( mem_avail > mem_total )) && mem_avail=$mem_total
 
@@ -591,16 +652,12 @@ used_kb=$(( mem_total - mem_avail ))
 pct=$(( used_kb * 100 / mem_total ))
 pct_tenths=$(( (used_kb * 1000 / mem_total) % 10 ))
 used_mb=$(( used_kb / 1024 ))
-total_mb=$(( mem_total / 1024 ))
 
 if (( pct < thresh_pct )); then
     printf '[INFO] RAM usage below threshold: %d.%d%% (%d MB / %d MB < %d%% threshold). Skipping proactive sweep to conserve CPU and avoid unnecessary compression.\n' \
         "$pct" "$pct_tenths" "$used_mb" "$total_mb" "$thresh_pct"
     mkdir -p /run/dusky 2>/dev/null || true
-    tmp_f="/run/dusky/.state.$$"
-    printf 'Idle (RAM: %d.%d%% < %d%%)\n' "$pct" "$pct_tenths" "$thresh_pct" > "$tmp_f" 2>/dev/null && \
-        chmod 0644 "$tmp_f" 2>/dev/null && \
-        mv -f "$tmp_f" /run/dusky/pro_active_zram_swap.state 2>/dev/null || true
+    printf 'Idle (RAM: %d.%d%% < %d%%)\n' "$pct" "$pct_tenths" "$thresh_pct" > /run/dusky/pro_active_zram_swap.state 2>/dev/null || true
     exit 1
 fi
 
@@ -609,13 +666,64 @@ exit 0
     write_file_atomic(gate_path, gate_content, mode=0o755)
     ok(f"Native Bash gatekeeper installed to {gate_path}")
 
-    service_path = Path("/etc/systemd/system/dusky_pro_active_zram_swap.service")
-    python_bin = "/usr/bin/python3"
-    if not Path(python_bin).exists():
-        python_bin = sys.executable
+    python_bin = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else sys.executable
 
-    service_content = f"""[Unit]
-Description=MGLRU Proactive Idle Memory Skimmer & ZRAM Swapper (Kernel 7.2+ / systemd 261+)
+    # 1. One-Shot Boot Baseline Memory Flush Units
+    boot_service_path = Path("/etc/systemd/system/dusky_boot_zram_flush.service")
+    boot_service_content = f"""[Unit]
+Description=One-Shot MGLRU Baseline Cold Memory Flush at {BOOT_FLUSH_DELAY} (Kernel 7.2+ / systemd 261+)
+Documentation=https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
+After=multi-user.target local-fs.target
+ConditionPathExists=/sys/fs/cgroup
+ConditionPathExists=/sys/fs/cgroup/system.slice
+
+[Service]
+Type=oneshot
+TimeoutStartSec=60s
+ExecStart={python_bin} {install_path} --boot-flush
+RemainAfterExit=no
+Nice=19
+CPUSchedulingPolicy=idle
+IOSchedulingClass=idle
+CPUWeight=1
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=no
+ProtectControlGroups=no
+RuntimeDirectory=dusky
+RuntimeDirectoryPreserve=yes
+ReadWritePaths=/sys/fs/cgroup /run/dusky
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+MemoryDenyWriteExecute=no
+"""
+    write_file_atomic(boot_service_path, boot_service_content, mode=0o644)
+    ok(f"One-shot boot service written to {boot_service_path}")
+
+    boot_timer_path = Path("/etc/systemd/system/dusky_boot_zram_flush.timer")
+    boot_timer_content = f"""[Unit]
+Description=Trigger One-Shot MGLRU Baseline Cold Memory Flush at {BOOT_FLUSH_DELAY} Boot
+Documentation=https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
+
+[Timer]
+OnBootSec={BOOT_FLUSH_DELAY}
+AccuracySec=2s
+Persistent=false
+Unit=dusky_boot_zram_flush.service
+
+[Install]
+WantedBy=timers.target
+"""
+    write_file_atomic(boot_timer_path, boot_timer_content, mode=0o644)
+    ok(f"One-shot boot timer written to {boot_timer_path} (Fires once at {BOOT_FLUSH_DELAY})")
+
+    # 2. Periodic Proactive Memory Skimmer Units
+    periodic_service_path = Path("/etc/systemd/system/dusky_pro_active_zram_swap.service")
+    periodic_service_content = f"""[Unit]
+Description=MGLRU Proactive Slice Memory Skimmer & ZRAM Swapper (Kernel 7.2+ / systemd 261+)
 Documentation=https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
 After=multi-user.target local-fs.target
 ConditionPathExists=/sys/fs/cgroup
@@ -645,17 +753,17 @@ RestrictSUIDSGID=yes
 RestrictRealtime=yes
 MemoryDenyWriteExecute=no
 """
-    write_file_atomic(service_path, service_content, mode=0o644)
-    ok(f"Service unit written to {service_path}")
+    write_file_atomic(periodic_service_path, periodic_service_content, mode=0o644)
+    ok(f"Periodic service unit written to {periodic_service_path}")
 
-    timer_path = Path("/etc/systemd/system/dusky_pro_active_zram_swap.timer")
-    timer_content = """[Unit]
-Description=Trigger MGLRU Proactive ZRAM Swap at 45s Boot & 6min Periodic
+    periodic_timer_path = Path("/etc/systemd/system/dusky_pro_active_zram_swap.timer")
+    periodic_timer_content = f"""[Unit]
+Description=Trigger MGLRU Proactive ZRAM Swap at {timer_int} Periodic
 Documentation=https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
 
 [Timer]
-OnBootSec=45s
-OnUnitActiveSec=6min
+OnBootSec={timer_int}
+OnUnitActiveSec={timer_int}
 AccuracySec=5s
 RandomizedDelaySec=15s
 Persistent=false
@@ -664,8 +772,8 @@ Unit=dusky_pro_active_zram_swap.service
 [Install]
 WantedBy=timers.target
 """
-    write_file_atomic(timer_path, timer_content, mode=0o644)
-    ok(f"Timer unit written to {timer_path}")
+    write_file_atomic(periodic_timer_path, periodic_timer_content, mode=0o644)
+    ok(f"Periodic timer unit written to {periodic_timer_path} (Interval: {timer_int})")
 
     info("Reloading systemd daemon...")
     try:
@@ -673,58 +781,91 @@ WantedBy=timers.target
     except subprocess.CalledProcessError as e:
         die(f"systemctl daemon-reload failed: {e}")
 
-    info("Enabling and starting dusky_pro_active_zram_swap.timer...")
+    info("Enabling and starting memory management timers...")
+    for timer_unit in ("dusky_boot_zram_flush.timer", "dusky_pro_active_zram_swap.timer"):
+        try:
+            subprocess.run(["systemctl", "enable", "--now", timer_unit], check=True)
+            ok(f"Started timer: {timer_unit}")
+        except subprocess.CalledProcessError as e:
+            die(f"Failed to enable timer {timer_unit}: {e}")
+
+    ok(f"MGLRU memory management active: one-shot boot flush at {BOOT_FLUSH_DELAY}, periodic skimmer starting at {timer_int} (recurring every {timer_int}).")
+
+def restore_system() -> None:
+    info("Stopping and disabling systemd timers and services...")
+    all_units = (
+        "dusky_boot_zram_flush.timer",
+        "dusky_boot_zram_flush.service",
+        "dusky_pro_active_zram_swap.timer",
+        "dusky_pro_active_zram_swap.service",
+    )
+    for unit in all_units:
+        try:
+            subprocess.run(["systemctl", "disable", "--now", unit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    files_to_remove = [
+        Path("/usr/local/bin/dusky_pro_active_zram_swap"),
+        Path("/usr/local/bin/dusky_pro_active_zram_gate"),
+        Path("/etc/systemd/system/dusky_boot_zram_flush.service"),
+        Path("/etc/systemd/system/dusky_boot_zram_flush.timer"),
+        Path("/etc/systemd/system/dusky_pro_active_zram_swap.service"),
+        Path("/etc/systemd/system/dusky_pro_active_zram_swap.timer"),
+        Path("/run/dusky/pro_active_zram_swap.state"),
+        Path("/run/dusky/app_idle_tracker.json"),
+        CONF_PATH,
+    ]
+    for f in files_to_remove:
+        if f.exists():
+            try:
+                f.unlink()
+                ok(f"Removed {f}")
+            except Exception as e:
+                warn(f"Failed to remove {f}: {e}")
+
+    info("Reloading systemd daemon...")
     try:
-        subprocess.run(["systemctl", "enable", "--now", "dusky_pro_active_zram_swap.timer"], check=True)
-    except subprocess.CalledProcessError as e:
-        die(f"Failed to enable timer: {e}")
+        subprocess.run(["systemctl", "daemon-reload"], check=True)
+    except Exception as e:
+        warn(f"systemctl daemon-reload failed: {e}")
 
-    ok("MGLRU skimmer timer active: initial run at 45s after boot, recurring every 6min thereafter.")
-    info("Verify with: systemctl status dusky_pro_active_zram_swap.timer && systemctl status dusky_pro_active_zram_swap.service && journalctl -u dusky_pro_active_zram_swap.service")
+    ok("Restoration complete. Memory reclaimer and boot flush units uninstalled.")
 
+# --- Entrypoint & Argument Handling ---
 def main() -> None:
     if sys.version_info < (3, 14):
         die(f"Python 3.14+ required, running {sys.version.split()[0]}")
 
+    parser = argparse.ArgumentParser(description="Lean Arch Linux MGLRU Proactive Slice Memory Skimmer & Boot Flush")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--run", action="store_true", help="Directly trigger the periodic MGLRU slice memory reclaim task")
+    group.add_argument("--boot-flush", action="store_true", help="Directly trigger the one-time baseline boot memory flush")
+    group.add_argument("--restore", action="store_true", help="Remove reclaimer binaries, systemd units, timers, and state")
+    group.add_argument("--status", action="store_true", help="Display memory, zRAM swap, PSI pressure, and reclaimer status")
+    parser.add_argument("--force", action="store_true", help="Bypass RAM threshold, tier check, and PSI checks")
+    parser.add_argument("--timer-interval", type=str, default="", help="Override periodic timer interval (e.g. 5min, 10min)")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI color output")
+
+    args = parser.parse_args()
+
+    if args.no_color or not sys.stdout.isatty() or "NO_COLOR" in os.environ:
+        C.strip()
+
+    if args.status:
+        show_status()
+        return
+
     escalate_privileges()
 
     if args.restore:
-        info("Stopping and disabling systemd timer and service...")
-        for unit in ("dusky_pro_active_zram_swap.timer", "dusky_pro_active_zram_swap.service"):
-            try:
-                subprocess.run(["systemctl", "disable", "--now", unit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:
-                pass
-
-        files_to_remove = [
-            Path("/usr/local/bin/dusky_pro_active_zram_swap"),
-            Path("/usr/local/bin/dusky_pro_active_zram_gate"),
-            Path("/etc/systemd/system/dusky_pro_active_zram_swap.service"),
-            Path("/etc/systemd/system/dusky_pro_active_zram_swap.timer"),
-            Path("/run/dusky/pro_active_zram_swap.state"),
-            CONF_PATH,
-        ]
-        for f in files_to_remove:
-            if f.exists():
-                try:
-                    f.unlink()
-                    ok(f"Removed {f}")
-                except Exception as e:
-                    warn(f"Failed to remove {f}: {e}")
-
-        info("Reloading systemd daemon...")
-        try:
-            subprocess.run(["systemctl", "daemon-reload"], check=True)
-        except Exception as e:
-            warn(f"systemctl daemon-reload failed: {e}")
-
-        ok("Restoration complete. Memory reclaimer uninstalled.")
-        return
-
-    if args.run:
-        perform_reclaim(force=args.force)
+        restore_system()
+    elif args.boot_flush:
+        perform_reclaim(force=args.force, boot_flush=True)
+    elif args.run:
+        perform_reclaim(force=args.force, boot_flush=False)
     else:
-        deploy_systemd_units()
+        deploy_systemd_units(timer_interval_arg=args.timer_interval)
 
 if __name__ == "__main__":
     try:

@@ -810,7 +810,7 @@ terminal = false
 type = "navigation"
 [pages.layout.items.properties]
 title = "Proactive Memory Reclaim"
-description = "Automatically move idle app memory into ZRAM (40% limit, 256 MB budget)"
+description = "Automatically move idle slice memory into ZRAM (30% cap, 256 MB budget)"
 icon = "power-profile-performance-symbolic"
 
 [[pages.layout.items.layout]]
@@ -872,6 +872,20 @@ command = "$HOME/user_scripts/performance/zram/dusky_pro_active_swap_modifier_cc
 terminal = false
 requires_root = true
 
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "One-Time Boot Memory Flush"
+description = "Trigger the aggressive one-shot memory flush (cold boot pages)"
+button_text = "Flush Now"
+icon = "system-reboot-symbolic"
+style = "regular"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "$HOME/user_scripts/performance/zram/dusky_pro_active_swap_modifier_cc.py --boot-flush"
+terminal = false
+requires_root = true
+
 [[pages.layout.items.layout]]
 type = "warning_banner"
 [pages.layout.items.layout.properties]
@@ -879,7 +893,7 @@ title = "Tuning Guidelines & Dial Reference"
 icon = "dialog-information-symbolic"
 compact = true
 message = """
-• Per-App Idle Anon Limit: Max idle RAM reclaimed per inactive app (higher frees more memory, lower keeps apps warm).
+• Slice Reclaim Cap: Max idle anonymous RAM reclaimed per slice sweep (higher frees more memory, lower keeps apps warm).
 • Max Sweep Budget: Maximum RAM moved to ZRAM per pass to prevent CPU spikes and micro-stutters.
 • Reclaim Chunk Size: Memory batch size per pass (smaller = completely stutter-free UI, larger = faster sweeps).
 • Sweep Frequency: How often the background service checks and cleans idle memory.
@@ -895,12 +909,12 @@ icon = "preferences-system-symbolic"
 [[pages.layout.items.layout.items]]
 type = "entry"
 [pages.layout.items.layout.items.properties]
-title = "Per-App Idle Anon Limit"
-description = "Percentage of anon memory reclaimed per idle app (e.g. 40%, 25%, 50%)"
+title = "Slice Reclaim Cap"
+description = "Percentage of anon memory reclaimed per slice sweep (e.g. 30%, 25%, 50%)"
 button_text = "Apply"
 icon = "edit-symbolic"
 value_command = "$HOME/user_scripts/performance/zram/dusky_pro_active_swap_modifier_cc.py --get-ratio"
-toast = "Per-app reclaim ratio set to {value}"
+toast = "Slice reclaim cap set to {value}"
 [pages.layout.items.layout.items.on_action]
 type = "exec"
 command = "$HOME/user_scripts/performance/zram/dusky_pro_active_swap_modifier_cc.py --set-ratio {value}"
@@ -1029,7 +1043,7 @@ icon = "utilities-terminal-symbolic"
 style = "regular"
 [pages.layout.items.layout.items.on_press]
 type = "exec"
-command = "kitty --class dusky_pro_active_logs --hold sh -c \"journalctl -u dusky_pro_active_zram_swap.service -n 50 -f\""
+command = "kitty --class dusky_pro_active_logs --hold sh -c \"journalctl -u dusky_pro_active_zram_swap.service -u dusky_boot_zram_flush.service -n 50 -f\""
 terminal = false
 
 [[pages.layout.items.layout.items]]

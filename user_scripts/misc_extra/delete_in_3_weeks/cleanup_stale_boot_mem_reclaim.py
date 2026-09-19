@@ -52,8 +52,6 @@ def main() -> None:
     legacy_units = (
         "dusky_boot_mem_reclaim.timer",
         "dusky_boot_mem_reclaim.service",
-        "dusky_pro_active_zram_swap.timer",
-        "dusky_pro_active_zram_swap.service",
     )
     legacy_files = (
         Path("/etc/systemd/system/dusky_boot_mem_reclaim.timer"),
@@ -61,15 +59,8 @@ def main() -> None:
         Path("/etc/systemd/system/timers.target.wants/dusky_boot_mem_reclaim.timer"),
         Path("/etc/systemd/system/multi-user.target.wants/dusky_boot_mem_reclaim.service"),
         Path("/usr/local/bin/dusky_boot_mem_reclaim"),
-        # Legacy Proactive ZRAM swap reclaimer (retired - kernel MGLRU/oomd replaces this)
-        Path("/etc/systemd/system/dusky_pro_active_zram_swap.timer"),
-        Path("/etc/systemd/system/dusky_pro_active_zram_swap.service"),
-        Path("/etc/systemd/system/timers.target.wants/dusky_pro_active_zram_swap.timer"),
-        Path("/etc/systemd/system/multi-user.target.wants/dusky_pro_active_zram_swap.service"),
-        Path("/usr/local/bin/dusky_pro_active_zram_swap"),
-        Path("/usr/local/bin/dusky_pro_active_zram_gate"),
-        Path("/etc/dusky/dusky_pro_active_zram_swap.conf"),
-        Path("/run/dusky/pro_active_zram_swap.state"),
+        # Stale userland idle tracker from prior proactive swap iteration
+        Path("/run/dusky/app_idle_tracker.json"),
         # Stale configuration backups
         Path("/etc/systemd/system.conf.d/99-default-accounting.conf.bak"),
         Path("/etc/systemd/user.conf.d/99-default-accounting.conf.bak"),

@@ -162,9 +162,13 @@ CORE_SYSTEM_DEFS = {
         "ZRAM 15M Cold Pages Compressor",
         "Auto compresses cold pages in both zram0 and zram1 with zstd level 3 every 15 minutes to reclaim memory",
     ),
+    "dusky_boot_zram_flush.timer": (
+        "Dusky Boot ZRAM Flush Timer",
+        "One-shot boot memory flush timer. Triggers 45s after boot to flush cold startup memory into ZRAM swap, minimizing idle memory footprint.",
+    ),
     "dusky_pro_active_zram_swap.timer": (
         "Proactive ZRAM Swap Timer",
-        "Proactive idle memory reclaimer timer. Triggers 45s after boot and every 3 minutes to compress cold idle memory into ZRAM swap, preventing disk swap wear and stutter.",
+        "Proactive MGLRU slice skimmer timer. Checks memory every 6 minutes and reclaims cold anonymous pages into ZRAM when RAM usage reaches 70%.",
     ),
     "ufw.service": (
         "Firewall (UFW)",

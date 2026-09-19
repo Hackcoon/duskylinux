@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Dusky Proactive ZRAM Swap Modifier & Control Center Backend
-Allows dynamic, runtime management of the MGLRU proactive idle memory skimmer:
-- Timer state (Active / Disabled)
-- Manual sweep trigger (Run Now)
-- Per-app idle anon reclaim percentage (APP_IDLE_RECLAIM_RATIO)
-- Max memory sweep budget ceiling (MAX_PER_RUN)
+Allows dynamic, runtime management of the MGLRU proactive slice skimmer & boot flush:
+- Timer states (Periodic Skimmer & One-Shot Boot Flush)
+- Manual sweep trigger (Run Now) and One-Shot Boot Flush trigger
+- Slice anonymous reclaim cap (RECLAIM_RATIO)
+- Max memory sweep budget ceiling (MAX_PER_RUN_MB)
 - Background sweep timer interval (OnUnitActiveSec)
 - ZRAM capacity safety abort threshold (ZRAM_MAX_USAGE_RATIO)
+- RAM usage trigger threshold (RAM_USAGE_THRESHOLD_RATIO)
 """
 
 from __future__ import annotations
@@ -51,6 +52,8 @@ CONF_DIR = Path("/etc/dusky")
 CONF_FILE = CONF_DIR / "dusky_pro_active_zram_swap.conf"
 TIMER_UNIT = Path("/etc/systemd/system/dusky_pro_active_zram_swap.timer")
 SERVICE_UNIT = Path("/etc/systemd/system/dusky_pro_active_zram_swap.service")
+BOOT_TIMER_UNIT = Path("/etc/systemd/system/dusky_boot_zram_flush.timer")
+BOOT_SERVICE_UNIT = Path("/etc/systemd/system/dusky_boot_zram_flush.service")
 BIN_PATH = Path("/usr/local/bin/dusky_pro_active_zram_swap")
 GATE_PATH = Path("/usr/local/bin/dusky_pro_active_zram_gate")
 STATE_FILE = Path("/run/dusky/pro_active_zram_swap.state")
@@ -73,11 +76,13 @@ def get_setup_script_path() -> Path:
         pass
     return Path.home() / "user_scripts" / "arch_setup_scripts" / "scripts" / "217_pro_active_zram_swap.py"
 
-DEFAULT_RATIO = 0.40        # 40% per idle app
-DEFAULT_BUDGET_MB = 256     # 256 MB per run
+DEFAULT_RATIO = 0.30        # 30% slice anon reclaim cap
+DEFAULT_BUDGET_MB = 256     # 256 MB per periodic run
+DEFAULT_BOOT_FLUSH_MAX_MB = 1024 # 1024 MB max for one-shot 45s boot flush
+DEFAULT_BOOT_FLUSH_DELAY = "45s" # Delay after boot for one-shot flush
 DEFAULT_CHUNK_MB = 32       # 32 MB write chunks per yield
-DEFAULT_ZRAM_LIMIT = 0.95   # 95% full zram abort
-DEFAULT_RAM_THRESHOLD = 0.80 # 80% RAM usage threshold to trigger sweep
+DEFAULT_ZRAM_LIMIT = 0.90   # 90% full zram abort
+DEFAULT_RAM_THRESHOLD = 0.70 # 70% RAM usage threshold to trigger sweep
 DEFAULT_INTERVAL = "6min"   # Periodic sweep interval
 
 def write_file_atomic(path: Path, content: str, mode: int = 0o644) -> None:
@@ -163,7 +168,12 @@ def sync_binary_if_needed() -> None:
             shutil.copy2(setup_script, BIN_PATH)
             os.chmod(BIN_PATH, 0o755)
             ok(f"Synchronized binary to {BIN_PATH}")
-        if not GATE_PATH.exists() or (SERVICE_UNIT.exists() and ("ExecCondition=" not in SERVICE_UNIT.read_text() or "RuntimeDirectoryPreserve=" not in SERVICE_UNIT.read_text())):
+        if (
+            not GATE_PATH.exists()
+            or not BOOT_TIMER_UNIT.exists()
+            or not BOOT_SERVICE_UNIT.exists()
+            or (SERVICE_UNIT.exists() and ("ExecCondition=" not in SERVICE_UNIT.read_text() or "RuntimeDirectoryPreserve=" not in SERVICE_UNIT.read_text()))
+        ):
             subprocess.run([sys.executable, str(setup_script)], check=False)
     except Exception as e:
         warn(f"Could not sync binary: {e}")
@@ -171,8 +181,11 @@ def sync_binary_if_needed() -> None:
 # --- Config Management ---
 def read_config() -> dict[str, str]:
     config: dict[str, str] = {
+        "RECLAIM_RATIO": str(DEFAULT_RATIO),
         "APP_IDLE_RECLAIM_RATIO": str(DEFAULT_RATIO),
         "MAX_PER_RUN_MB": str(DEFAULT_BUDGET_MB),
+        "BOOT_FLUSH_MAX_MB": str(DEFAULT_BOOT_FLUSH_MAX_MB),
+        "BOOT_FLUSH_DELAY": DEFAULT_BOOT_FLUSH_DELAY,
         "CHUNK_SIZE_MB": str(DEFAULT_CHUNK_MB),
         "ZRAM_MAX_USAGE_RATIO": str(DEFAULT_ZRAM_LIMIT),
         "RAM_USAGE_THRESHOLD_RATIO": str(DEFAULT_RAM_THRESHOLD),
@@ -190,6 +203,9 @@ def read_config() -> dict[str, str]:
                     v = v.strip().strip("\"'")
                     if k in ("RAM_USAGE_THRESHOLD_RATIO", "RAM_THRESHOLD_RATIO", "RAM_USAGE_THRESHOLD", "RAM_THRESHOLD"):
                         config["RAM_USAGE_THRESHOLD_RATIO"] = v
+                    elif k in ("RECLAIM_RATIO", "APP_IDLE_RECLAIM_RATIO"):
+                        config["RECLAIM_RATIO"] = v
+                        config["APP_IDLE_RECLAIM_RATIO"] = v
                     else:
                         config[k] = v
         except Exception:
@@ -199,12 +215,17 @@ def read_config() -> dict[str, str]:
 def write_config(conf: dict[str, str]) -> None:
     CONF_DIR.mkdir(parents=True, exist_ok=True)
     content = f"""# Dusky Proactive ZRAM Swap Runtime Configuration
-# Dynamically consumed by /usr/local/bin/dusky_pro_active_zram_swap
-APP_IDLE_RECLAIM_RATIO={conf.get("APP_IDLE_RECLAIM_RATIO", str(DEFAULT_RATIO))}
+# Dynamically consumed by /usr/local/bin/dusky_pro_active_zram_swap and gatekeeper
+RAM_USAGE_THRESHOLD_RATIO={conf.get("RAM_USAGE_THRESHOLD_RATIO", str(DEFAULT_RAM_THRESHOLD))}
+RECLAIM_RATIO={conf.get("RECLAIM_RATIO", str(DEFAULT_RATIO))}
 MAX_PER_RUN_MB={conf.get("MAX_PER_RUN_MB", str(DEFAULT_BUDGET_MB))}
+BOOT_FLUSH_MAX_MB={conf.get("BOOT_FLUSH_MAX_MB", str(DEFAULT_BOOT_FLUSH_MAX_MB))}
+BOOT_FLUSH_DELAY={conf.get("BOOT_FLUSH_DELAY", DEFAULT_BOOT_FLUSH_DELAY)}
 CHUNK_SIZE_MB={conf.get("CHUNK_SIZE_MB", str(DEFAULT_CHUNK_MB))}
 ZRAM_MAX_USAGE_RATIO={conf.get("ZRAM_MAX_USAGE_RATIO", str(DEFAULT_ZRAM_LIMIT))}
-RAM_USAGE_THRESHOLD_RATIO={conf.get("RAM_USAGE_THRESHOLD_RATIO", str(DEFAULT_RAM_THRESHOLD))}
+PSI_SOME_THRESHOLD=0.50
+ENABLE_ON_LARGE_RAM=false
+RAM_TIER_MAX_MB=16384
 TIMER_INTERVAL={conf.get("TIMER_INTERVAL", DEFAULT_INTERVAL)}
 """
     write_file_atomic(CONF_FILE, content, mode=0o644)
@@ -272,7 +293,7 @@ def set_timer_interval(interval: str) -> None:
 def get_ratio_str() -> str:
     conf = read_config()
     try:
-        val = float(conf.get("APP_IDLE_RECLAIM_RATIO", str(DEFAULT_RATIO)))
+        val = float(conf.get("RECLAIM_RATIO", conf.get("APP_IDLE_RECLAIM_RATIO", str(DEFAULT_RATIO))))
         return f"{int(round(val * 100))}%"
     except ValueError:
         return f"{int(DEFAULT_RATIO * 100)}%"
@@ -283,21 +304,22 @@ def set_ratio(val_str: str) -> None:
     val_clean = val_str.strip().rstrip("%")
     try:
         num = float(val_clean)
-        # If passed as decimal e.g. 0.40 -> convert to 0.40; if passed as 40 -> 0.40
+        # If passed as decimal e.g. 0.30 -> convert to 0.30; if passed as 30 -> 0.30
         if num > 1.0:
             ratio = num / 100.0
         else:
             ratio = num
         ratio = max(0.05, min(1.0, ratio))
     except ValueError:
-        die(f"Invalid ratio value '{val_str}'. Please provide a percentage like '40%' or '0.40'.")
+        die(f"Invalid ratio value '{val_str}'. Please provide a percentage like '30%' or '0.30'.")
 
     conf = read_config()
+    conf["RECLAIM_RATIO"] = f"{ratio:.2f}"
     conf["APP_IDLE_RECLAIM_RATIO"] = f"{ratio:.2f}"
     write_config(conf)
     pct = int(round(ratio * 100))
-    ok(f"Per-app idle reclaim ratio set to {pct}% ({ratio:.2f}).")
-    notify("Proactive Swap Ratio", f"Per-app reclaim ratio set to {pct}%")
+    ok(f"Slice memory reclaim cap set to {pct}% ({ratio:.2f}).")
+    notify("Proactive Swap Ratio", f"Slice reclaim cap set to {pct}%")
 
 # --- Max Budget Queries & Mutations ---
 def get_max_budget_str() -> str:
@@ -438,18 +460,45 @@ def is_timer_active() -> bool:
     )
     return res.returncode == 0
 
+def is_boot_timer_active() -> bool:
+    res = subprocess.run(
+        ["systemctl", "is-active", "--quiet", "dusky_boot_zram_flush.timer"],
+        check=False
+    )
+    return res.returncode == 0
+
 def enable_timer() -> None:
     escalate_root_if_needed()
     sync_binary_if_needed()
     subprocess.run(["systemctl", "enable", "--now", "dusky_pro_active_zram_swap.timer"], check=True)
-    ok("dusky_pro_active_zram_swap.timer enabled and started.")
-    notify("Proactive Swap", "Automatic background reclaim timer enabled.")
+    if BOOT_TIMER_UNIT.exists():
+        subprocess.run(["systemctl", "enable", "--now", "dusky_boot_zram_flush.timer"], check=False)
+    ok("Proactive ZRAM swap timers enabled and started.")
+    notify("Proactive Swap", "Automatic background reclaim timers enabled.")
 
 def disable_timer() -> None:
     escalate_root_if_needed()
     subprocess.run(["systemctl", "disable", "--now", "dusky_pro_active_zram_swap.timer"], check=True)
-    ok("dusky_pro_active_zram_swap.timer stopped and disabled.")
-    notify("Proactive Swap", "Automatic background reclaim timer disabled.")
+    if BOOT_TIMER_UNIT.exists():
+        subprocess.run(["systemctl", "disable", "--now", "dusky_boot_zram_flush.timer"], check=False)
+    ok("Proactive ZRAM swap timers stopped and disabled.")
+    notify("Proactive Swap", "Automatic background reclaim timers disabled.")
+
+def boot_flush() -> None:
+    escalate_root_if_needed()
+    sync_binary_if_needed()
+    info("Triggering one-time boot memory flush into ZRAM...")
+    res = subprocess.run(["systemctl", "start", "dusky_boot_zram_flush.service"], check=False)
+    if res.returncode == 0:
+        ok("Boot memory flush initiated successfully via systemd service.")
+        notify("Boot ZRAM Flush", "One-time memory flush completed.")
+    else:
+        if BIN_PATH.exists():
+            subprocess.run([sys.executable, str(BIN_PATH), "--boot-flush"], check=False)
+            ok("Boot memory flush executed directly.")
+            notify("Boot ZRAM Flush", "One-time memory flush completed.")
+        else:
+            die("Neither systemd service nor binary could be executed.")
 
 def run_now(force: bool = False) -> None:
     escalate_root_if_needed()
@@ -490,7 +539,7 @@ def get_last_sweep_summary() -> str:
     # Tier 2: Systemd Journal Fallback (if user has journal permissions)
     try:
         res = subprocess.run(
-            ["journalctl", "-u", "dusky_pro_active_zram_swap.service", "-n", "30", "--no-pager", "-o", "cat"],
+            ["journalctl", "-u", "dusky_pro_active_zram_swap.service", "-u", "dusky_boot_zram_flush.service", "-n", "30", "--no-pager", "-o", "cat"],
             capture_output=True,
             text=True,
             check=False
@@ -500,17 +549,18 @@ def get_last_sweep_summary() -> str:
             lines = out.splitlines()
             for line in reversed(lines):
                 clean = re.sub(r"\x1b\[[0-9;]*[mGKF]", "", line)
-                if "Sweep finished" in clean:
+                if "Sweep finished" in clean or "Boot flush finished" in clean:
                     match = re.search(r"Stolen:\s*([0-9.]+)\s*MB", clean)
                     dur_match = re.search(r"in\s*([0-9.]+)\s*ms", clean)
+                    prefix = "Boot flush: " if "Boot flush finished" in clean else ""
                     if match:
                         stolen_mb = float(match.group(1))
                         stolen_str = f"{int(round(stolen_mb))} MB" if stolen_mb >= 10 else f"{stolen_mb:.1f} MB"
                         if dur_match:
                             ms = float(dur_match.group(1))
                             dur_str = f"{ms/1000:.1f}s" if ms >= 1000 else f"{int(round(ms))}ms"
-                            return f"{stolen_str} ({dur_str})"
-                        return stolen_str
+                            return f"{prefix}{stolen_str} ({dur_str})"
+                        return f"{prefix}{stolen_str}"
                 elif "RAM usage below threshold" in clean or "Skipping proactive sweep" in clean:
                     m = re.search(r"RAM usage (?:at|below threshold:)\s*([0-9.]+)%", clean)
                     thresh_str = get_ram_threshold_str()
@@ -574,6 +624,7 @@ def get_compact_status() -> str:
 
 def print_full_status() -> None:
     active = is_timer_active()
+    boot_active = is_boot_timer_active()
     interval = get_timer_interval()
     ram_threshold = get_ram_threshold_str()
     ratio = get_ratio_str()
@@ -588,10 +639,13 @@ def print_full_status() -> None:
     
     status_color = C.GRN if active else C.RED
     status_word = "ACTIVE (Running)" if active else "DISABLED (Stopped)"
-    print(f"  {C.BOLD}Timer Subsystem:{C.RST}   {status_color}{status_word}{C.RST}")
+    boot_color = C.GRN if boot_active else C.YLW
+    boot_word = "ACTIVE (Enabled)" if boot_active else "INACTIVE / ELAPSED"
+    print(f"  {C.BOLD}Periodic Timer:{C.RST}    {status_color}{status_word}{C.RST}")
+    print(f"  {C.BOLD}Boot Flush Timer:{C.RST}  {boot_color}{boot_word}{C.RST} (one-shot 45s after boot)")
     print(f"  {C.BOLD}Sweep Frequency:{C.RST}   {C.CYN}{interval}{C.RST}")
     print(f"  {C.BOLD}RAM Trigger Cap:{C.RST}   {C.CYN}{ram_threshold}{C.RST} (only sweeps when RAM >= {ram_threshold})")
-    print(f"  {C.BOLD}App Skim Limit:{C.RST}    {C.CYN}{ratio}{C.RST} anon memory per idle app")
+    print(f"  {C.BOLD}Slice Reclaim Cap:{C.RST} {C.CYN}{ratio}{C.RST} anon memory per cgroup slice")
     print(f"  {C.BOLD}Run Budget Cap:{C.RST}    {C.CYN}{budget}{C.RST} max per sweep")
     print(f"  {C.BOLD}Burst Chunk Size:{C.RST}  {C.CYN}{chunk}{C.RST} per kernel reclaim yield")
     print(f"  {C.BOLD}ZRAM Safety Cap:{C.RST}   {C.CYN}{zram_limit}{C.RST} (aborts sweep if exceeded)")
@@ -600,14 +654,14 @@ def print_full_status() -> None:
     # Timer schedule details
     try:
         res = subprocess.run(
-            ["systemctl", "list-timers", "dusky_pro_active_zram_swap.timer", "--no-pager"],
+            ["systemctl", "list-timers", "dusky_pro_active_zram_swap.timer", "dusky_boot_zram_flush.timer", "--no-pager"],
             capture_output=True,
             text=True,
             check=False
         )
         if res.returncode == 0 and res.stdout.strip():
             print(f"  {C.BOLD}Systemd Timer Schedule:{C.RST}")
-            for line in res.stdout.strip().splitlines()[:4]:
+            for line in res.stdout.strip().splitlines()[:6]:
                 print(f"    {line}")
             print()
     except Exception:
@@ -647,7 +701,7 @@ def main() -> None:
     parser.add_argument("--status", action="store_true", help="Print compact one-line status")
     parser.add_argument("--status-full", action="store_true", help="Print comprehensive diagnostic report")
     parser.add_argument("--is-active", action="store_true", help="Output 'on' or 'off' for GUI toggle switch")
-    parser.add_argument("--get-ratio", action="store_true", help="Print per-app idle reclaim ratio percentage")
+    parser.add_argument("--get-ratio", action="store_true", help="Print slice anon memory reclaim cap percentage")
     parser.add_argument("--get-max-budget", action="store_true", help="Print max memory sweep budget")
     parser.add_argument("--get-chunk-size", action="store_true", help="Print kernel memory reclaim write chunk size")
     parser.add_argument("--get-interval", action="store_true", help="Print periodic sweep timer interval")
@@ -660,7 +714,8 @@ def main() -> None:
     parser.add_argument("--disable", action="store_true", help="Disable and stop proactive swap timer")
     parser.add_argument("--run-now", action="store_true", help="Trigger an immediate memory sweep")
     parser.add_argument("--force", action="store_true", help="With --run-now, force immediate sweep bypassing RAM threshold")
-    parser.add_argument("--set-ratio", nargs="+", metavar="PCT", help="Set per-app idle anon memory ratio (e.g. '40%%', '25%%')")
+    parser.add_argument("--boot-flush", action="store_true", help="Trigger one-time boot memory flush into ZRAM")
+    parser.add_argument("--set-ratio", nargs="+", metavar="PCT", help="Set slice anon memory reclaim cap (e.g. '30%%', '25%%')")
     parser.add_argument("--set-max-budget", nargs="+", metavar="SIZE", help="Set max sweep budget ceiling (e.g. '256 MB', '512 MB', '1 GB')")
     parser.add_argument("--set-chunk-size", nargs="+", metavar="SIZE", help="Set kernel memory reclaim write chunk size (e.g. '16 MB', '32 MB', '64 MB')")
     parser.add_argument("--set-interval", nargs="+", metavar="INTERVAL", help="Set periodic timer interval (e.g. '3min', '6min')")
@@ -707,6 +762,9 @@ def main() -> None:
         return
     if args.disable:
         disable_timer()
+        return
+    if args.boot_flush:
+        boot_flush()
         return
     if args.run_now:
         run_now(force=args.force)
