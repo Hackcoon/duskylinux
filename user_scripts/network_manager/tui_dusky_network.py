@@ -250,22 +250,24 @@ SCHEMA[2].extend([
         group="Throughput"
     ),
     ConfigItem(
-        label="RX Total: 0 B",
+        label="Down Total: ↓ 0 B",
         key="throughput_rx_total",
         scope="clipboard",
         type_="bool",
         default=False,
         options=["copy"],
-        group="Throughput"
+        group="Throughput",
+        extended_help="Total data downloaded."
     ),
     ConfigItem(
-        label="TX Total: 0 B",
+        label="Up Total: ↑ 0 B",
         key="throughput_tx_total",
         scope="clipboard",
         type_="bool",
         default=False,
         options=["copy"],
-        group="Throughput"
+        group="Throughput",
+        extended_help="Total data uploaded."
     ),
     ConfigItem(
         label="Router Ping: N/A",
@@ -292,6 +294,16 @@ SCHEMA[2].extend([
         type_="bool",
         default=False,
         group="Latency"
+    ),
+    ConfigItem(
+        label="DNS: DHCP",
+        key="dns_current",
+        scope="clipboard",
+        type_="bool",
+        default=False,
+        options=["copy"],
+        group="Latency",
+        extended_help="Active DNS provider."
     ),
     ConfigItem(
         label="Disconnect",
@@ -470,8 +482,8 @@ def render_network_dashboard_view(app):
     t_tp.add_column(style="bold green", justify="left")
     t_tp.add_row("Down:", f"↓ {dl_rate}")
     t_tp.add_row("Up:", f"↑ {ul_rate}")
-    t_tp.add_row("RX Total:", rx_total)
-    t_tp.add_row("TX Total:", tx_total)
+    t_tp.add_row("Down Total:", f"↓ {rx_total}")
+    t_tp.add_row("Up Total:", f"↑ {tx_total}")
     p_tp = Panel(t_tp, title="[bold green] 󰓅 THROUGHPUT [/bold green]", border_style="green", expand=True)
 
     t_ping = Table(show_header=False, box=None, padding=(0, 1))

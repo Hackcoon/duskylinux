@@ -844,7 +844,7 @@ class NetworkManagerEngine(BaseEngine):
         for clip_key in (
             "status_type", "status_ssid", "status_ip", "status_gateway", "status_detail", "status_device",
             "throughput_down", "throughput_up", "throughput_rx_total", "throughput_tx_total",
-            "ping_router", "ping_internet", "ping_packet_loss",
+            "ping_router", "ping_internet", "ping_packet_loss", "dns_current",
             "speedtest_down_result", "speedtest_up_result"
         ):
             state[f"clipboard/{clip_key}"] = "false"
@@ -2335,9 +2335,9 @@ class NetworkManagerEngine(BaseEngine):
                 elif item.key == "throughput_up":
                     item.label = f"Up: ↑ {ul_rate_str}"
                 elif item.key == "throughput_rx_total":
-                    item.label = f"RX Total: {rx_total_str}"
+                    item.label = f"Down Total: ↓ {rx_total_str}"
                 elif item.key == "throughput_tx_total":
-                    item.label = f"TX Total: {tx_total_str}"
+                    item.label = f"Up Total: ↑ {tx_total_str}"
                 elif item.key == "ping_router":
                     item.label = f"Router Ping: {router_ping_str}"
                 elif item.key == "ping_internet":
