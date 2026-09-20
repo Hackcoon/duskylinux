@@ -220,7 +220,7 @@ ManagedOOMMemoryPressure=auto
 ManagedOOMPreference=none
 MemoryAccounting=yes
 OOMRules=
-OOMRules=30-dusky-pressure 30-dusky-swap
+OOMRules=30-dusky-pressure 30-dusky-swap 30-dusky-swap-ceiling
 """
 
 BACKGROUND_SLICE: Final[str] = HDR + """[Slice]
@@ -229,7 +229,7 @@ ManagedOOMMemoryPressure=auto
 ManagedOOMPreference=none
 MemoryAccounting=yes
 OOMRules=
-OOMRules=30-dusky-background 30-dusky-swap
+OOMRules=30-dusky-background 30-dusky-swap 30-dusky-swap-ceiling
 """
 
 SESSION_SLICE: Final[str] = HDR + """#
@@ -1475,6 +1475,16 @@ LastingSec={p['swap_lasting']}
 Action=kill-by-pgscan
 """
 
+    swap_ceiling_rule = rule_hdr + f"""#
+# Emergency swap exhaustion ceiling: fire immediately when swap is critically
+# depleted (>=95%), even if processes in app.slice are quiescent/idle. This
+# stops code-page refault thrashing before the kernel enters an unrecoverable disk livelock.
+[Rule]
+SwapUsageMax=95%
+LastingSec=0
+Action=kill-by-pgscan
+"""
+
     bg_rule = rule_hdr + f"""[Rule]
 MemoryPressureAbove={p['bg_pressure_above']}
 LastingSec={p['bg_pressure_lasting']}
@@ -1493,15 +1503,18 @@ Action=kill-by-pgscan
         FileSpec(dest=Path("/etc/systemd/oomd/rules.d/30-dusky-swap.oomrule"),
                  content=swap_rule,
                  desc=f"swap rule ({p['swap_max']} AND {p['swap_pressure']} / {p['swap_lasting']})"),
+        FileSpec(dest=Path("/etc/systemd/oomd/rules.d/30-dusky-swap-ceiling.oomrule"),
+                 content=swap_ceiling_rule,
+                 desc="emergency swap ceiling rule (95% / 0s)"),
         FileSpec(dest=Path("/etc/systemd/oomd/rules.d/30-dusky-background.oomrule"),
                  content=bg_rule,
                  desc=f"background rule ({p['bg_pressure_above']} / {p['bg_pressure_lasting']})"),
         FileSpec(dest=Path("/etc/systemd/oomd.conf.d/90-dusky-oomd.conf"),
                  content=OOMD_TUNE, desc="oomd global tuning (prekill hook 0s)"),
         FileSpec(dest=Path("/etc/systemd/user/app.slice.d/90-desktop-oomd.conf"),
-                 content=APP_SLICE, desc="app.slice -> 30-dusky-pressure 30-dusky-swap"),
+                 content=APP_SLICE, desc="app.slice -> 30-dusky-pressure 30-dusky-swap 30-dusky-swap-ceiling"),
         FileSpec(dest=Path("/etc/systemd/user/background.slice.d/90-desktop-oomd.conf"),
-                 content=BACKGROUND_SLICE, desc="background.slice -> 30-dusky-background 30-dusky-swap"),
+                 content=BACKGROUND_SLICE, desc="background.slice -> 30-dusky-background 30-dusky-swap 30-dusky-swap-ceiling"),
         FileSpec(dest=Path("/etc/systemd/user/session.slice.d/90-desktop-oomd.conf"),
                  content=SESSION_SLICE, desc="session.slice preference=avoid (no MemoryMin/Low)"),
         FileSpec(dest=Path("/etc/systemd/system/session-.scope.d/90-desktop-oomd.conf"),
@@ -1819,7 +1832,7 @@ def verify() -> int:
         warn("systemd-oomd is inactive or failed")
         problems += 1
 
-    for rule in ("30-dusky-pressure", "30-dusky-swap", "30-dusky-background"):
+    for rule in ("30-dusky-pressure", "30-dusky-swap", "30-dusky-swap-ceiling", "30-dusky-background"):
         rp = Path(f"/etc/systemd/oomd/rules.d/{rule}.oomrule")
         if rp.is_file():
             say(f"[green]{'RULE OK':11}[/] {rule} installed", plain=f"{'RULE OK':11} {rule} installed")
