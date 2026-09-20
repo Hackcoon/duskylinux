@@ -10,6 +10,8 @@ import asyncio
 import math
 import copy
 import sys
+import signal
+import tempfile
 import threading
 import logging
 from dataclasses import dataclass
@@ -65,6 +67,12 @@ _RE_HSL = re.compile(r"hsla?\(\s*([\d.]+)\s*,\s*([\d.]+)%?\s*,\s*([\d.]+)%?")
 _RE_OKLCH = re.compile(r"oklch\(\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)")
 _RE_RGBA_ALPHA = re.compile(r"rgba\([^,]+,[^,]+,[^,]+,\s*([0-9.]+)\)")
 _RE_HSLA_ALPHA = re.compile(r"hsla\([^,]+,[^,]+,[^,]+,\s*([0-9.]+)\)")
+
+# Bounded background-action execution (execute_action non-interactive path).
+_ACTION_OUTPUT_LIMIT = 8192
+_ACTION_TIMEOUT = 15.0
+_ACTION_DRAIN_TIMEOUT = 3.0
+_ACTION_KILL_GRACE = 1.0
 
 
 def _md_escape(text: str) -> str:
@@ -2352,6 +2360,14 @@ Tooltip {
         # _save_lock is already declared above (line ~2005); do not re-declare.
         self._sudo_keepalive: Timer | None = None
 
+        # Background (non-interactive) action execution tracking.
+        self._action_tasks: set[asyncio.Task[Any]] = set()
+        self._action_procs: set[Any] = set()
+        self._action_cleanup_tasks: set[asyncio.Task[Any]] = set()
+        self._action_shutdown_started = False
+        self._action_shutdown_done = False
+        self._action_shutdown_lock: asyncio.Lock | None = None
+
         # Color variable registry.
         self._color_var_registry: dict[str, str] = {}
         self._color_var_counter: int = 1
@@ -2382,6 +2398,10 @@ Tooltip {
                     self.action_save_batch()
 
                 elif reply == "discard":
+                    try:
+                        self._cancel_background_actions()
+                    except Exception:
+                        pass
                     self.exit()
 
             self.push_screen(UnsavedChangesDialog(len(self.pending_commits)), on_reply)
@@ -2406,6 +2426,10 @@ Tooltip {
             self.notify_status("Waiting for the current save to finish.", level="info")
             return
 
+        try:
+            self._cancel_background_actions()
+        except Exception:
+            pass
         self.exit()
 
     def _modal_active(self) -> bool:
@@ -2705,9 +2729,17 @@ Tooltip {
         if tab_idx is None:
             tab_idx = self._current_tab_index()
 
-        child_items: list[ConfigItem] = []
         seen_items: set[int] = set()
         stack = [ref for ref in (parent_key, parent_uid) if ref]
+
+        any_modified = parent_modified
+        any_pending = parent_pending
+
+        def _settled() -> bool:
+            return any_modified and (any_pending or self.auto_save)
+
+        if _settled():
+            return any_modified, any_pending
 
         while stack:
             curr = str(stack.pop())
@@ -2716,29 +2748,23 @@ Tooltip {
                 if marker in seen_items:
                     continue
                 seen_items.add(marker)
-                child_items.append(itm)
+                if itm.type_ not in ("menu", "action", "preset"):
+                    v_ser = itm.serialize(itm.value)
+                    d_ser = itm.serialize(itm.default)
+                    init_val = itm.initial_value if getattr(itm, "initial_value", None) is not None else itm.value
+                    i_ser = itm.serialize(init_val)
+
+                    if v_ser != d_ser:
+                        any_modified = True
+                    if v_ser != i_ser:
+                        any_pending = True
+
+                    if _settled():
+                        return any_modified, any_pending
                 if getattr(itm, "is_parent", False) or getattr(itm, "type_", None) == "menu":
                     if itm.key:
                         stack.append(itm.key)
                     stack.append(self._get_item_uid(itm))
-
-        any_modified = parent_modified
-        any_pending = parent_pending
-
-        for itm in child_items:
-            if itm.type_ not in ("menu", "action", "preset"):
-                v_ser = itm.serialize(itm.value)
-                d_ser = itm.serialize(itm.default)
-                init_val = itm.initial_value if getattr(itm, "initial_value", None) is not None else itm.value
-                i_ser = itm.serialize(init_val)
-
-                if v_ser != d_ser:
-                    any_modified = True
-                if v_ser != i_ser:
-                    any_pending = True
-
-                if any_modified and (any_pending or self.auto_save):
-                    break
 
         return any_modified, any_pending
 
@@ -3965,6 +3991,9 @@ Tooltip {
                     self.last_target_mtimes[e_key] = fingerprint
                     continue
 
+                if fingerprint == previous:
+                    continue
+
                 items_for_engine = [
                     (t_idx, i_idx, item)
                     for t_idx, i_idx, item in self._items_by_engine.get(e_key, [])
@@ -3995,9 +4024,6 @@ Tooltip {
                             changed_any = True
                     if accepted:
                         self.last_target_mtimes[e_key] = None
-                    continue
-
-                if fingerprint == previous:
                     continue
 
                 reload_generations = {
@@ -4706,6 +4732,42 @@ Tooltip {
                 self._preset_refresh_timer = None
 
             self._refresh_presets_ui()
+
+    def _is_unchanged_submission(self, item: ConfigItem, new_val: Any) -> bool:
+        """Narrow guard for input submission paths: skip ordinary settings whose
+        accepted value already matches, avoiding undo/redo/save churn."""
+        if item.type_ in ("action", "preset", "menu"):
+            return False
+        if is_trigger_item(item):
+            return False
+        if not bool(getattr(item, "exists_in_target", False)):
+            return False
+        try:
+            if item.serialize(item.value) != item.serialize(new_val):
+                return False
+        except Exception:
+            return False
+        try:
+            src_eng = self._get_item_engine_info(item)
+        except Exception:
+            return False
+        try:
+            for _, _, other in self._items_by_uid.get(self._get_item_uid(item), ()):
+                if other is item:
+                    continue
+                try:
+                    if self._get_item_engine_info(other) != src_eng:
+                        continue
+                except Exception:
+                    return False
+                try:
+                    if other.serialize(other.value) != other.serialize(new_val):
+                        return False
+                except Exception:
+                    return False
+        except Exception:
+            return False
+        return True
 
     def _safe_apply_value(
         self,
@@ -5812,6 +5874,57 @@ Tooltip {
     # =========================================================================
     # PRESET ACTIONS
     # =========================================================================
+    def _write_preset_atomically(self, file_path: Path, payload: dict, *, exclusive: bool) -> None:
+        """Serialize first, then publish via temp file plus atomic replacement.
+
+        exclusive=True keeps new-name creation race-safe: the destination is
+        linked (fails if it already exists) instead of replaced.  Existing
+        bytes are never truncated; temporary files are always cleaned up.
+        Temporary files use a non-.json suffix so preset readers polling
+        for *.json never observe an incomplete file.
+        """
+        text = json.dumps(payload, indent=4)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path: Path | None = None
+        try:
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(file_path.parent), prefix=".tmp-preset-", suffix=".tmp"
+            )
+            tmp_path = Path(tmp_name)
+            try:
+                stream = os.fdopen(fd, "w", encoding="utf-8")
+            except BaseException:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            with stream:
+                stream.write(text)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if exclusive:
+                try:
+                    os.link(tmp_path, file_path)
+                except FileExistsError:
+                    raise FileExistsError(f"Preset already exists: {file_path.stem}")
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    tmp_path = None
+            else:
+                os.replace(tmp_path, file_path)
+                tmp_path = None
+        finally:
+            if tmp_path is not None:
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except OSError:
+                    pass
+
     def action_save_preset(self) -> None:
         if self._modal_active():
             return
@@ -5833,12 +5946,17 @@ Tooltip {
 
                     payload[self._get_item_uid(item)] = item.value
 
-            self.user_presets_dir.mkdir(parents=True, exist_ok=True)
             file_path = self.user_presets_dir / f"{name}.json"
 
-            try:
-                with open(file_path, "w", encoding="utf-8") as f:
-                    json.dump(payload, f, indent=4)
+            def do_save(*, exclusive: bool) -> None:
+                try:
+                    self._write_preset_atomically(file_path, payload, exclusive=exclusive)
+                except FileExistsError:
+                    self.notify_status(f"Preset already exists: {name}", level="error")
+                    return
+                except Exception as e:
+                    self.notify_status(f"Error saving preset: {e}", level="error")
+                    return
 
                 self.notify_status(f"Successfully saved preset: {name}", level="success")
 
@@ -5846,8 +5964,20 @@ Tooltip {
                 self._rebuild_indexes()
                 self._refresh_all_ui()
 
-            except Exception as e:
-                self.notify_status(f"Error saving preset: {e}", level="error")
+            if file_path.exists():
+                safe_name = _md_escape(name)
+                self.push_screen(
+                    ConfirmDialog(
+                        f"Preset **{safe_name}** already exists. Overwrite?",
+                        title="Overwrite Preset",
+                        level="warning",
+                        default_confirm=False,
+                    ),
+                    lambda confirmed: do_save(exclusive=False) if confirmed else None,
+                )
+                return
+
+            do_save(exclusive=True)
 
         self.push_screen(HybridInputScreen("Save Current State as Preset (Name):", ""), check_reply)
 
@@ -5863,23 +5993,33 @@ Tooltip {
             if not name:
                 return
 
-            self.user_presets_dir.mkdir(parents=True, exist_ok=True)
             file_path = self.user_presets_dir / f"{name}.json"
 
             try:
-                with open(file_path, "w", encoding="utf-8") as f:
-                    json.dump({}, f, indent=4)
-
-                self.notify_status(f"Created import template: {name}", level="success")
-
-                self._load_user_presets()
-                self._rebuild_indexes()
-                self._refresh_all_ui()
-
-                self.open_file_externally(file_path, button=1, touch_first=False)
-
+                if file_path.exists():
+                    self.notify_status(
+                        f"Preset already exists: {name}. Choose a new name.",
+                        level="error",
+                    )
+                    return
+                self._write_preset_atomically(file_path, {}, exclusive=True)
+            except FileExistsError:
+                self.notify_status(
+                    f"Preset already exists: {name}. Choose a new name.",
+                    level="error",
+                )
+                return
             except Exception as e:
                 self.notify_status(f"Error importing preset: {e}", level="error")
+                return
+
+            self.notify_status(f"Created import template: {name}", level="success")
+
+            self._load_user_presets()
+            self._rebuild_indexes()
+            self._refresh_all_ui()
+
+            self.open_file_externally(file_path, button=1, touch_first=False)
 
         self.push_screen(HybridInputScreen("Import Preset (Enter new name):", ""), check_reply)
 
@@ -6279,6 +6419,349 @@ Tooltip {
 
         return False
 
+    @staticmethod
+    async def _drain_action_stream(stream: asyncio.StreamReader, limit: int) -> bytes:
+        buf = bytearray()
+        try:
+            while True:
+                chunk = await stream.read(4096)
+                if not chunk:
+                    break
+                if len(buf) < limit:
+                    buf.extend(chunk[: limit - len(buf)])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        return bytes(buf)
+
+    def _kill_action_tree(self, proc: asyncio.subprocess.Process) -> None:
+        try:
+            pid = proc.pid
+        except Exception:
+            return
+        if pid is None:
+            return
+        if sys.platform.startswith("linux") and hasattr(os, "killpg"):
+            try:
+                # Dedicated session/group (start_new_session=True) => pgid == pid.
+                os.killpg(pid, signal.SIGTERM)
+                return
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            except Exception:
+                pass
+        try:
+            proc.terminate()
+        except (ProcessLookupError, OSError):
+            pass
+        except Exception:
+            pass
+
+    @staticmethod
+    def _action_group_alive(pgid: int | None) -> bool:
+        if pgid is None:
+            return False
+        if not (sys.platform.startswith("linux") and hasattr(os, "killpg")):
+            return False
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+
+    def _close_action_pipes(self, proc: asyncio.subprocess.Process | None) -> None:
+        if proc is None:
+            return
+        try:
+            transport = getattr(proc, "_transport", None)
+            if transport is not None:
+                try:
+                    is_closing = transport.is_closing() if hasattr(transport, "is_closing") else False
+                    if not is_closing:
+                        transport.close()
+                    return
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+            try:
+                pipe_transport = getattr(stream, "_transport", None)
+                if pipe_transport is not None and hasattr(pipe_transport, "close"):
+                    try:
+                        if hasattr(pipe_transport, "is_closing") and pipe_transport.is_closing():
+                            continue
+                        pipe_transport.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    async def _terminate_and_reap_action(self, proc: asyncio.subprocess.Process) -> None:
+        try:
+            pid = proc.pid
+        except Exception:
+            pid = None
+        pgid = pid if (pid is not None and sys.platform.startswith("linux") and hasattr(os, "killpg")) else None
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        else:
+            try:
+                proc.terminate()
+            except (ProcessLookupError, OSError):
+                pass
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        start = loop.time() if loop is not None else 0.0
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_ACTION_KILL_GRACE)
+        except TimeoutError:
+            pass
+        # Honor the grace period: if the shell exited quickly, surviving
+        # group members still get the remaining interval to finish graceful
+        # SIGTERM cleanup before escalation to SIGKILL.
+        if pgid is not None and self._action_group_alive(pgid):
+            try:
+                remaining = _ACTION_KILL_GRACE - ((loop.time() - start) if loop is not None else _ACTION_KILL_GRACE)
+            except Exception:
+                remaining = 0.0
+            if remaining > 0:
+                try:
+                    deadline = (loop.time() + remaining) if loop is not None else 0.0
+                    while self._action_group_alive(pgid):
+                        now = loop.time() if loop is not None else deadline
+                        if now >= deadline:
+                            break
+                        await asyncio.sleep(0.05)
+                except Exception:
+                    pass
+        if pgid is not None and self._action_group_alive(pgid):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except (ProcessLookupError, OSError):
+                pass
+            except Exception:
+                pass
+            try:
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + _ACTION_KILL_GRACE
+                while self._action_group_alive(pgid):
+                    if loop.time() >= deadline:
+                        break
+                    await asyncio.sleep(0.05)
+            except Exception:
+                pass
+        elif pgid is None and proc.returncode is None:
+            try:
+                proc.kill()
+            except (ProcessLookupError, OSError):
+                pass
+            except Exception:
+                pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_ACTION_KILL_GRACE)
+        except (TimeoutError, Exception):
+            pass
+
+    async def _cleanup_action_resources(
+        self,
+        proc: asyncio.subprocess.Process | None,
+        drains: list[asyncio.Task[bytes]],
+        spawn_task: asyncio.Task[Any] | None = None,
+        proc_box: list[Any] | None = None,
+    ) -> None:
+        """Single-owner group termination + drain reaping + pipe closing."""
+        if proc is None and proc_box:
+            for cand in list(proc_box):
+                if cand is not None:
+                    proc = cand
+                    break
+        if proc is None and spawn_task is not None and not spawn_task.done():
+            try:
+                got = await asyncio.wait_for(asyncio.shield(spawn_task), timeout=_ACTION_DRAIN_TIMEOUT)
+                if isinstance(got, asyncio.subprocess.Process):
+                    proc = got
+            except TimeoutError:
+                pass
+        if proc is None and spawn_task is not None and spawn_task.done() and not spawn_task.cancelled():
+            try:
+                if spawn_task.exception() is None:
+                    got = spawn_task.result()
+                    if isinstance(got, asyncio.subprocess.Process):
+                        proc = got
+            except Exception:
+                pass
+        if proc is not None:
+            try:
+                self._action_procs.add(proc)
+            except Exception:
+                pass
+            try:
+                await self._terminate_and_reap_action(proc)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+        for pending in drains:
+            try:
+                if pending is not None and not pending.done():
+                    pending.cancel()
+            except Exception:
+                pass
+        if drains:
+            try:
+                await asyncio.gather(*drains, return_exceptions=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+        if proc is not None:
+            try:
+                self._close_action_pipes(proc)
+            except Exception:
+                pass
+            try:
+                self._action_procs.discard(proc)
+            except Exception:
+                pass
+
+    def _track_action_task(self, task: asyncio.Task[Any]) -> asyncio.Task[Any]:
+        tasks = getattr(self, "_action_tasks", None)
+        if tasks is None:
+            tasks = self._action_tasks = set()
+        tasks.add(task)
+
+        def _done(t: asyncio.Task[Any]) -> None:
+            try:
+                tasks.discard(t)
+            except Exception:
+                pass
+            try:
+                if not t.cancelled():
+                    t.exception()
+            except Exception:
+                pass
+
+        task.add_done_callback(_done)
+        return task
+
+    def _track_action_cleanup(self, task: asyncio.Task[Any]) -> asyncio.Task[Any]:
+        tasks = getattr(self, "_action_cleanup_tasks", None)
+        if tasks is None:
+            tasks = self._action_cleanup_tasks = set()
+        tasks.add(task)
+
+        def _done(t: asyncio.Task[Any]) -> None:
+            try:
+                tasks.discard(t)
+            except Exception:
+                pass
+            try:
+                if not t.cancelled():
+                    t.exception()
+            except Exception:
+                pass
+
+        task.add_done_callback(_done)
+        return task
+
+    def _cancel_background_actions(self) -> None:
+        """Synchronous best-effort kill/cancel; awaiting happens in shutdown."""
+        for proc in list(getattr(self, "_action_procs", ())):
+            try:
+                self._kill_action_tree(proc)
+            except Exception:
+                pass
+        for task in list(getattr(self, "_action_tasks", ())):
+            try:
+                if not task.done():
+                    task.cancel()
+            except Exception:
+                pass
+
+    async def _shutdown_background_actions(self) -> None:
+        """Idempotent bounded shutdown; safe to call from any exit path."""
+        if getattr(self, "_action_shutdown_done", False):
+            return
+        lock = getattr(self, "_action_shutdown_lock", None)
+        if lock is None:
+            lock = self._action_shutdown_lock = asyncio.Lock()
+        async with lock:
+            if getattr(self, "_action_shutdown_done", False):
+                return
+            self._action_shutdown_started = True
+            self._cancel_background_actions()
+            tasks = [t for t in list(getattr(self, "_action_tasks", ())) if not t.done()]
+            if tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=5.0,
+                    )
+                except TimeoutError:
+                    pass
+                for t in tasks:
+                    try:
+                        if t.done() and not t.cancelled():
+                            t.exception()
+                    except Exception:
+                        pass
+            cleanup_tasks = [t for t in list(getattr(self, "_action_cleanup_tasks", ())) if not t.done()]
+            if cleanup_tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*cleanup_tasks, return_exceptions=True),
+                        timeout=5.0,
+                    )
+                except TimeoutError:
+                    pass
+                for t in cleanup_tasks:
+                    try:
+                        if t.done() and not t.cancelled():
+                            t.exception()
+                    except Exception:
+                        pass
+            for proc in list(getattr(self, "_action_procs", ())):
+                try:
+                    await self._terminate_and_reap_action(proc)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+                try:
+                    self._close_action_pipes(proc)
+                except Exception:
+                    pass
+                try:
+                    self._action_procs.discard(proc)
+                except Exception:
+                    pass
+            if (
+                all(t.done() for t in tasks)
+                and all(t.done() for t in cleanup_tasks)
+                and not getattr(self, "_action_procs", set())
+            ):
+                self._action_shutdown_done = True
+
+    async def on_unmount(self) -> None:
+        await self._shutdown_background_actions()
+
     def execute_action(self, item: ConfigItem) -> None:
         if item.key == "__save_new_preset":
             self.action_save_preset()
@@ -6295,6 +6778,9 @@ Tooltip {
             return
 
         def do_execute():
+            if getattr(self, "_action_shutdown_started", False):
+                self.notify_status("Shutting down; action not started.", level="warning")
+                return
             self.notify_status(f"Executing: {item.label}...", level="info")
 
             forced = getattr(item, "force_interactive", None)
@@ -6324,20 +6810,87 @@ Tooltip {
 
             async def run_noninteractive():
                 proc: asyncio.subprocess.Process | None = None
+                drains: list[asyncio.Task[bytes]] = []
+                spawn_task: asyncio.Task[Any] | None = None
+                proc_box: list[Any] = []
+                stdout = b""
+                stderr = b""
+                timed_out = False
                 try:
-                    proc = await asyncio.create_subprocess_shell(
-                        command,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
+                    popen_kwargs: dict[str, Any] = {}
+                    if sys.platform != "win32":
+                        popen_kwargs["start_new_session"] = True
+
+                    async def _spawn() -> asyncio.subprocess.Process:
+                        p = await asyncio.create_subprocess_shell(
+                            command,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            **popen_kwargs
+                        )
+                        proc_box.append(p)
+                        try:
+                            self._action_procs.add(p)
+                        except Exception:
+                            pass
+                        return p
+
+                    spawn_task = asyncio.create_task(_spawn())
+                    self._track_action_cleanup(spawn_task)
+                    try:
+                        # Shield the await (not the task): outer cancellation
+                        # must not propagate into the owned spawn task.
+                        proc = await asyncio.shield(spawn_task)
+                    except asyncio.CancelledError:
+                        for cand in list(proc_box):
+                            if cand is not None:
+                                proc = cand
+                                break
+                        if proc is None and spawn_task.done() and not spawn_task.cancelled():
+                            try:
+                                if spawn_task.exception() is None:
+                                    cand = spawn_task.result()
+                                    if isinstance(cand, asyncio.subprocess.Process):
+                                        proc = cand
+                                        try:
+                                            self._action_procs.add(proc)
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                        raise
+                    assert proc.stdout is not None and proc.stderr is not None
+                    drains = [
+                        asyncio.create_task(
+                            self._drain_action_stream(proc.stdout, _ACTION_OUTPUT_LIMIT)
+                        ),
+                        asyncio.create_task(
+                            self._drain_action_stream(proc.stderr, _ACTION_OUTPUT_LIMIT)
+                        ),
+                    ]
 
                     try:
-                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+                        await asyncio.wait_for(proc.wait(), timeout=_ACTION_TIMEOUT)
                     except TimeoutError:
-                        if proc is not None:
-                            proc.kill()
-                            await proc.wait()
-                        self.notify_status("Action timed out after 15 seconds.", level="error")
+                        timed_out = True
+
+                    if not timed_out:
+                        try:
+                            parts = await asyncio.wait_for(
+                                asyncio.gather(*drains),
+                                timeout=_ACTION_DRAIN_TIMEOUT,
+                            )
+                            stdout, stderr = parts[0], parts[1]
+                        except TimeoutError:
+                            # Shell exited but descendants still hold pipes.
+                            timed_out = True
+                            stdout, stderr = b"", b""
+
+                    if timed_out:
+                        self.notify_status(
+                            f"Action timed out after {_ACTION_TIMEOUT:g} seconds.",
+                            level="error",
+                        )
                         return
 
                     if proc.returncode == 0:
@@ -6354,14 +6907,18 @@ Tooltip {
                             err = "Unknown execution error"
                         self.notify_status(f"Action failed: {err[:60]}", level="error")
 
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     self.notify_status(f"Execution error: {str(e)[:60]}", level="error")
                 finally:
-                    if proc is not None and proc.returncode is None:
-                        proc.kill()
-                        await proc.wait()
+                    if proc is not None or drains or (spawn_task is not None and not spawn_task.done()):
+                        cleanup = asyncio.create_task(
+                            self._cleanup_action_resources(proc, drains, spawn_task, proc_box)
+                        )
+                        self._track_action_cleanup(cleanup)
 
-            asyncio.create_task(run_noninteractive())
+            self._track_action_task(asyncio.create_task(run_noninteractive()))
 
         if item.confirm_message:
             self.push_screen(
@@ -6476,10 +7033,15 @@ Tooltip {
             if new_val is not None:
                 if item.type_ == "int":
                     try:
+                        text = str(new_val).strip()
                         try:
-                            parsed_val = int(new_val, 0)
+                            parsed_val = int(text, 0)
                         except ValueError:
-                            parsed_val = int(float(new_val))
+                            float_val = float(text)
+                            if not math.isfinite(float_val):
+                                self.notify_status("Error: Value must be a finite integer.", level="error")
+                                return
+                            parsed_val = int(float_val)
 
                         if item.min_val is not None:
                             parsed_val = max(int(item.min_val), parsed_val)
@@ -6489,13 +7051,17 @@ Tooltip {
 
                         new_val = parsed_val
 
-                    except ValueError:
-                        self.notify_status("Error: Value must be an integer.", level="error")
+                    except (ValueError, OverflowError):
+                        self.notify_status("Error: Value must be a finite integer.", level="error")
                         return
 
                 elif item.type_ == "float":
                     try:
-                        parsed_val = float(new_val)
+                        parsed_val = float(str(new_val).strip())
+
+                        if not math.isfinite(parsed_val):
+                            self.notify_status("Error: Value must be a finite float.", level="error")
+                            return
 
                         if item.min_val is not None:
                             parsed_val = max(float(item.min_val), parsed_val)
@@ -6505,10 +7071,12 @@ Tooltip {
 
                         new_val = parsed_val
 
-                    except ValueError:
-                        self.notify_status("Error: Value must be a float.", level="error")
+                    except (ValueError, OverflowError):
+                        self.notify_status("Error: Value must be a finite float.", level="error")
                         return
 
+                if self._is_unchanged_submission(item, new_val):
+                    return
                 self._safe_apply_value(tab_idx, item_idx, item, new_val)
 
         self.push_screen(
@@ -6523,6 +7091,8 @@ Tooltip {
     def prompt_picker(self, tab_idx: int, item_idx: int, item: ConfigItem) -> None:
         def check_reply(new_val: str | None) -> None:
             if new_val is not None:
+                if self._is_unchanged_submission(item, new_val):
+                    return
                 self._safe_apply_value(tab_idx, item_idx, item, new_val)
 
         self.push_screen(
