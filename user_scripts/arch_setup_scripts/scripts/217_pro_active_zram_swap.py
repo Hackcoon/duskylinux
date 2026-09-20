@@ -45,8 +45,8 @@ PSI_SOME_THRESHOLD: float = 0.50         # Abort sweep if some avg10 >= 0.50%
 ZRAM_MAX_USAGE_RATIO: float = 0.90       # Abort sweep if zRAM swap is >= 90% full to protect disk swap
 RAM_USAGE_THRESHOLD_RATIO: float = 0.70  # Only trigger periodic sweep if total system RAM usage is >= 70%
 RECLAIM_RATIO: float = 0.30              # Reclaim up to 30% of slice anonymous pages per periodic sweep
-RAM_TIER_MAX_MB: int = 16384             # Target <=16 GB RAM tier by default; skip large RAM machines (>16GB)
-ENABLE_ON_LARGE_RAM: bool = False        # Allow override for machines with > 16 GB RAM
+RAM_TIER_MAX_MB: int = 29696             # Target <=29 GB RAM tier by default; skip large RAM machines (>29GB)
+ENABLE_ON_LARGE_RAM: bool = False        # Allow override for machines with > 29 GB RAM
 TIMER_INTERVAL: str = "6min"             # Dynamic periodic timer recurrence interval written into systemd timer unit
 MAX_PER_RUN_MB: int = 256                # Capped at 256 MiB per periodic sweep to prevent background stutter
 BOOT_FLUSH_MAX_MB: int = 1024            # Budget for one-time 60s boot flush to minimize baseline idle RAM
@@ -374,14 +374,14 @@ def perform_reclaim(force: bool = False, boot_flush: bool = False) -> None:
     used_b, total_b, ram_ratio = get_ram_usage()
     total_mb = total_b // (1024 * 1024)
 
-    # 1. RAM Tier Guard: Skip on >16 GB workstations by default to save CPU
+    # 1. RAM Tier Guard: Skip on >29 GB workstations by default to save CPU
     if not force and not ENABLE_ON_LARGE_RAM and total_mb > RAM_TIER_MAX_MB:
         info(
-            f"RAM tier > 16 GB ({total_mb} MB detected). Skipping memory sweep to conserve CPU "
+            f"RAM tier > 29 GB ({total_mb} MB detected). Skipping memory sweep to conserve CPU "
             "(large RAM systems have ample memory headroom). Override via ENABLE_ON_LARGE_RAM=true."
         )
         try:
-            write_file_atomic(Path("/run/dusky/pro_active_zram_swap.state"), f"Idle (Tier > 16GB: {total_mb} MB)\n", mode=0o644)
+            write_file_atomic(Path("/run/dusky/pro_active_zram_swap.state"), f"Idle (Tier > 29GB: {total_mb} MB)\n", mode=0o644)
         except Exception:
             pass
         return
@@ -523,7 +523,7 @@ def show_status() -> None:
     print(f"Current RAM Used    : {used_b // (1024*1024)} MB ({ram_ratio*100:.1f}%) [Periodic Threshold: {int(RAM_USAGE_THRESHOLD_RATIO*100)}%]")
     print(f"Slice Reclaim Cap   : {int(RECLAIM_RATIO*100)}% anon per periodic sweep [Run Budget: {MAX_PER_RUN_MB} MB max]")
     print(f"One-Shot Boot Flush : {BOOT_FLUSH_DELAY} after boot [Budget: {BOOT_FLUSH_MAX_MB} MB max, 100% cold pages]")
-    print(f"RAM Tier Policy     : {'<= 16 GB active' if total_b // (1024*1024) <= RAM_TIER_MAX_MB or ENABLE_ON_LARGE_RAM else f'> 16 GB skipped (ENABLE_ON_LARGE_RAM={ENABLE_ON_LARGE_RAM})'}")
+    print(f"RAM Tier Policy     : {'<= 29 GB active' if total_b // (1024*1024) <= RAM_TIER_MAX_MB or ENABLE_ON_LARGE_RAM else f'> 29 GB skipped (ENABLE_ON_LARGE_RAM={ENABLE_ON_LARGE_RAM})'}")
     print(f"Memory Pressure PSI : {psi:.2f}% [Abort Threshold: {PSI_SOME_THRESHOLD:.2f}%]")
 
     if zram_stat:
@@ -601,7 +601,7 @@ done
 CONF="/etc/dusky/dusky_pro_active_zram_swap.conf"
 thresh_pct=70
 enable_large_ram="false"
-ram_tier_max_mb=16384
+ram_tier_max_mb=29696
 
 if [[ -f "$CONF" ]]; then
     while read -r line; do
@@ -657,12 +657,12 @@ fi
 
 total_mb=$(( mem_total / 1024 ))
 
-# RAM Tier Guard: On systems > 16 GB, skip unless explicitly enabled in conf
+# RAM Tier Guard: On systems > 29 GB, skip unless explicitly enabled in conf
 if (( total_mb > ram_tier_max_mb )) && [[ "$enable_large_ram" != "true" && "$enable_large_ram" != "1" && "$enable_large_ram" != "yes" ]]; then
     printf '[INFO] RAM tier > %d MB (%d MB detected). Skipping proactive sweep to conserve CPU (large RAM tier has ample headroom).\n' \
         "$ram_tier_max_mb" "$total_mb"
     mkdir -p /run/dusky 2>/dev/null || true
-    printf 'Idle (Tier > 16GB: %d MB)\n' "$total_mb" > /run/dusky/pro_active_zram_swap.state 2>/dev/null || true
+    printf 'Idle (Tier > %dMB: %d MB)\n' "$ram_tier_max_mb" "$total_mb" > /run/dusky/pro_active_zram_swap.state 2>/dev/null || true
     exit 1
 fi
 

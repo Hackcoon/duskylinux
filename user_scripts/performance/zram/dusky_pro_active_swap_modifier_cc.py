@@ -84,6 +84,8 @@ DEFAULT_CHUNK_MB = 32       # 32 MB write chunks per yield
 DEFAULT_ZRAM_LIMIT = 0.90   # 90% full zram abort
 DEFAULT_RAM_THRESHOLD = 0.70 # 70% RAM usage threshold to trigger sweep
 DEFAULT_INTERVAL = "6min"   # Periodic sweep interval
+DEFAULT_RAM_TIER_MAX_MB = 29696 # 29 GB tier cutoff; skip larger RAM machines
+DEFAULT_ENABLE_ON_LARGE_RAM = "false"
 
 def write_file_atomic(path: Path, content: str, mode: int = 0o644) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,6 +192,8 @@ def read_config() -> dict[str, str]:
         "ZRAM_MAX_USAGE_RATIO": str(DEFAULT_ZRAM_LIMIT),
         "RAM_USAGE_THRESHOLD_RATIO": str(DEFAULT_RAM_THRESHOLD),
         "TIMER_INTERVAL": DEFAULT_INTERVAL,
+        "ENABLE_ON_LARGE_RAM": DEFAULT_ENABLE_ON_LARGE_RAM,
+        "RAM_TIER_MAX_MB": str(DEFAULT_RAM_TIER_MAX_MB),
     }
     if CONF_FILE.exists():
         try:
@@ -224,8 +228,8 @@ BOOT_FLUSH_DELAY={conf.get("BOOT_FLUSH_DELAY", DEFAULT_BOOT_FLUSH_DELAY)}
 CHUNK_SIZE_MB={conf.get("CHUNK_SIZE_MB", str(DEFAULT_CHUNK_MB))}
 ZRAM_MAX_USAGE_RATIO={conf.get("ZRAM_MAX_USAGE_RATIO", str(DEFAULT_ZRAM_LIMIT))}
 PSI_SOME_THRESHOLD=0.50
-ENABLE_ON_LARGE_RAM=false
-RAM_TIER_MAX_MB=16384
+ENABLE_ON_LARGE_RAM={conf.get("ENABLE_ON_LARGE_RAM", DEFAULT_ENABLE_ON_LARGE_RAM)}
+RAM_TIER_MAX_MB={conf.get("RAM_TIER_MAX_MB", str(DEFAULT_RAM_TIER_MAX_MB))}
 TIMER_INTERVAL={conf.get("TIMER_INTERVAL", DEFAULT_INTERVAL)}
 """
     write_file_atomic(CONF_FILE, content, mode=0o644)
