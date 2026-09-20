@@ -166,6 +166,8 @@ score=200
 preference="avoid"
 grace_sec="${DUSKY_GRACE_SEC:-8}"
 
+[[ "$grace_sec" =~ ^[0-9]+$ ]] || grace_sec=8
+
 if [[ "$1" == "--background" ]]; then
   slice="background.slice"
   score=300
@@ -181,8 +183,8 @@ if ! printf '%d\\n' "$score" > /proc/self/oom_score_adj 2>/dev/null; then
   echo "dusky-run: warning: cannot set oom_score_adj" >&2
 fi
 
-app_name="$(basename "${1}")"
-unit="app-${app_name}-${RANDOM}"
+app_name="$(basename "${1}" | tr -cd 'a-zA-Z0-9_.-')"
+unit="app-${app_name:-app}-$$-${RANDOM}"
 
 # Grace period: Protect newly launched interactive apps with ManagedOOMPreference=avoid
 # for the first grace_sec (default 8s), then revert to ManagedOOMPreference=none.
@@ -486,6 +488,7 @@ static void cleanup_all(void) {
 int main(void) {
     signal(SIGTERM, handle_sig);
     signal(SIGINT, handle_sig);
+    signal(SIGHUP, handle_sig);
     signal(SIGPIPE, SIG_IGN);
     
     char cmd_sock[PATH_MAX_LEN], evt_sock_path[PATH_MAX_LEN];
@@ -546,7 +549,11 @@ int main(void) {
                         strncmp(line_start, "openwindow>>", 12) == 0 ||
                         strncmp(line_start, "closewindow>>", 13) == 0 ||
                         strncmp(line_start, "focusedmon>>", 12) == 0 ||
-                        strncmp(line_start, "workspace>>", 11) == 0) {
+                        strncmp(line_start, "workspace>>", 11) == 0 ||
+                        strncmp(line_start, "workspacev2>>", 13) == 0 ||
+                        strncmp(line_start, "fullscreen>>", 12) == 0 ||
+                        strncmp(line_start, "changefloatingmode>>", 19) == 0 ||
+                        strncmp(line_start, "movewindow>>", 12) == 0) {
                         needs_sync = true;
                     }
                     line_start = nl + 1;
