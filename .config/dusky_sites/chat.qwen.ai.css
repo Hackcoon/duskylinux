@@ -20,5 +20,8 @@
     div.app > div.desktop-layout > div.desktop-layout-content.desktop-layout-content-temporary { background-color: var(--surface_container_low) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.app%20%3E%20div.desktop-layout%20%3E%20div.desktop-layout-content.desktop-layout-content-temporary%1Fbg | bg: surface_container_low */
     svg { fill: var(--primary) !important; color: var(--primary) !important; } /* dusky key=sel%1Fsvg%1Ffill | fill: primary */
     div.wms-more-entry__text { color: var(--primary_fixed_dim) !important; } /* dusky key=sel%1Fdiv.wms-more-entry__text%1Ftext | text: primary_fixed_dim */
+    span { color: var(--on_surface) !important; } /* dusky key=sel%1Fspan%1Ftext | text: on_surface */
+    div > div.message-input-container-area > textarea.message-input-textarea { color: var(--on_surface) !important; } /* dusky key=sel%1Fdiv%20%3E%20div.message-input-container-area%20%3E%20textarea.message-input-textarea%1Ftext | text: on_surface */
+    div.satisfaction-rating { background-color: var(--surface_container_high) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.satisfaction-rating%1Fbg | bg: surface_container_high */
     /* <<< dusky:picks */
 }
