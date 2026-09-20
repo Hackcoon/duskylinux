@@ -559,5 +559,6 @@
     div.backdrop-blur-elevation-01.flex-col { background-color: var(--surface_container_low) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.backdrop-blur-elevation-01.flex-col%1Fbg | bg: surface_container_low */
     div:nth-of-type(2) > button.shrink-0 > svg { fill: var(--on_primary) !important; color: var(--on_primary) !important; } /* dusky key=sel%1Fdiv%3Anth-of-type(2)%20%3E%20button.shrink-0%20%3E%20svg%1Ffill | fill: on_primary */
     div.shrink-0 > div.start-0 > svg { fill: var(--surface) !important; color: var(--surface) !important; } /* dusky key=sel%1Fdiv.shrink-0%20%3E%20div.start-0%20%3E%20svg%1Ffill | fill: surface */
+    button.shrink-0 { background-color: var(--surface_bright) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fbutton.shrink-0%1Fbg | bg: surface_bright */
     /* <<< dusky:picks */
 }
