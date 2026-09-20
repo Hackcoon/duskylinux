@@ -336,21 +336,22 @@ DUSKY_RUN_WRAPPER: Final[str] = r"""#!/bin/bash
 # inherits the compositor's session-N.scope, which is a *system* scope owned by
 # PID 1. It is therefore invisible to app.slice's OOMRules and cannot be
 # protected by dusky-oom-shield. dusky-run reparents it into app.slice (or
-# background.slice) so the whole OOM policy applies to it.
+# background.slice / session.slice) so the whole OOM policy applies to it.
 #
 # Env:
 #   DUSKY_GRACE_SEC   seconds of ManagedOOMPreference=avoid after launch
-#                     (default 8; 0 disables the grace period entirely)
+#                     (default 0; 0 disables the grace period entirely)
 set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: dusky-run [--background] [--] <cmd> [args...]
+usage: dusky-run [--session|--background] [--] <cmd> [args...]
 
-  (default)      app.slice        oom_score_adj=200  preference=avoid -> none
+  (default)      app.slice        oom_score_adj=200  preference=none
+  --session      session.slice    oom_score_adj=100  preference=avoid
   --background   background.slice oom_score_adj=300  preference=none
 
-env: DUSKY_GRACE_SEC=<int>   avoid-window in seconds (default 8, 0 = off)
+env: DUSKY_GRACE_SEC=<int>   avoid-window in seconds (default 0, 0 = off)
 EOF
   exit 1
 }
@@ -359,17 +360,28 @@ EOF
 
 slice="app.slice"
 score=200
-preference="avoid"
+preference="none"
 
 case "${1-}" in
+  --session)    slice="session.slice"; score=100; preference="avoid"; shift ;;
   --background) slice="background.slice"; score=300; preference="none"; shift ;;
   -h|--help)    usage ;;
 esac
 [[ "${1-}" == "--" ]] && shift
 [[ $# -gt 0 ]] || usage
 
-grace_sec="${DUSKY_GRACE_SEC:-8}"
-[[ "$grace_sec" =~ ^[0-9]+$ ]] || grace_sec=8
+# If launched command is a desktop panel/daemon, place in session.slice
+raw_name="${1##*/}"
+case "$raw_name" in
+  waybar|mako|swaync|hypridle|hyprpaper|awww-daemon|wpaperd|hyprpolkitagent)
+    slice="session.slice"
+    score=100
+    preference="avoid"
+    ;;
+esac
+
+grace_sec="${DUSKY_GRACE_SEC:-0}"
+[[ "$grace_sec" =~ ^[0-9]+$ ]] || grace_sec=0
 
 if ! command -v -- "$1" >/dev/null 2>&1 && [[ ! -x "$1" ]]; then
   echo "dusky-run: command not found: $1" >&2
@@ -384,25 +396,25 @@ if ! printf '%d\n' "$score" > /proc/self/oom_score_adj 2>/dev/null; then
   echo "dusky-run: warning: cannot set oom_score_adj to $score" >&2
 fi
 
-raw_name="${1##*/}"
 app_name="$(printf '%s' "$raw_name" | tr -cd 'a-zA-Z0-9_.-')"
 app_name="${app_name:-app}"
 app_name="${app_name:0:64}"
 unit="app-${app_name}-$$-${RANDOM}${RANDOM}"
 
-# Grace period. Newly launched interactive apps are the most expensive thing to
-# lose, so they get ManagedOOMPreference=avoid for the first grace_sec and are
-# then demoted to none so they cannot permanently distort oomd's ranking.
-#
-# NOTE: this set-property makes the user manager removexattr user.oomd_avoid on
-# the scope cgroup. dusky-oom-shield re-applies it on its next reconcile if the
-# window is still focused -- the shield is a reconciler, not an edge-trigger, so
-# this demotion cannot strand a focused window unprotected.
-if [[ "$preference" == "avoid" && "$grace_sec" -gt 0 ]]; then
+# Grace period: if explicitly requested via DUSKY_GRACE_SEC for an app.slice
+# application, ensure user.oomd_avoid is removed from the cgroup upon expiry.
+if [[ "$preference" == "avoid" && "$grace_sec" -gt 0 && "$slice" == "app.slice" ]]; then
   setsid --fork bash -c '
     sleep "$1"
-    systemctl --user -q is-active "$2.scope" 2>/dev/null || exit 0
-    systemctl --user set-property "$2.scope" ManagedOOMPreference=none >/dev/null 2>&1 || true
+    unit="$2.scope"
+    systemctl --user -q is-active "$unit" 2>/dev/null || exit 0
+    systemctl --user set-property "$unit" ManagedOOMPreference=none >/dev/null 2>&1 || true
+    cgroup="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/$unit"
+    if [[ -d "$cgroup" ]]; then
+      if ! getfattr -n user.dusky_shield "$cgroup" >/dev/null 2>&1; then
+        setfattr -x user.oomd_avoid "$cgroup" 2>/dev/null || true
+      fi
+    fi
   ' _ "$grace_sec" "$unit" </dev/null >/dev/null 2>&1 &
   disown || true
 fi
@@ -631,13 +643,11 @@ static bool xattr_present(const char *path, const char *name)
 }
 
 /*
- * Apply protection.  If an avoid already exists without our marker it belongs
- * to systemd (unit property) -- leave it strictly alone.
+ * Apply protection. Always write our marker so we can safely clean up later
+ * when focus changes.
  */
 static void shield_apply(const char *path)
 {
-        if (xattr_present(path, XATTR_AVOID))
-                return;
         if (setxattr(path, XATTR_AVOID, "1", 1, 0) < 0) {
                 if (errno != ENOENT)
                         logmsg(1, "setxattr(%s, %s): %s", path, XATTR_AVOID, strerror(errno));
@@ -666,8 +676,11 @@ static int sweep_cb(const char *path, const struct stat *sb, int flag, struct FT
 {
         (void)sb;
         (void)ftw;
-        if (flag == FTW_D || flag == FTW_DP)
+        if (flag == FTW_D || flag == FTW_DP) {
                 shield_clear(path);
+                if (strstr(path, "/app.slice/") && strstr(path, ".scope"))
+                        removexattr(path, XATTR_AVOID);
+        }
         return 0;
 }
 
@@ -913,6 +926,72 @@ static void add_candidates(int pid, StrVec *out)
         fclose(f);
 }
 
+/*
+ * Terminals (like Kitty) and IDEs move child processes into sub-scopes or child
+ * scopes. Recursively inspect direct children of the process so that commands
+ * running inside the focused window share the protection.
+ */
+static void add_descendant_cgroups(int pid, StrVec *out, int depth)
+{
+        if (depth <= 0)
+                return;
+
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%d/task/%d/children", pid, pid);
+        FILE *f = fopen(path, "re");
+        if (!f)
+                return;
+
+        int child_pid;
+        while (fscanf(f, "%d", &child_pid) == 1) {
+                if (child_pid > 1) {
+                        add_candidates(child_pid, out);
+                        add_descendant_cgroups(child_pid, out, depth - 1);
+                }
+        }
+        fclose(f);
+}
+
+/*
+ * Kitty creates peer scopes under app.slice named kitty-<ppid>-<id>.scope.
+ * Pattern match them directly under the user's app.slice.
+ */
+static void add_pattern_scopes(int pid, StrVec *out)
+{
+        char app_slice[PATH_LEN];
+        int n = snprintf(app_slice, sizeof(app_slice),
+                         "%s/user.slice/user-%u.slice/user@%u.service/app.slice",
+                         CGROUP_ROOT, (unsigned)getuid(), (unsigned)getuid());
+        if (n < 0 || (size_t)n >= sizeof(app_slice))
+                return;
+
+        DIR *d = opendir(app_slice);
+        if (!d)
+                return;
+
+        char prefix[64];
+        int plen = snprintf(prefix, sizeof(prefix), "kitty-%d-", pid);
+
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+                if (plen > 0 && strncmp(de->d_name, prefix, (size_t)plen) == 0 &&
+                    strstr(de->d_name, ".scope") != NULL) {
+                        char cand[PATH_LEN];
+                        int w = snprintf(cand, sizeof(cand), "%s/%s", app_slice, de->d_name);
+                        if (w > 0 && (size_t)w < sizeof(cand))
+                                push_if_dir(out, cand);
+                }
+        }
+        closedir(d);
+}
+
+static void add_cgroups_for_window(int pid, StrVec *out)
+{
+        add_candidates(pid, out);
+        add_descendant_cgroups(pid, out, 3);
+        add_pattern_scopes(pid, out);
+}
+
 /* ------------------------------------------------------ socket discovery */
 
 static const char *runtime_dir(char *buf, size_t len)
@@ -1013,7 +1092,7 @@ static void reconcile(const char *cmd_sock)
                 collect_pinned(&clients, &pids);
 
         for (size_t i = 0; i < pids.n; i++)
-                add_candidates(pids.v[i], &desired);
+                add_cgroups_for_window(pids.v[i], &desired);
 
         /*
          * Idempotent apply.  This is a full reconcile, not an edge trigger:
@@ -1866,8 +1945,8 @@ def main() -> None:
         fail("dusky-oom-shield failed to build with both makepkg and sanitised flags")
 
     run_sysctl(["systemctl", "daemon-reload"], quiet_ok=False)
-    run_sysctl(["systemctl", "enable", "--now", "systemd-oomd.service"], quiet_ok=False)
-    run_sysctl(["systemctl", "restart", "systemd-oomd.service"], quiet_ok=False)
+    run_sysctl(["systemctl", "enable", "--now", "systemd-oomd.socket", "systemd-oomd.service"], quiet_ok=False)
+    run_sysctl(["systemctl", "restart", "systemd-oomd.socket", "systemd-oomd.service"], quiet_ok=False)
     reload_user_managers()
 
     oomd_ok = subprocess.run(["systemctl", "is-active", "--quiet", "systemd-oomd.service"],
