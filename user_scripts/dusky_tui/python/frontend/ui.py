@@ -11,6 +11,8 @@ import math
 import copy
 import sys
 import threading
+import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, override
 from collections import deque, defaultdict
@@ -32,6 +34,10 @@ from textual.widget import Widget
 
 from rich.text import Text
 from rich.cells import cell_len
+
+
+LOGGER = logging.getLogger(__name__)
+_TARGET_UNREADABLE = object()
 
 from python.frontend.core_types import (
     ConfigItem,
@@ -86,16 +92,26 @@ class EnginesLoaded(Message):
 # =============================================================================
 # RENDERABLE CACHE & PRESET MATRIX
 # =============================================================================
+@dataclass(frozen=True, slots=True)
+class OptionCacheKey:
+    uid: str
+    kind: str
+    presentation: tuple[Any, ...]
+    state: tuple[Any, ...]
+
+
 class OptionTextCache:
-    __slots__ = ("_maxsize", "_data", "hits", "misses")
+    __slots__ = ("_maxsize", "_data", "_uid_index", "_kind_index", "hits", "misses")
 
     def __init__(self, maxsize: int = 2048) -> None:
         self._maxsize = max(64, maxsize)
-        self._data: dict[tuple, Text] = {}
+        self._data: dict[OptionCacheKey, Text] = {}
+        self._uid_index: defaultdict[str, set[OptionCacheKey]] = defaultdict(set)
+        self._kind_index: defaultdict[str, set[OptionCacheKey]] = defaultdict(set)
         self.hits = 0
         self.misses = 0
 
-    def get(self, key: tuple) -> Text | None:
+    def get(self, key: OptionCacheKey) -> Text | None:
         txt = self._data.pop(key, None)
         if txt is None:
             self.misses += 1
@@ -104,37 +120,55 @@ class OptionTextCache:
         self.hits += 1
         return txt.copy()
 
-    def put(self, key: tuple, txt: Text) -> Text:
+    def put(self, key: OptionCacheKey, txt: Text) -> Text:
         if key in self._data:
-            del self._data[key]
+            self._drop(key)
         elif len(self._data) >= self._maxsize:
-            del self._data[next(iter(self._data))]
+            self._drop(next(iter(self._data)))
         self._data[key] = txt.copy()
+        self._uid_index[key.uid].add(key)
+        self._kind_index[key.kind].add(key)
         return txt
 
-    def invalidate_uid(self, uid: str) -> None:
-        kill = [k for k in self._data if k[0] == uid or (len(k) > 1 and k[1] in ("menu", "preset"))]
-        for k in kill:
-            del self._data[k]
+    def invalidate_uid(self, uid: str, *, include_presets: bool = False) -> None:
+        kill = set(self._uid_index.get(uid, ()))
+        if include_presets:
+            kill.update(self._kind_index.get("preset", ()))
+        for key in kill:
+            self._drop(key)
 
     def invalidate_presets(self) -> None:
-        kill = [k for k in self._data if len(k) > 1 and k[1] == "preset"]
-        for k in kill:
-            del self._data[k]
+        for key in tuple(self._kind_index.get("preset", ())):
+            self._drop(key)
+
+    def _drop(self, key: OptionCacheKey) -> None:
+        self._data.pop(key, None)
+        uid_keys = self._uid_index.get(key.uid)
+        if uid_keys is not None:
+            uid_keys.discard(key)
+            if not uid_keys:
+                self._uid_index.pop(key.uid, None)
+        kind_keys = self._kind_index.get(key.kind)
+        if kind_keys is not None:
+            kind_keys.discard(key)
+            if not kind_keys:
+                self._kind_index.pop(key.kind, None)
 
     def clear(self) -> None:
         self._data.clear()
+        self._uid_index.clear()
+        self._kind_index.clear()
 
 
 class PresetMatchMatrix:
     """
     Structural index built once; current serialized values updated incrementally.
-    ratio() is O(1). on_item_changed is O(affected) via inverted dependency index.
+    ratio() is O(1). Changes update the preset counters directly.
     """
     __slots__ = (
         "_app", "_current", "_exists", "_defaults", "_expected",
         "_all_defaults", "_matches", "_totals", "_preset_uids",
-        "_configurable_uids", "_uid_set", "_item_to_presets"
+        "_configurable_uids", "_uid_set"
     )
 
     def __init__(self, app: Any) -> None:
@@ -149,7 +183,6 @@ class PresetMatchMatrix:
         self._preset_uids: list[str] = []
         self._configurable_uids: list[str] = []
         self._uid_set: set[str] = set()
-        self._item_to_presets: defaultdict[str, set[str]] = defaultdict(set)
 
     def rebuild(self, configurable_items: Any) -> None:
         self._current.clear()
@@ -162,7 +195,6 @@ class PresetMatchMatrix:
         self._preset_uids.clear()
         self._configurable_uids.clear()
         self._uid_set.clear()
-        self._item_to_presets.clear()
 
         items: list[Any] = []
         presets: list[Any] = []
@@ -177,6 +209,10 @@ class PresetMatchMatrix:
 
         for item in items:
             uid = item.uid
+            # A UID is a logical setting.  Duplicate presentations of it must
+            # contribute once to a preset ratio.
+            if uid in self._uid_set:
+                continue
             self._configurable_uids.append(uid)
             self._uid_set.add(uid)
             self._current[uid] = item.serialize(item.value)
@@ -194,19 +230,19 @@ class PresetMatchMatrix:
                 if key_path == "__ALL_DEFAULTS__":
                     continue
                 exp[key_path] = self._serialize_payload(key_path, raw)
-                self._item_to_presets[key_path].add(puid)
             self._expected[puid] = exp
-            if all_def:
-                for uid in self._configurable_uids:
-                    self._item_to_presets[uid].add(puid)
             self._recompute_preset(puid)
 
     def ingest_items(self, items: Any) -> None:
         touched = False
+        seen: set[str] = set()
         for it in items:
             if it.type_ in ("preset", "action", "menu"):
                 continue
             uid = it.uid
+            if uid in seen:
+                continue
+            seen.add(uid)
             self._current[uid] = it.serialize(it.value)
             self._defaults[uid] = it.serialize(it.default)
             self._exists[uid] = bool(it.exists_in_target)
@@ -245,7 +281,11 @@ class PresetMatchMatrix:
         self._current[uid] = new_ser
         self._exists[uid] = new_exists
 
-        affected_presets = self._item_to_presets.get(uid) or self._preset_uids
+        # Settings omitted from a payload are matched against their defaults,
+        # so every setting can affect every preset's ratio.
+        affected_presets = self._preset_uids
+        if not old_exists and not new_exists:
+            return
         for puid in affected_presets:
             exp = self._expected_for(puid, uid)
             if old_exists and not new_exists:
@@ -277,13 +317,25 @@ class PresetMatchMatrix:
         return self._matches.get(puid, 0) / total
 
     def _serialize_payload(self, uid: str, raw: Any) -> str:
-        # Canonical index is _items_by_uid (list of duplicates); use first entry's ConfigItem for typing.
+        # Canonical index is _items_by_uid (list of duplicate presentations);
+        # serialize with the default-target presentation when available.
         items_for_uid = getattr(self._app, "_items_by_uid", {}).get(uid)
         if items_for_uid:
             try:
-                # _items_by_uid[uid] is list[(tab_idx, item_idx, ConfigItem)]
-                first = items_for_uid[0]
-                item = first[2] if isinstance(first, tuple) and len(first) == 3 else first
+                # Prefer the canonical/default target when a UID is shown in
+                # several per-target presentations.
+                item = None
+                for candidate in items_for_uid:
+                    candidate_item = candidate[2] if isinstance(candidate, tuple) and len(candidate) == 3 else candidate
+                    try:
+                        if self._app._get_item_engine_info(candidate_item) == self._app.default_engine_key:
+                            item = candidate_item
+                            break
+                    except Exception:
+                        item = item or candidate_item
+                if item is None:
+                    item = items_for_uid[0]
+                    item = item[2] if isinstance(item, tuple) and len(item) == 3 else item
                 return item.serialize(raw)
             except Exception:
                 pass
@@ -1045,35 +1097,55 @@ class SearchScreen(ModalScreen[tuple[int, int] | None]):
     def on_mount(self) -> None:
         self.query_one(Input).focus()
         self._search_cache = []
+        self._search_timer: Timer | None = None
+        self._last_query = None
 
         for tab_idx, tab_items in self.app.schema.items():
             tab_name = self.app.tabs[tab_idx] if tab_idx < len(self.app.tabs) else f"Tab {tab_idx}"
             for item_idx, item in enumerate(tab_items):
-                haystack = f"{tab_name} {item.label} {item.key} {item.type_}".lower().replace(" ", "")
-                self._search_cache.append((tab_idx, item_idx, item, tab_name, haystack))
+                label_norm = item.label.casefold()
+                haystack = f"{tab_name} {item.label} {item.key} {item.type_}".casefold()
+                haystack_compact = "".join(haystack.split())
+                self._search_cache.append(
+                    (tab_idx, item_idx, item, tab_name, label_norm, haystack, haystack_compact)
+                )
 
         self._populate_list("")
 
+    def on_unmount(self) -> None:
+        if self._search_timer is not None:
+            self._search_timer.stop()
+            self._search_timer = None
+
     @on(Input.Changed)
     def handle_input(self, event: Input.Changed) -> None:
-        self._populate_list(event.value)
+        if self._search_timer is not None:
+            self._search_timer.stop()
+        self._search_timer = self.set_timer(
+            0.05,
+            lambda query=event.value: self._populate_list(query),
+        )
 
-    def _populate_list(self, query: str) -> None:
+    def _populate_list(self, query: str, *, force: bool = False) -> None:
+        query_key = query.casefold().strip()
+        if not force and query_key == self._last_query:
+            return
+        self._last_query = query_key
         ol = self.query_one(OptionList)
         ol.clear_options()
         self.results = []
 
-        query_lower = query.lower().strip()
-        query_no_space = query_lower.replace(" ", "")
+        query_lower = query_key
+        query_no_space = "".join(query_key.split())
         scored_results = []
 
-        for tab_idx, item_idx, item, tab_name, haystack in self._search_cache:
+        for tab_idx, item_idx, item, tab_name, label_norm, haystack, haystack_compact in self._search_cache:
             if not query_no_space:
                 scored_results.append((100, tab_idx, item_idx, item, tab_name))
                 continue
 
             score = 0
-            lbl = item.label.lower()
+            lbl = label_norm
 
             if query_lower == lbl:
                 score += 100
@@ -1086,8 +1158,8 @@ class SearchScreen(ModalScreen[tuple[int, int] | None]):
             q_idx, s_idx = 0, 0
             match_positions = []
 
-            while q_idx < len(query_no_space) and s_idx < len(haystack):
-                if query_no_space[q_idx] == haystack[s_idx]:
+            while q_idx < len(query_no_space) and s_idx < len(haystack_compact):
+                if query_no_space[q_idx] == haystack_compact[s_idx]:
                     match_positions.append(s_idx)
                     q_idx += 1
                 s_idx += 1
@@ -1129,6 +1201,11 @@ class SearchScreen(ModalScreen[tuple[int, int] | None]):
     @on(Input.Submitted)
     def on_input_submitted(self, event: Input.Submitted) -> None:
         event.stop()
+
+        if self._search_timer is not None:
+            self._search_timer.stop()
+            self._search_timer = None
+        self._populate_list(event.value, force=True)
 
         ol = self.query_one(OptionList)
         if ol.highlighted is not None and ol.highlighted < len(self.results):
@@ -2250,7 +2327,7 @@ Tooltip {
         self.auto_save = (default_mode.lower() == "auto")
 
         # External target modification tracking.
-        self.last_target_mtimes: dict[tuple[str, str], float] = {}
+        self.last_target_mtimes: dict[tuple[str, str], tuple[int, int, int] | None] = {}
         self._initial_target_mtimes_set: bool = False
 
         # Lazy tab population state.
@@ -2260,11 +2337,18 @@ Tooltip {
         # Schema indexes.
         self._items_by_uid: dict[str, list[tuple[int, int, ConfigItem]]] = {}
         self._items_by_engine: dict[tuple[str, str], list[tuple[int, int, ConfigItem]]] = {}
+        self._children_by_parent: defaultdict[tuple[int, str], list[ConfigItem]] = defaultdict(list)
         self._configurable_items: list[tuple[int, int, ConfigItem]] = []
         self._preset_items: list[tuple[int, int, ConfigItem]] = []
 
         # Async save / stale-write protection.
         self._write_generation: dict[str, int] = {}
+        self._active_save_count = 0
+        self._save_tasks: set[asyncio.Task[Any]] = set()
+        self._save_task_keys: dict[asyncio.Task[Any], set[str]] = {}
+        self._save_auth_pending = 0
+        self._save_failure_pending = False
+        self._quit_after_save = False
         # _save_lock is already declared above (line ~2005); do not re-declare.
         self._sudo_keepalive: Timer | None = None
 
@@ -2294,11 +2378,8 @@ Tooltip {
         if not self.auto_save and self.pending_commits:
             def on_reply(reply: str) -> None:
                 if reply == "save":
-                    def on_quit_save(success: bool):
-                        if success:
-                            self.exit()
-
-                    self.action_save_batch(on_complete=on_quit_save)
+                    self._quit_after_save = True
+                    self.action_save_batch()
 
                 elif reply == "discard":
                     self.exit()
@@ -2310,18 +2391,19 @@ Tooltip {
         if self.auto_save and self._save_timers:
             for (ti, ii), timer in list(self._save_timers.items()):
                 timer.stop()
+                self._bump_write_generation_for_item(self.schema[ti][ii])
                 self.pending_commits.add((ti, ii))
 
             self._save_timers.clear()
             self._pending_autosave_args.clear()
 
-            def on_auto_quit_save(success: bool):
-                if success:
-                    self.exit()
-                else:
-                    self.notify_status("Quit aborted: Could not save final changes.", level="warning")
+            self._quit_after_save = True
+            self.action_save_batch()
+            return
 
-            self.action_save_batch(on_complete=on_auto_quit_save)
+        if self._save_tasks or self._save_auth_pending:
+            self._quit_after_save = True
+            self.notify_status("Waiting for the current save to finish.", level="info")
             return
 
         self.exit()
@@ -2431,7 +2513,10 @@ Tooltip {
 
     def _on_item_value_changed(self, item: ConfigItem) -> None:
         if hasattr(self, "_option_cache"):
-            self._option_cache.invalidate_uid(item.uid)
+            self._option_cache.invalidate_uid(
+                item.uid,
+                include_presets=item.type_ not in ("preset", "action", "menu"),
+            )
         if item.type_ not in ("preset", "action", "menu"):
             # Preset matching is global-only: per-file overrides (e.g. per-game GPU) should NOT
             # pollute the global preset ratio. Only default-engine items participate.
@@ -2442,12 +2527,20 @@ Tooltip {
             except Exception:
                 if hasattr(self, "_preset_matrix"):
                     self._preset_matrix.on_item_changed(item)
-            if hasattr(self, "_option_cache"):
-                self._option_cache.invalidate_presets()
         self._schema_dirty_counter += 1
         cur = self._current_tab_index()
         if cur is not None:
             self._tab_dirty.add(cur)
+
+    def _has_pending_save_for_key(self, uek: str) -> bool:
+        for item, _value, _old in getattr(self, "_pending_autosave_args", {}).values():
+            if self._uid_engine_key(item) == uek:
+                return True
+        for tab_idx, item_idx in getattr(self, "pending_commits", set()):
+            item = self._get_schema_item(tab_idx, item_idx)
+            if item is not None and self._uid_engine_key(item) == uek:
+                return True
+        return any(uek in keys for keys in getattr(self, "_save_task_keys", {}).values())
 
     def _get_item_engine_info(self, item: ConfigItem) -> tuple[str, str]:
         """
@@ -2529,6 +2622,7 @@ Tooltip {
         self._key_map.clear()
         self._items_by_uid.clear()
         self._items_by_engine.clear()
+        self._children_by_parent.clear()
         self._configurable_items.clear()
         self._preset_items.clear()
 
@@ -2538,6 +2632,9 @@ Tooltip {
 
                 self._key_map[uid] = (t_idx, i_idx)
                 self._items_by_uid.setdefault(uid, []).append((t_idx, i_idx, item))
+
+                if item.parent_ref:
+                    self._children_by_parent[(t_idx, str(item.parent_ref))].append(item)
 
                 try:
                     ekey = self._get_item_engine_info(item)
@@ -2608,35 +2705,28 @@ Tooltip {
         if tab_idx is None:
             tab_idx = self._current_tab_index()
 
-        items_in_tab = self.schema.get(tab_idx, [])
-
-        child_uids = set()
-        child_keys = set()
-        stack = []
-        if parent_key:
-            stack.append(parent_key)
-        if parent_uid:
-            stack.append(parent_uid)
+        child_items: list[ConfigItem] = []
+        seen_items: set[int] = set()
+        stack = [ref for ref in (parent_key, parent_uid) if ref]
 
         while stack:
-            curr = stack.pop()
-            for itm in items_in_tab:
-                p_ref = getattr(itm, "parent_ref", None)
-                if p_ref and p_ref == curr:
-                    u = self._get_item_uid(itm)
-                    if u not in child_uids:
-                        child_uids.add(u)
-                        child_keys.add(itm.key)
-                        if getattr(itm, "is_parent", False) or getattr(itm, "type_", None) == "menu":
-                            if itm.key:
-                                stack.append(itm.key)
-                            stack.append(u)
+            curr = str(stack.pop())
+            for itm in self._children_by_parent.get((tab_idx, curr), ()):
+                marker = id(itm)
+                if marker in seen_items:
+                    continue
+                seen_items.add(marker)
+                child_items.append(itm)
+                if getattr(itm, "is_parent", False) or getattr(itm, "type_", None) == "menu":
+                    if itm.key:
+                        stack.append(itm.key)
+                    stack.append(self._get_item_uid(itm))
 
         any_modified = parent_modified
         any_pending = parent_pending
 
-        for itm in items_in_tab:
-            if (itm.key in child_keys or self._get_item_uid(itm) in child_uids) and itm.type_ not in ("menu", "action", "preset"):
+        for itm in child_items:
+            if itm.type_ not in ("menu", "action", "preset"):
                 v_ser = itm.serialize(itm.value)
                 d_ser = itm.serialize(itm.default)
                 init_val = itm.initial_value if getattr(itm, "initial_value", None) is not None else itm.value
@@ -2674,20 +2764,35 @@ Tooltip {
             is_pending = (val_ser != init_ser)
             is_modified = (val_ser != def_ser)
 
-        cache_key = (
-            item.uid,
-            item.type_,
-            val_ser,
-            item.exists_in_target,
-            is_pending,
-            is_modified,
-            is_highlighted,
-            indent_prefix,
-            item.expanded,
-            bool(item.warning_msg),
-            item.is_parent,
-            ratio_bucket,
-            getattr(self, "_theme_version", 0)
+        try:
+            engine_identity = self._get_item_engine_info(item)
+        except Exception:
+            engine_identity = self.default_engine_key
+        cache_key = OptionCacheKey(
+            uid=item.uid,
+            kind=item.type_,
+            presentation=(
+                tab_idx,
+                item.key,
+                item.label,
+                tuple(item.options or ()),
+                tuple(item.hints or ()),
+                engine_identity,
+            ),
+            state=(
+                val_ser,
+                item.exists_in_target,
+                is_pending,
+                is_modified,
+                is_highlighted,
+                indent_prefix,
+                item.expanded,
+                bool(item.warning_msg),
+                item.is_parent,
+                ratio_bucket,
+                self.auto_save,
+                getattr(self, "_theme_version", 0),
+            ),
         )
 
         if hasattr(self, "_option_cache"):
@@ -2966,11 +3071,36 @@ Tooltip {
     # =========================================================================
     # USER PRESETS
     # =========================================================================
-    def _load_user_presets(self) -> None:
+    def _read_user_presets(self) -> list[tuple[str, dict[str, Any], str | None]]:
         if not self.enable_user_presets:
-            return
+            return []
 
         self.user_presets_dir.mkdir(parents=True, exist_ok=True)
+        records: list[tuple[str, dict[str, Any], str | None]] = []
+        for file_path in sorted(
+            (p for p in self.user_presets_dir.iterdir() if p.name.endswith(".json")),
+            key=lambda p: p.stem.lower(),
+        ):
+            name = file_path.stem
+            warning = None
+            try:
+                with file_path.open("r", encoding="utf-8") as stream:
+                    payload = json.load(stream)
+                if not isinstance(payload, dict):
+                    payload = {"__INVALID__": True, "__ERROR__": "Expected JSON object"}
+                    warning = "Invalid preset payload: expected JSON object"
+            except json.JSONDecodeError as exc:
+                payload = {"__INVALID__": True, "__ERROR__": str(exc)}
+                warning = "Invalid preset JSON file"
+            records.append((name, payload, warning))
+        return records
+
+    def _apply_user_presets(
+        self,
+        preset_records: list[tuple[str, dict[str, Any], str | None]],
+    ) -> None:
+        if not self.enable_user_presets:
+            return
 
         # Remove dynamically added User Presets from previous loads.
         for t_idx, items in self.schema.items():
@@ -3027,22 +3157,7 @@ Tooltip {
 
         user_preset_items = [reset_btn, save_btn, import_btn]
 
-        for file_path in sorted(self.user_presets_dir.glob("*.json"), key=lambda p: p.stem.lower()):
-            name = file_path.stem
-            warning = None
-
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    payload = json.load(f)
-
-                if not isinstance(payload, dict):
-                    payload = {"__INVALID__": True, "__ERROR__": "Expected JSON object"}
-                    warning = "Invalid preset payload: expected JSON object"
-
-            except Exception as e:
-                payload = {"__INVALID__": True, "__ERROR__": str(e)}
-                warning = "Invalid preset JSON file"
-
+        for name, payload, warning in preset_records:
             new_item = ConfigItem(
                 label=f"User: {name}",
                 key=f"__user_preset_{name}",
@@ -3066,6 +3181,10 @@ Tooltip {
 
         self.schema[self.user_presets_tab_idx].extend(user_preset_items)
         self._schema_dirty_counter += 1
+
+    def _load_user_presets(self) -> None:
+        """Synchronous compatibility wrapper for already UI-bound callers."""
+        self._apply_user_presets(self._read_user_presets())
 
     # =========================================================================
     # EXTERNAL EDITING
@@ -3325,7 +3444,9 @@ Tooltip {
     @work(exclusive=True, group="engine-boot", exit_on_error=False)
     async def run_deferred_boot(self, *, initial_tab: int = 0) -> None:
         self._init_boot_state()
-        await asyncio.to_thread(self._load_user_presets)
+        preset_records = await asyncio.to_thread(self._read_user_presets)
+        self._apply_user_presets(preset_records)
+        self._rebuild_indexes()
 
         need_now = self._engines_for_tab(initial_tab) if self.tabs else set()
         deferred = set(self.engine_pool) - need_now
@@ -3353,7 +3474,6 @@ Tooltip {
         else:
             self._mark_boot_complete_if_done()
 
-    @work(exclusive=True, group="engine-boot", exit_on_error=False)
     async def _load_engines_async(self, engine_keys: set[tuple[str, str]]) -> None:
         if not engine_keys:
             return
@@ -3555,7 +3675,7 @@ Tooltip {
 
             self._tab_data_ready.add(tab_idx)
 
-            if tab_idx in self._populated_tabs or tab_idx in self._tab_populated or tab_idx == current_idx:
+            if tab_idx == current_idx:
                 self._populate_option_list(tab_idx)
                 self._populated_tabs.add(tab_idx)
                 self._tab_dirty.discard(tab_idx)
@@ -3580,6 +3700,9 @@ Tooltip {
 
     def _refresh_single_ui(self, tab_idx: int, item_idx: int, item: ConfigItem) -> None:
         if tab_idx not in self._tab_populated:
+            self._tab_dirty.add(tab_idx)
+            return
+        if tab_idx != self._current_tab_index():
             self._tab_dirty.add(tab_idx)
             return
 
@@ -3643,9 +3766,12 @@ Tooltip {
             pass
 
     def _refresh_all_ui(self) -> None:
+        current_tab = self._current_tab_index()
         for tab_idx in self.schema.keys():
-            if tab_idx in self._tab_populated:
+            if tab_idx == current_tab and tab_idx in self._tab_populated:
                 self._populate_option_list(tab_idx)
+            elif tab_idx in self._tab_populated:
+                self._tab_dirty.add(tab_idx)
             else:
                 self._tab_dirty.add(tab_idx)
 
@@ -3669,6 +3795,7 @@ Tooltip {
         if not new:
             for (ti, ii), timer in list(self._save_timers.items()):
                 timer.stop()
+                self._bump_write_generation_for_item(self.schema[ti][ii])
                 self.pending_commits.add((ti, ii))
 
             self._save_timers.clear()
@@ -3806,6 +3933,18 @@ Tooltip {
     # =========================================================================
     # WATCHERS
     # =========================================================================
+    @staticmethod
+    def _target_fingerprint(path: Path) -> tuple[int, int, int] | None | object:
+        """Return a replacement-safe file identity for external-change polling."""
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            LOGGER.warning("Unable to stat target file %s: %s", path, exc)
+            return _TARGET_UNREADABLE
+        return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+
     async def watch_target_file(self) -> None:
         try:
             changed_any = False
@@ -3816,68 +3955,100 @@ Tooltip {
 
                 path = Path(engine.target_path).expanduser().resolve()
 
-                try:
-                    stat_info = await asyncio.to_thread(path.stat)
-                    current_mtime = stat_info.st_mtime
-                except FileNotFoundError:
-                    if self._initial_target_mtimes_set:
-                        for t_idx, i_idx, item in self._items_by_engine.get(e_key, []):
-                            if item.type_ in ("action", "preset", "menu"):
-                                continue
+                fingerprint = await asyncio.to_thread(self._target_fingerprint, path)
+                previous = self.last_target_mtimes.get(e_key)
 
-                            if item.exists_in_target:
-                                item.exists_in_target = False
-                                self._bump_write_generation(self._get_item_uid(item))
-                                changed_any = True
-                    continue
-                except OSError:
+                if fingerprint is _TARGET_UNREADABLE:
                     continue
 
                 if not self._initial_target_mtimes_set:
-                    self.last_target_mtimes[e_key] = current_mtime
+                    self.last_target_mtimes[e_key] = fingerprint
                     continue
 
-                if current_mtime > self.last_target_mtimes.get(e_key, 0.0):
-                    self.last_target_mtimes[e_key] = current_mtime
+                items_for_engine = [
+                    (t_idx, i_idx, item)
+                    for t_idx, i_idx, item in self._items_by_engine.get(e_key, [])
+                    if item.type_ not in ("action", "preset", "menu")
+                ]
+                items_by_uek: defaultdict[str, list[tuple[int, int, ConfigItem]]] = defaultdict(list)
+                for t_idx, i_idx, item in items_for_engine:
+                    items_by_uek[self._uid_engine_key(item)].append((t_idx, i_idx, item))
 
-                    try:
-                        new_state = await asyncio.to_thread(engine.load_state)
-                    except Exception:
+                if fingerprint is None:
+                    if previous is None:
+                        continue
+                    # Keep the missing fingerprint so a recreated file is
+                    # recognized even if it gets an older timestamp.
+                    accepted = True
+                    for uek, grouped_items in items_by_uek.items():
+                        if self._has_pending_save_for_key(uek):
+                            accepted = False
+                            continue
+                        group_changed = False
+                        for _t_idx, _i_idx, item in grouped_items:
+                            if item.exists_in_target:
+                                item.exists_in_target = False
+                                self._on_item_value_changed(item)
+                                group_changed = True
+                        if group_changed:
+                            self._bump_write_generation(uek)
+                            changed_any = True
+                    if accepted:
+                        self.last_target_mtimes[e_key] = None
+                    continue
+
+                if fingerprint == previous:
+                    continue
+
+                reload_generations = {
+                    uek: self._write_generation.get(uek, 0)
+                    for uek in items_by_uek
+                }
+                try:
+                    new_state = await asyncio.to_thread(engine.load_state)
+                except Exception as exc:
+                    # Do not consume the fingerprint when parsing/loading
+                    # failed; the next poll can retry the same file.
+                    LOGGER.warning("Unable to reload %s: %s", path, exc)
+                    continue
+
+                accepted = True
+                for uek, grouped_items in items_by_uek.items():
+                    # A queued or running local save owns this logical setting;
+                    # let it finish instead of applying an older disk snapshot.
+                    if (
+                        self._write_generation.get(uek, 0) != reload_generations[uek]
+                        or self._has_pending_save_for_key(uek)
+                    ):
+                        accepted = False
                         continue
 
-                    for t_idx, i_idx, item in self._items_by_engine.get(e_key, []):
-                        if not self.auto_save and (t_idx, i_idx) in self.pending_commits:
-                            continue
-
-                        if item.type_ in ("action", "preset", "menu"):
-                            continue
-
+                    group_changed = False
+                    for _t_idx, _i_idx, item in grouped_items:
                         raw = self._lookup_state(new_state, item)
-
                         if raw is not None:
                             new_val = item.deserialize(raw)
-
-                            if str(item.value) != str(new_val):
-                                item.value = new_val
-                                item.exists_in_target = True
-                                self._on_item_value_changed(item)
-                                self._bump_write_generation(self._get_item_uid(item))
-                                changed_any = True
-
+                            expected_exists = True
                         else:
-                            expected_exists = (item.default != "nil")
-                            expected_val = item.default if expected_exists else item.value
+                            expected_exists = item.default != "nil"
+                            new_val = item.default if expected_exists else item.value
 
-                            if item.exists_in_target != expected_exists or str(item.value) != str(expected_val):
-                                item.exists_in_target = expected_exists
+                        value_changed = item.serialize(item.value) != item.serialize(new_val)
+                        existence_changed = item.exists_in_target != expected_exists
+                        if value_changed or existence_changed:
+                            item.value = new_val
+                            item.exists_in_target = expected_exists
+                            self._on_item_value_changed(item)
+                            group_changed = True
 
-                                if expected_exists:
-                                    item.value = expected_val
+                    if group_changed:
+                        self._bump_write_generation(uek)
+                        changed_any = True
 
-                                # Always notify – existence toggle affects preset totals.
-                                self._on_item_value_changed(item)
-                                self._bump_write_generation(self._get_item_uid(item))
-                                changed_any = True
+                # Consume the fingerprint only after every item has been
+                # reconciled successfully; failures above must be retried.
+                if accepted:
+                    self.last_target_mtimes[e_key] = fingerprint
 
             if not self._initial_target_mtimes_set:
                 self._initial_target_mtimes_set = True
@@ -3889,7 +4060,7 @@ Tooltip {
                 self.notify_status("Config modified externally. Refreshed UI.")
 
         except Exception:
-            pass
+            LOGGER.exception("Unexpected error while watching target files")
 
     async def update_telemetry(self) -> None:
         if self.telemetry_engine:
@@ -3898,13 +4069,12 @@ Tooltip {
                 banner = self.query_one("#telemetry-banner", Label)
                 banner.update(msg)
             except Exception:
-                pass
+                LOGGER.exception("Telemetry update failed")
 
     async def watch_presets_dir(self) -> None:
         if (
             not self.enable_user_presets
             or not hasattr(self, "user_presets_dir")
-            or not self.user_presets_dir.exists()
         ):
             return
 
@@ -3913,33 +4083,36 @@ Tooltip {
                 self._preset_mtimes = {}
 
             def check_mtimes():
-                return {f.name: f.stat().st_mtime for f in self.user_presets_dir.glob("*.json")}
+                result = {}
+                for file_path in self.user_presets_dir.iterdir():
+                    if not file_path.name.endswith(".json"):
+                        continue
+                    stat = file_path.stat()
+                    result[file_path.name] = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+                return result
 
             current_mtimes = await asyncio.to_thread(check_mtimes)
             changed_any = False
 
             for fname, mtime in current_mtimes.items():
-                if self._preset_mtimes.get(fname, 0.0) < mtime:
+                if self._preset_mtimes.get(fname) != mtime:
                     changed_any = True
                     break
 
             if set(self._preset_mtimes.keys()) - set(current_mtimes.keys()):
                 changed_any = True
 
-            if not getattr(self, "_initial_presets_mtime_set", False):
+            if changed_any or not getattr(self, "_initial_presets_mtime_set", False):
+                preset_records = await asyncio.to_thread(self._read_user_presets)
+                self._apply_user_presets(preset_records)
+                self._rebuild_indexes()
                 self._preset_mtimes = current_mtimes
                 self._initial_presets_mtime_set = True
-                return
-
-            if changed_any:
                 self._schema_dirty_counter += 1
-                self._preset_mtimes = current_mtimes
-                self._load_user_presets()
-                self._rebuild_indexes()
                 self._refresh_all_ui()
 
         except Exception:
-            pass
+            LOGGER.exception("Unexpected error while watching preset files")
 
     async def watch_theme_file(self) -> None:
         if not self.theme_path:
@@ -3970,7 +4143,7 @@ Tooltip {
                     self._update_footer_legend()
 
         except Exception:
-            pass
+            LOGGER.exception("Unexpected error while watching theme file")
 
     def apply_theme_to_engine(self) -> None:
         self._theme_toggle = not getattr(self, "_theme_toggle", False)
@@ -4454,6 +4627,13 @@ Tooltip {
         for uek in uid_engines:
             self._bump_write_generation(uek)
 
+        # Keep the edit generation that belongs to this transaction.  A
+        # later edit can legitimately return to the same serialized value;
+        # comparing values alone would let an older failed batch roll it back.
+        transaction_generations = {
+            uek: self._write_generation.get(uek, 0) for uek in uid_engines
+        }
+
         if self.auto_save:
             def finalize_transaction(batch_success: bool):
                 successful_parts = []
@@ -4464,10 +4644,20 @@ Tooltip {
                         failed_parts.append((t, i, o, n))
 
                         item = self.schema[t][i]
-                        item.value = n if action_type == "undo" else o
-                        self._on_item_value_changed(item)
-                        self._refresh_single_ui(t, i, item)
-                        self.pending_commits.discard((t, i))
+                        expected = o if action_type == "undo" else n
+                        uek = self._uid_engine_key(item)
+                        generation_unchanged = (
+                            self._write_generation.get(uek, 0)
+                            == transaction_generations.get(uek, -1)
+                        )
+                        if (
+                            generation_unchanged
+                            and item.serialize(item.value) == item.serialize(expected)
+                        ):
+                            item.value = n if action_type == "undo" else o
+                            self._on_item_value_changed(item)
+                            self._refresh_single_ui(t, i, item)
+                            self.pending_commits.discard((t, i))
                     else:
                         successful_parts.append((t, i, o, n))
 
@@ -4593,13 +4783,15 @@ Tooltip {
         val_str = item.serialize(new_val)
 
         if self.auto_save and not batch_mode:
+            if not self._save_tasks and self._save_auth_pending == 0:
+                self._save_failure_pending = False
             k = (tab_idx, item_idx)
             gen = self._bump_write_generation(self._uid_engine_key(item))
 
             self._save_timers[k] = self.set_timer(
                 0.25,
                 lambda ti=tab_idx, ii=item_idx, it=item, vs=val_str, ov=old_val, g=gen, tx=transaction:
-                    asyncio.create_task(self._do_auto_save_async(ti, ii, it, vs, ov, g, tx, False))
+                    self._start_save_task(self._do_auto_save_async(ti, ii, it, vs, ov, g, tx, False))
             )
 
             self._pending_autosave_args[k] = (item, val_str, old_val)
@@ -4632,6 +4824,62 @@ Tooltip {
     # =========================================================================
     # ASYNC AUTO SAVE
     # =========================================================================
+    def _start_save_task(self, coroutine: Any) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coroutine)
+        self._save_tasks.add(task)
+        task.add_done_callback(self._on_save_task_done)
+        return task
+
+    def _on_save_task_done(self, task: asyncio.Task[Any]) -> None:
+        self._save_tasks.discard(task)
+        getattr(self, "_save_task_keys", {}).pop(task, None)
+        if task.cancelled():
+            self._save_failure_pending = True
+        else:
+            try:
+                if task.exception() is not None:
+                    self._save_failure_pending = True
+            except Exception:
+                self._save_failure_pending = True
+        self._maybe_finish_quit()
+
+    async def _run_save_io(self, func: Any, /, *args: Any, **kwargs: Any) -> Any:
+        """Run blocking save/auth I/O while draining the worker on cancellation."""
+        worker = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+        try:
+            await asyncio.wait({worker})
+            return worker.result()
+        except asyncio.CancelledError:
+            # Repeated cancellation must not cancel the worker or release the
+            # caller's save lock while its blocking write is still running.
+            while not worker.done():
+                try:
+                    await asyncio.wait({worker})
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            try:
+                worker.result()
+            except Exception:
+                LOGGER.exception("Save I/O failed while draining cancellation")
+            finally:
+                raise
+
+    def _maybe_finish_quit(self) -> None:
+        if (
+            self._quit_after_save
+            and not self._save_tasks
+            and self._save_auth_pending == 0
+            and not self._save_timers
+        ):
+            self._quit_after_save = False
+            if self._save_failure_pending or self.pending_commits:
+                self._save_failure_pending = False
+                self.notify_status("Quit aborted: pending changes were not fully saved.", level="warning")
+            else:
+                self.exit()
+
     async def _do_auto_save_async(
         self,
         tab_idx: int,
@@ -4647,9 +4895,23 @@ Tooltip {
         self._pending_autosave_args.pop((tab_idx, item_idx), None)
 
         uek = self._uid_engine_key(item)
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            task_keys = getattr(self, "_save_task_keys", None)
+            if task_keys is None:
+                task_keys = self._save_task_keys = {}
+            task_keys.setdefault(current_task, set()).add(uek)
 
         if force:
+            if (
+                self._write_generation.get(uek) != generation
+                or item.serialize(item.value) != item.serialize(old_val)
+            ):
+                return
             self._apply_transaction_to_ram(transaction, undo=False)
+            # Applying the retry transaction advances the generation.  The
+            # new value is the one that must survive the lock wait and write.
+            generation = self._write_generation.get(uek, generation)
         else:
             if self._write_generation.get(uek) != generation:
                 return
@@ -4663,28 +4925,54 @@ Tooltip {
         try:
             engine = self._get_engine_for_item(item)
         except Exception as e:
+            self._save_failure_pending = True
             self.notify_status(f"Engine Error: {e}", level="error")
             self._revert_transaction(transaction)
+            self._maybe_finish_quit()
             return
 
         async with self._save_lock:
+            # A newer edit may have happened while this save waited for the
+            # serialized write lock.  Validate again immediately before I/O.
+            if (
+                self._write_generation.get(uek) != generation
+                or item.serialize(item.value) != val_str
+            ):
+                return
+
+            self._active_save_count += 1
             try:
-                success, msg, _ = await asyncio.to_thread(
-                    engine.write_value,
-                    item.key,
-                    item.scope,
-                    val_str,
-                    item_type=item.type_
-                )
-            except Exception as e:
-                success, msg = False, f"Engine Error: {e}"
+                try:
+                    success, msg, _ = await self._run_save_io(
+                        engine.write_value,
+                        item.key,
+                        item.scope,
+                        val_str,
+                        item_type=item.type_
+                    )
+                except Exception as e:
+                    success, msg = False, f"Engine Error: {e}"
+            finally:
+                self._active_save_count -= 1
 
         if success:
+            # The write may have completed after a newer edit was made.  Do
+            # not report the old value as current or roll anything back.
+            if self._write_generation.get(uek) != generation:
+                return
             try:
                 ekey = self._get_item_engine_info(item)
-                self.last_target_mtimes[ekey] = Path(engine.target_path).expanduser().resolve().stat().st_mtime
-            except OSError:
+                if engine.target_path:
+                    fingerprint = self._target_fingerprint(Path(engine.target_path).expanduser().resolve())
+                    if isinstance(fingerprint, tuple):
+                        self.last_target_mtimes[ekey] = fingerprint
+            except (OSError, TypeError):
                 pass
+
+            # A completed write is a state transition too.  Advancing the
+            # generation prevents an external reload that began earlier from
+            # replacing the value just committed.
+            self._bump_write_generation(uek)
 
             if is_trigger_item(item):
                 def reset_trigger():
@@ -4693,25 +4981,42 @@ Tooltip {
                 self.set_timer(0.15, reset_trigger)
 
             self.notify_status(f"Updated {item.label}", level="success")
+            self._maybe_finish_quit()
             return
 
         if "AUTH_REQUIRED" in msg:
+            if (
+                self._write_generation.get(uek) != generation
+                or item.serialize(item.value) != val_str
+            ):
+                return
             if isinstance(self.screen, PasswordScreen):
                 self.notify_status("Another authorization is already in progress.", level="warning")
+                self._save_failure_pending = True
                 self._revert_transaction(transaction)
                 return
 
             self._revert_transaction(transaction)
+            generation = self._write_generation.get(uek, generation)
 
             def on_pwd(pwd: str | None) -> None:
-                asyncio.create_task(self._on_auto_password(pwd, tab_idx, item_idx, item, val_str, old_val, generation, transaction))
+                self._start_save_task(self._on_auto_password(pwd, tab_idx, item_idx, item, val_str, old_val, generation, transaction))
 
+            self._save_auth_pending += 1
             self.push_screen(PasswordScreen(), on_pwd)
             return
 
+        if (
+            self._write_generation.get(uek) != generation
+            or item.serialize(item.value) != val_str
+        ):
+            return
+
         self.notify_status(f"Error: {msg}", level="error")
+        self._save_failure_pending = True
         self._revert_transaction(transaction)
         self.play_reset_sound()
+        self._maybe_finish_quit()
 
     async def _on_auto_password(
         self,
@@ -4724,13 +5029,25 @@ Tooltip {
         generation: int,
         transaction: list[tuple[int, int, Any, Any]]
     ) -> None:
+        self._save_auth_pending = max(0, self._save_auth_pending - 1)
         if pwd:
-            auth_res = await asyncio.to_thread(
-                subprocess.run,
-                ["sudo", "-S", "-v"],
-                input=(pwd + "\n").encode(),
-                capture_output=True
-            )
+            try:
+                auth_res = await self._run_save_io(
+                    subprocess.run,
+                    ["sudo", "-S", "-v"],
+                    input=(pwd + "\n").encode(),
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                    env={**os.environ, "LC_ALL": "C"},
+                )
+            except subprocess.TimeoutExpired:
+                self.notify_status("Sudo authentication timed out.", level="error")
+                self._save_failure_pending = True
+                self._maybe_finish_quit()
+                return
+            finally:
+                pwd = None
 
             if auth_res.returncode == 0:
                 self.notify_status("Sudo authenticated. Retrying...", level="info")
@@ -4748,9 +5065,12 @@ Tooltip {
                 )
             else:
                 self.notify_status("Incorrect sudo password.", level="error")
+                self._save_failure_pending = True
                 self.play_reset_sound()
         else:
             self.notify_status("Sudo authentication cancelled.", level="warning")
+            self._save_failure_pending = True
+        self._maybe_finish_quit()
 
     def _start_sudo_keepalive(self) -> None:
         if self._sudo_keepalive is None:
@@ -4780,16 +5100,20 @@ Tooltip {
 
         self.trigger_shortcut_blink("ctrl-s")
 
+        if not self._save_tasks and self._save_auth_pending == 0:
+            self._save_failure_pending = False
+
         if not self.pending_commits:
             self.notify_status("No pending changes.", level="info")
             if on_complete:
                 on_complete(True)
+            self._maybe_finish_quit()
             return True
 
         if self._save_lock is None:
             self._save_lock = asyncio.Lock()
 
-        asyncio.create_task(self._save_batch_async(on_complete))
+        self._start_save_task(self._save_batch_async(on_complete))
         return True
 
     async def _save_batch_async(self, on_complete=None) -> None:
@@ -4840,20 +5164,28 @@ Tooltip {
                 changes = [b[0] for b in batch]
 
                 try:
-                    success, msg, _ = await asyncio.to_thread(engine.write_batch, changes)
+                    success, msg, _ = await self._run_save_io(engine.write_batch, changes)
                 except Exception as e:
                     success, msg = False, f"Engine Error: {e}"
 
                 if success:
+                    committed_ueks: set[str] = set()
                     for _change, key, frozen_str, frozen_val, itm in batch:
                         if mark_success(key, frozen_str, frozen_val, itm):
                             success_count += 1
+                            committed_ueks.add(self._uid_engine_key(itm))
                             if is_trigger_item(itm):
                                 self._reset_trigger_ui(itm)
 
+                    for uek in committed_ueks:
+                        self._bump_write_generation(uek)
+
                     try:
-                        self.last_target_mtimes[ekey] = Path(engine.target_path).expanduser().resolve().stat().st_mtime
-                    except OSError:
+                        if engine.target_path:
+                            fingerprint = self._target_fingerprint(Path(engine.target_path).expanduser().resolve())
+                            if isinstance(fingerprint, tuple):
+                                self.last_target_mtimes[ekey] = fingerprint
+                    except (OSError, TypeError):
                         pass
                 else:
                     if "AUTH_REQUIRED" in msg:
@@ -4861,12 +5193,13 @@ Tooltip {
                         break
 
                     engine_success_count = 0
+                    committed_ueks = set()
 
                     for change, key, frozen_str, frozen_val, itm in batch:
                         key_s, scope, val_str, itype = change
 
                         try:
-                            ok, item_msg, _ = await asyncio.to_thread(
+                            ok, item_msg, _ = await self._run_save_io(
                                 engine.write_value,
                                 key_s,
                                 scope,
@@ -4880,12 +5213,16 @@ Tooltip {
                             if mark_success(key, frozen_str, frozen_val, itm):
                                 success_count += 1
                                 engine_success_count += 1
+                                committed_ueks.add(self._uid_engine_key(itm))
                                 if is_trigger_item(itm):
                                     self._reset_trigger_ui(itm)
 
                             try:
-                                self.last_target_mtimes[ekey] = Path(engine.target_path).expanduser().resolve().stat().st_mtime
-                            except OSError:
+                                if engine.target_path:
+                                    fingerprint = self._target_fingerprint(Path(engine.target_path).expanduser().resolve())
+                                    if isinstance(fingerprint, tuple):
+                                        self.last_target_mtimes[ekey] = fingerprint
+                            except (OSError, TypeError):
                                 pass
                         else:
                             if "AUTH_REQUIRED" in item_msg:
@@ -4896,6 +5233,9 @@ Tooltip {
                                 self.pending_commits.discard(key)
                                 self._reset_trigger_ui(itm)
 
+                    for uek in committed_ueks:
+                        self._bump_write_generation(uek)
+
                     if auth_required:
                         break
 
@@ -4905,19 +5245,21 @@ Tooltip {
         if self._save_queued_during_run:
             self._save_queued_during_run = False
             if self.pending_commits:
-                asyncio.create_task(self._save_batch_async(on_complete))
+                self._start_save_task(self._save_batch_async(on_complete))
                 return
 
         if auth_required:
             if isinstance(self.screen, PasswordScreen):
                 self.notify_status("Another authorization is already in progress.", level="warning")
+                self._save_failure_pending = True
                 if on_complete:
                     on_complete(False)
                 return
 
             def on_pwd_batch(pwd: str | None) -> None:
-                asyncio.create_task(self._on_batch_password(pwd, on_complete))
+                self._start_save_task(self._on_batch_password(pwd, on_complete))
 
+            self._save_auth_pending += 1
             self.push_screen(PasswordScreen(), on_pwd_batch)
             return
 
@@ -4925,10 +5267,12 @@ Tooltip {
             self.notify_status(f"Batched {success_count} commits successfully.", level="success")
             self.play_reset_sound()
         elif success_count > 0:
+            self._save_failure_pending = True
             first_err = error_msgs[0] if error_msgs else "Unknown Engine Error"
             self.notify_status(f"Partial success ({success_count} applied). Error: {first_err}", level="warning")
             self.play_reset_sound()
         else:
+            self._save_failure_pending = True
             first_err = error_msgs[0] if error_msgs else "Unknown Engine Error"
             self.notify_status(f"Batch Error: {first_err}", level="error")
 
@@ -4940,9 +5284,10 @@ Tooltip {
             on_complete(final_success)
 
     async def _on_batch_password(self, pwd: str | None, on_complete=None) -> None:
+        self._save_auth_pending = max(0, self._save_auth_pending - 1)
         if pwd:
             try:
-                auth_res = await asyncio.to_thread(
+                auth_res = await self._run_save_io(
                     subprocess.run,
                     ["sudo", "-S", "-v"],
                     input=(pwd + "\n").encode(),
@@ -4953,8 +5298,10 @@ Tooltip {
                 )
             except subprocess.TimeoutExpired:
                 self.notify_status("Sudo authentication timed out.", level="error")
+                self._save_failure_pending = True
                 if on_complete:
                     on_complete(False)
+                self._maybe_finish_quit()
                 return
             finally:
                 pwd = None
@@ -4965,12 +5312,15 @@ Tooltip {
                 self.action_save_batch(on_complete=on_complete)
             else:
                 self.notify_status("Incorrect sudo password. Batch aborted.", level="error")
+                self._save_failure_pending = True
                 if on_complete:
                     on_complete(False)
         else:
             self.notify_status("Sudo authentication cancelled.", level="warning")
+            self._save_failure_pending = True
             if on_complete:
                 on_complete(False)
+        self._maybe_finish_quit()
 
     # =========================================================================
     # GLOBAL ACTIONS
@@ -6070,6 +6420,10 @@ Tooltip {
             is_all_defaults = payload.get("__ALL_DEFAULTS__", False)
 
             for t_idx, i_idx, target_item in self._configurable_items:
+                # Presets are snapshots of the default target.  Per-target
+                # overrides sharing the same UID must not be changed by one.
+                if self._get_item_engine_info(target_item) != self.default_engine_key:
+                    continue
                 if not target_item.exists_in_target:
                     skipped += 1
                     continue
