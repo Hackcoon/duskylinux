@@ -8653,13 +8653,12 @@ if _HAS_UI:
             self.push_screen(LogSearchScreen(title, lines))
 
         def _update_header_state(self) -> None:
-            # Visible active filter/follow/child-input state in the header.
+            # Visible active filter/child-input state in the header.
             with suppress(Exception):
                 title = self.query_one("#header_title", Static)
                 bits = []
                 if self.filter_mode != "all":
                     bits.append(f"filter:{self.filter_mode}")
-                bits.append(f"follow:{'on' if self.follow_mode else 'off'}")
                 if self.child_input_mode:
                     bits.append("child-input")
                 suffix = f" [{' '.join(bits)}]" if bits else ""
