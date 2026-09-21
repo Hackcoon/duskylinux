@@ -63,5 +63,9 @@
     #placeholder { background-color: var(--background) !important; color: var(--on_background) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1F%23placeholder%1Fbg | bg: background */
     svg.r-uvuy5l.r-cfp7ip { background: transparent !important; box-shadow: none !important; } /* dusky key=sel%1Fsvg.r-uvuy5l.r-cfp7ip%1Fbg | bg: transparent */
     button.r-1loqt21.r-1ny4l3l { background: transparent !important; box-shadow: none !important; } /* dusky key=sel%1Fbutton.r-1loqt21.r-1ny4l3l%1Fbg | bg: transparent */
+    div.r-k4xj1c.r-g2wdr4.r-6koalj { background-color: var(--surface_variant) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.r-k4xj1c.r-g2wdr4.r-6koalj%1Fbg | bg: surface_variant */
+    div.r-kemksi { background-color: var(--surface_container_low) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.r-kemksi%1Fbg | bg: surface_container_low */
+    div.r-g2wdr4.r-nsbfu8 { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.r-g2wdr4.r-nsbfu8%1Fbg | bg: surface */
+    div.r-1kqtdi0.r-1udh08x.r-g2wdr4 { background-color: var(--surface_bright) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.r-1kqtdi0.r-1udh08x.r-g2wdr4%1Fbg | bg: surface_bright */
     /* <<< dusky:picks */
 }
