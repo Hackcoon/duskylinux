@@ -3479,6 +3479,7 @@ Screen, ListView, RichLog, ScrollBar, #sidebar {{
     scrollbar-background: transparent;
     scrollbar-background-hover: transparent;
     scrollbar-background-active: transparent;
+    scrollbar-size-horizontal: 0;
 }}
 #sidebar {{
     width: {sidebar_w}%; 
@@ -3495,8 +3496,9 @@ Screen, ListView, RichLog, ScrollBar, #sidebar {{
 ContentSwitcher {{ height: 1fr; width: 100%; }}
 RichLog {{
     height: 1fr; background: transparent; color: {THEME['fg']};
-    border: none; padding: 0 0 0 1;
+    border: none; padding: 0;
     scrollbar-size-vertical: 1;
+    overflow-x: hidden;
 }}
 ListView {{ background: transparent; overflow-x: hidden; height: 100%; scrollbar-size-vertical: 1; }}
 ListView:focus {{ background-tint: transparent 0%; }}
@@ -6840,16 +6842,16 @@ if _HAS_UI:
             else:
                 note = f"{summary.get('collisions')} work-tree collision(s) backed up."
                 if summary.get("collision_backup"):
-                    note += f" Backup: {payload['collision_backup']}"
+                    note += f" Backup: {summary.get('collision_backup')}"
             self.log_task(f"[dim]{note}[/dim]", 2)
 
             self.log_task(f"\n[bold {THEME['accent']}]Snapshot[/]", 3)
             if unrelated:
                 note = "Full tracked-tree backup performed during diverged-history recovery."
                 if summary.get("local_mods"):
-                    note += f" {payload['local_mods']} local tracked modification(s) backed up for restore."
+                    note += f" {summary.get('local_mods')} local tracked modification(s) backed up for restore."
                     if summary.get("local_mods_backup"):
-                        note += f" Backup: {payload['local_mods_backup']}"
+                        note += f" Backup: {summary.get('local_mods_backup')}"
             elif summary.get("local_mods") is None:
                 note = "No snapshot details recorded."
             elif summary.get("local_mods") == 0:
@@ -6857,7 +6859,7 @@ if _HAS_UI:
             else:
                 note = f"{summary.get('local_mods')} local tracked modification(s) backed up."
                 if summary.get("local_mods_backup"):
-                    note += f" Backup: {payload['local_mods_backup']}"
+                    note += f" Backup: {summary.get('local_mods_backup')}"
             self.log_task(f"[dim]{note}[/dim]", 3)
 
             self.log_task(f"\n[bold {THEME['accent']}]Apply Bare Updates (Reset)[/]", 4)
@@ -6908,8 +6910,9 @@ if _HAS_UI:
                     with suppress(Exception):
                         list_view = self.query_one("#task_list", ListView)
                         target_pos = index + 1
-                        if list_view.index is None or list_view.index <= target_pos:
-                            list_view.index = target_pos
+                        list_view.index = target_pos
+                        switcher = self.query_one("#log_switcher", ContentSwitcher)
+                        switcher.current = f"log-task-{index}"
 
             if new_status in terminal and index not in self._finalized:
                 self._finalized.add(index)
@@ -6933,12 +6936,6 @@ if _HAS_UI:
             item = event.item
             if item is None:
                 return
-            # Manual navigation disables auto-follow so background progress
-            # never steals the selected log while the user is reading.
-            if isinstance(item, TaskItem) and getattr(item, "status", "") != "running":
-                if getattr(self, "follow_mode", True):
-                    self.follow_mode = False
-                    self.log_main("[dim]Follow mode off (manual navigation). Ctrl+G resumes.[/dim]")
             switcher = self.query_one("#log_switcher", ContentSwitcher)
             if isinstance(item, MainLogItem):
                 switcher.current = "log-main"
@@ -6946,6 +6943,10 @@ if _HAS_UI:
                 switcher.current = "log-report"
             elif isinstance(item, TaskItem):
                 switcher.current = f"log-task-{item.task_index}"
+
+        def on_list_view_selected(self, event: ListView.Selected) -> None:
+            self.follow_mode = False
+            self._update_header_state()
 
         def _queue_pty_write(self, data: bytes) -> None:
             """Enqueue child-input bytes preserving order with a byte bound.
@@ -8752,10 +8753,14 @@ if _HAS_UI:
             return None
 
         def action_tree_down(self) -> None:
+            self.follow_mode = False
+            self._update_header_state()
             with suppress(Exception):
                 self.query_one("#task_list", ListView).action_cursor_down()
 
         def action_tree_up(self) -> None:
+            self.follow_mode = False
+            self._update_header_state()
             with suppress(Exception):
                 self.query_one("#task_list", ListView).action_cursor_up()
 
