@@ -1,8 +1,0 @@
-@-moz-document domain("claude.ai") {
-    /* >>> dusky:picks - managed by the Visual Picker, one rule per line */
-    div { background-color: var(--background) !important; color: var(--on_background) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv%1Fbg | bg: background */
-    body { background-color: var(--background) !important; color: var(--on_background) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fbody%1Fbg | bg: background */
-    div.flex-1.flex-col { background-color: var(--background) !important; color: var(--on_background) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.flex-1.flex-col%1Fbg | bg: background */
-    svg.shrink-0 { fill: var(--primary) !important; color: var(--primary) !important; } /* dusky key=sel%1Fsvg.shrink-0%1Ffill | fill: primary */
-    /* <<< dusky:picks */
-}
