@@ -36,5 +36,10 @@
     div.flex-col.contain-inline-size { background-color: var(--surface_container) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.flex-col.contain-inline-size%1Fbg | bg: surface_container */
     div.-m-1 > div.translucent-surface:nth-of-type(1) > div { display: none !important; } /* dusky key=sel%1Fdiv.-m-1%20%3E%20div.translucent-surface%3Anth-of-type(1)%20%3E%20div%1Fdisplay | hidden */
     button.-my-1\.5.-ms-2.-me-2\.5 > div > span.btn-secondary.btn.btn-small { display: none !important; } /* dusky key=sel%1Fbutton.-my-1%5C.5.-ms-2.-me-2%5C.5%20%3E%20div%20%3E%20span.btn-secondary.btn.btn-small%1Fdisplay | hidden */
+    div:nth-of-type(2) > div.grid-cols-2:nth-of-type(2) > div:nth-of-type(1) { background-color: var(--inverse_on_surface) !important; } /* dusky key=sel%1Fdiv%3Anth-of-type(2)%20%3E%20div.grid-cols-2%3Anth-of-type(2)%20%3E%20div%3Anth-of-type(1)%1Fbg | bg: inverse_on_surface */
+    div:nth-of-type(2) > div.grid-cols-2:nth-of-type(2) > div:nth-of-type(2) { background-color: var(--on_secondary_fixed_variant) !important; } /* dusky key=sel%1Fdiv%3Anth-of-type(2)%20%3E%20div.grid-cols-2%3Anth-of-type(2)%20%3E%20div%3Anth-of-type(2)%1Fbg | bg: on_secondary_fixed_variant */
+    div.grid-cols-2 { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.grid-cols-2%1Fbg | bg: surface */
+    div.ms-auto.shrink-0 { background-color: var(--inverse_on_surface) !important; } /* dusky key=sel%1Fdiv.ms-auto.shrink-0%1Fbg | bg: inverse_on_surface */
+    div.flex-col { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.flex-col%1Fbg | bg: surface */
     /* <<< dusky:picks */
 }
