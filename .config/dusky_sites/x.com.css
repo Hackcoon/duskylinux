@@ -67,5 +67,6 @@
     div.r-kemksi { background-color: var(--surface_container_low) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.r-kemksi%1Fbg | bg: surface_container_low */
     div.r-g2wdr4.r-nsbfu8 { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.r-g2wdr4.r-nsbfu8%1Fbg | bg: surface */
     div.r-1kqtdi0.r-1udh08x.r-g2wdr4 { background-color: var(--surface_bright) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.r-1kqtdi0.r-1udh08x.r-g2wdr4%1Fbg | bg: surface_bright */
+    body { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fbody%1Fbg | bg: surface */
     /* <<< dusky:picks */
 }
