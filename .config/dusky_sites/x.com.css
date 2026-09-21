@@ -61,5 +61,7 @@
     circle { fill: var(--on_primary) !important; color: var(--on_primary) !important; } /* dusky key=sel%1Fcircle%1Ffill | fill: on_primary */
     svg.r-4qtqp9.r-yyyyoo.r-bnwqim { fill: var(--secondary_fixed_dim) !important; color: var(--secondary_fixed_dim) !important; } /* dusky key=sel%1Fsvg.r-4qtqp9.r-yyyyoo.r-bnwqim%1Ffill | fill: secondary_fixed_dim */
     #placeholder { background-color: var(--background) !important; color: var(--on_background) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1F%23placeholder%1Fbg | bg: background */
+    svg.r-uvuy5l.r-cfp7ip { background: transparent !important; box-shadow: none !important; } /* dusky key=sel%1Fsvg.r-uvuy5l.r-cfp7ip%1Fbg | bg: transparent */
+    button.r-1loqt21.r-1ny4l3l { background: transparent !important; box-shadow: none !important; } /* dusky key=sel%1Fbutton.r-1loqt21.r-1ny4l3l%1Fbg | bg: transparent */
     /* <<< dusky:picks */
 }
