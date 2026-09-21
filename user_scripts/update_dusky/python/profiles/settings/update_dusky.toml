@@ -241,8 +241,8 @@ GIT_OPTIONAL_LOCKS = "0"
 # AUTOMATED INTERACTIVE PROMPTS
 # ------------------------------------------------------------------------------
 [prompts]
-# Minimum delay in seconds between auto-responding to matching interactive prompt patterns
 cooldown = 0.35
+allow_insecure_password_autofeed = true
 
 [[prompts.rules]]
 name = "sudo_password"
@@ -250,8 +250,28 @@ pattern = "(?i)(\\[sudo\\] password for [^:]+:|^\\s*Password:\\s*$|sudo: a passw
 kind = "password"
 
 [[prompts.rules]]
+name = "pgp_import"
+pattern = "(?i)(::\\s*Import PGP key.*\\?\\s*\\[Y/n\\]|::\\s*Append key\\?.*\\[Y/n\\]|Import PGP key.*\\?\\s*\\[Y/n\\])"
+kind = "yes"
+
+[[prompts.rules]]
 name = "pacman_proceed"
 pattern = "(?i)::\\s*(Proceed with (?:installation|download|upgrade)|Continue (?:installation|download|upgrade)).*\\?\\s*\\[Y/n\\]"
+kind = "yes"
+
+[[prompts.rules]]
+name = "pacman_replace"
+pattern = "(?i)::\\s*Replace\\s+.*\\?\\s*\\[Y/n\\]"
+kind = "yes"
+
+[[prompts.rules]]
+name = "pacman_remove_conflict"
+pattern = "(?i)::\\s*Remove conflicting file.*\\?\\s*\\[Y/n\\]"
+kind = "yes"
+
+[[prompts.rules]]
+name = "aur_proceed"
+pattern = "(?i)(Proceed with installation\\?|Continue building\\?|Continue installing\\?|::\\s*Proceed with (?:installation|download|build).*\\?\\s*\\[Y/n\\])"
 kind = "yes"
 
 [[prompts.rules]]

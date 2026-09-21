@@ -10,15 +10,15 @@ Reference guide for `update_dusky.py` synchronization mechanics, backup strategi
 - **Git Directory (`GIT_DIR`)**: `~/dusky` ([L2314](file:///home/dusk/user_scripts/update_dusky/python/update_dusky.py#L2314)) — Bare repository
 - **Upstream Tracking Ref**: `refs/dusky-updater/upstream/<branch>` ([L3368](file:///home/dusk/user_scripts/update_dusky/python/update_dusky.py#L3368))
 
-### The 5 Sync Tasks ([GitEngine.execute_phase: L3367](file:///home/dusk/user_scripts/update_dusky/python/update_dusky.py#L3367))
+### The 5 Sync Tasks
 
 | Task | Name | Primary Function | Core Action |
 | :---: | :--- | :--- | :--- |
-| **0** | **Bare Repo Validation** | [_get_repo_state](file:///home/dusk/user_scripts/update_dusky/python/update_dusky.py#L2778) | Validates permissions & ownership. Clears stale locks (>60s). Auto-clones if absent. |
-| **1** | **Fetch & Diff** | [_fetch_with_retry](file:///home/dusk/user_scripts/update_dusky/python/update_dusky.py#L2885) | Fetches upstream ref. Evaluates `merge-base` for fast-forward, diverged, or unrelated history. |
-| **2** | **Collision Backup** | [_backup_worktree_collisions](file:///home/dusk/user_scripts/update_dusky/python/update_dusky.py#L2975) | Moves untracked work-tree files colliding with incoming tracked paths to `moved_aside_<ts>`. |
-| **3** | **Atomic Snapshot** | [_capture_tracked_changes](file:///home/dusk/user_scripts/update_dusky/python/update_dusky.py#L3079) | Backs up local tracked edits/deletions (`diff-index HEAD`) to `your_changes_<ts>` with a `MANIFEST.txt`. |
-| **4** | **Reset & Restore** | [_restore_user_modifications](file:///home/dusk/user_scripts/update_dusky/python/update_dusky.py#L3253) | Runs `git reset --hard`, then restores local changes or stages conflicts in `manual_merge_<ts>`. |
+| **0** | **Bare Repo Validation** | `_get_repo_state` | Validates permissions & ownership and bare-repo identity. Refuses on git locks or in-progress merge/rebase (never auto-removes locks). Auto-clones (staged temp dir, published only on success) if absent. |
+| **1** | **Fetch & Diff** | `_fetch_with_retry` | Fetches upstream ref, snapshots the target commit OID (`rev-parse <ref>^{commit}` + `cat-file -t`), and uses the OID throughout. Rejects incoming trees overlapping protected storage. |
+| **2** | **Collision Backup** | `_backup_worktree_collisions` | Moves colliding paths to `moved_aside_<ts>/payload/` with journal in `.meta/`. Fails closed on `ls-tree`/`ls-files` errors. |
+| **3** | **Snapshot** | `_capture_tracked_changes` | Backs up local tracked edits (`diff-index HEAD`, fail-closed) to `your_changes_<ts>/payload/` with manifest in `.meta/` plus staged blobs in `.meta/staged/`. Full snapshots verify every copy and abort reset on omission. |
+| **4** | **Reset & Restore** | `_restore_user_modifications` | Runs `git reset --hard <OID>`, gates incoming scripts (preserves deletions, blocks and restores invalid scripts from previous commit), then restores or stages conflicts in `manual_merge_<ts>`. Preserves backups on any uncertainty. |
 
 ---
 
@@ -109,15 +109,41 @@ flowchart TD
 
 ## 6. Backup Storage Strategy
 
-Backups are saved under `~/.local/share/dusky/backups/` ([backups_dir(): L117](file:///home/dusk/user_scripts/update_dusky/python/update_dusky.py#L117)):
+Backups are saved under `~/Documents/dusky_backups/` (configurable via `paths.backups_subdir`):
 
 | Directory | Created By | Purpose | Retention |
 | :--- | :--- | :--- | :--- |
-| `moved_aside_<ts>` | Task 2 ([L3040](file:///home/dusk/user_scripts/update_dusky/python/update_dusky.py#L3040)) | Untracked work-tree collisions | Permanent |
-| `your_changes_<ts>` | Task 3 ([L3126](file:///home/dusk/user_scripts/update_dusky/python/update_dusky.py#L3126)) | Pre-reset local tracked edits | Removed after restore |
-| `full_snapshot_<ts>` | Task 3 ([L3171](file:///home/dusk/user_scripts/update_dusky/python/update_dusky.py#L3171)) | Full tracked tree snapshot (unrelated history) | Permanent |
-| `repo_history_<ts>` | Task 1 ([L3216](file:///home/dusk/user_scripts/update_dusky/python/update_dusky.py#L3216)) | Copy of `~/dusky` bare repo before diverged reset | Permanent |
-| `manual_merge_<ts>` | Task 4 ([L3313](file:///home/dusk/user_scripts/update_dusky/python/update_dusky.py#L3313)) | User versions conflicting with upstream updates | Permanent |
+| `moved_aside_<ts>` | Task 2 | Untracked work-tree collisions (`payload/` + `.meta/JOURNAL.txt`, `.meta/STATUS=pending-collision`) | Never auto-pruned; requires explicit user action |
+| `your_changes_<ts>` | Task 3 | Pre-reset local tracked edits (`payload/` + `.meta/MANIFEST.txt`, staged blobs in `.meta/staged/`) | Auto-pruned only when `.meta/STATUS=completed` and older than `backup_retention_days`; otherwise preserved |
+| `full_snapshot_<ts>` | Task 3 | Full tracked tree snapshot (`payload/` + `.meta/EXPECTED.txt`) | Never auto-pruned; requires explicit user action |
+| `repo_history_<ts>` | Task 1 | Copy of `~/dusky` bare repo before diverged reset | Never auto-pruned; requires explicit user action |
+| `manual_merge_<ts>` | Task 4 | User versions conflicting with upstream updates | Never auto-pruned; requires explicit user action |
+| `quarantined_incoming_<ts>` | Gate | Invalid incoming scripts moved out of the worktree with reasons in `.meta/QUARANTINED.txt` | Never auto-pruned; requires explicit user action |
+
+> The syntax gate fails closed: unreadable trees never read as empty, git
+> symlinks (mode 120000) are skipped by policy, and exact paths use
+> `:(literal)` pathspecs. Self-update restarts keep the operation lock across
+> exec and carry exact git outcomes plus the sudo askpass in a bound
+> single-use handoff file (`handoff_<run_id>.json` in the runtime dir);
+> no password bytes cross the exec and no singleton diff file is reused.
+
+> Payload/metadata separation: `INFO.txt`, `MANIFEST.txt`, `MOVED_PATHS.txt`, `STATUS`, and journals live under `.meta/`; worktree copies live under `payload/`. Staging is preserved under `.meta/staged/` for recovery but never auto-restored.
+
+> **Intentional staging-restoration policy**: staged (index) content is preserved for manual recovery, never auto-restored. A backup containing any staged blob, mode record (`STAGED_MODES.txt`), or staged deletion (`MANIFEST.txt` `staged:absent`) is retained as `pending-staged` and never marked `completed`, even when worktree bytes happen to match. Byte equality with `WORK_TREE` alone does not prove index mode/type/deletion is preserved.
+
+> **File permissions**: regular-file restores preserve the backed-up file's mode (via `copystat` + `chmod` before atomic `replace`), verified (content/type/mode) before the backup is deleted. `0755`/`0644`, local `chmod` edits, and symlinks (recreated as symlinks, never write-through) are covered. A failed `replace` or verification leaves both the destination and the payload recoverable.
+
+> **Read-only SQLite access**: `StateStore`/`OnceStore` in read-only/dry-run mode connect directly to existing databases with SQLite's `mode=ro` (seeing committed WAL data naturally without copying files or manual sidecar manipulation). When a database does not exist, an in-memory instance is used without mutating the filesystem. Real database errors surface normally.
+
+> **Process lifecycle**: `_terminate_process_group` performs bounded shutdown of the process group (SIGTERM → grace → SIGKILL), ensuring children and spawned descendants do not outlive their tasks. Standard UNIX process group signaling is used directly without slow `/proc` iteration loops. Interactive tasks run with clean terminal restoration.
+
+> **PTY input**: Keystrokes and automated prompts are routed directly and reliably to the active child pseudo-terminal, preserving ordering and interactive control.
+
+> **Restart handoff**: When the updater, profile, or settings change during sync, a simple continuation payload carries the held lock descriptor, acquired sudo capability, and previous git task outcomes across `execv`. The child re-adopts the lock and sudo state without re-prompting or losing exclusivity.
+
+> **UI bootstrap**: no auto-installation. Missing `textual`/`rich` prints an explicit `sudo pacman -S` command and exits before mutations. Info commands and dry-run never install.
+
+> **Child-input keys**: reserved emergency shortcuts are ONLY `Ctrl+O` (leave child-input) and `Ctrl+Q` (emergency abort), both priority bindings. All other keys (Escape `\x1b`, `Ctrl+F`/`Ctrl+L`, function keys, Tab, arrows, printable) are non-priority and reach the child in child-input mode. Unrelated bindings are disabled via `check_action` in child-input mode; modals and `Input` focus are preserved.
 
 ---
 
