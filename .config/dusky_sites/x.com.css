@@ -59,5 +59,7 @@
     svg.r-4qtqp9.r-yyyyoo.r-dnmrzs > g > path { fill: var(--primary) !important; color: var(--primary) !important; } /* dusky key=sel%1Fsvg.r-4qtqp9.r-yyyyoo.r-dnmrzs%20%3E%20g%20%3E%20path%1Ffill | fill: primary */
     div[role="alert"] { background-color: var(--on_tertiary) !important; } /* dusky key=sel%1Fdiv%5Brole%3D%22alert%22%5D%1Fbg | bg: on_tertiary */
     circle { fill: var(--on_primary) !important; color: var(--on_primary) !important; } /* dusky key=sel%1Fcircle%1Ffill | fill: on_primary */
+    svg.r-4qtqp9.r-yyyyoo.r-bnwqim { fill: var(--secondary_fixed_dim) !important; color: var(--secondary_fixed_dim) !important; } /* dusky key=sel%1Fsvg.r-4qtqp9.r-yyyyoo.r-bnwqim%1Ffill | fill: secondary_fixed_dim */
+    #placeholder { background-color: var(--background) !important; color: var(--on_background) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1F%23placeholder%1Fbg | bg: background */
     /* <<< dusky:picks */
 }
