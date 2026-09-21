@@ -68,5 +68,6 @@
     div.r-g2wdr4.r-nsbfu8 { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.r-g2wdr4.r-nsbfu8%1Fbg | bg: surface */
     div.r-1kqtdi0.r-1udh08x.r-g2wdr4 { background-color: var(--surface_bright) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.r-1kqtdi0.r-1udh08x.r-g2wdr4%1Fbg | bg: surface_bright */
     body { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fbody%1Fbg | bg: surface */
+    div > div.r-1q9bdsx.r-1udh08x.r-18u37iz > div.r-dnmrzs.r-nsbfu8 { background-color: var(--surface_container_highest) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv%20%3E%20div.r-1q9bdsx.r-1udh08x.r-18u37iz%20%3E%20div.r-dnmrzs.r-nsbfu8%1Fbg | bg: surface_container_highest */
     /* <<< dusky:picks */
 }
