@@ -54,5 +54,6 @@
     div.r-1kihuf0.r-13qz1uu { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.r-1kihuf0.r-13qz1uu%1Fbg | bg: surface */
     div[role="tab"] { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv%5Brole%3D%22tab%22%5D%1Fbg | bg: surface */
     a[role="tab"] { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fa%5Brole%3D%22tab%22%5D%1Fbg | bg: surface */
+    button[role="button"] { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fbutton%5Brole%3D%22button%22%5D%1Fbg | bg: surface */
     /* <<< dusky:picks */
 }
