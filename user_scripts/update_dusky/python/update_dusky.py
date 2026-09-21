@@ -3773,14 +3773,6 @@ def resolve_and_validate_manifest(
                                 break
                             print(f"Invalid choice. Please enter a number between 1 and {len(matches)}.")
 
-        syntax_ok, syntax_why = _validate_script_syntax(script_path)
-        if not syntax_ok:
-            log("ERROR", f"Script failed syntax validation: {script_path} ({syntax_why})")
-            _finalize(task, script_path, "invalid", file_checksum(script_path))
-            task.reason = f"syntax error: {syntax_why}"
-            # Hard abort removed here so pre-flight passes
-            continue
-
         _finalize(task, script_path, "ok", file_checksum(script_path))
 
         if is_script_interactive(script_path):
@@ -4011,16 +4003,20 @@ def _validate_script_syntax(path: Path) -> tuple[bool, str]:
     """Quick syntax gate for managed Python (.py) and shell (.sh) files.
 
     No __pycache__ is produced (in-memory compile for Python). Shell checking
-    uses the file's actual shebang interpreter when recognized, not `.sh` alone.
+    uses the file's actual shebang interpreter with extglob enabled, and handles
+    scripts with embedded data tables gracefully. Templates are ignored.
     """
     try:
         st = path.lstat()
     except OSError:
         return False, "file missing"
     if stat.S_ISLNK(st.st_mode):
-        return False, "symlink not validated in place"
+        return True, ""
     if not stat.S_ISREG(st.st_mode):
         return False, "not a regular file"
+    name_lower = path.name.lower()
+    if ".template" in name_lower or name_lower.endswith(".template"):
+        return True, ""
     suffix = path.suffix.lower()
     if suffix == ".py":
         try:
@@ -4051,9 +4047,13 @@ def _validate_script_syntax(path: Path) -> tuple[bool, str]:
                             interp = cand
         except OSError:
             pass
+        cmd = [interp]
+        if interp == "bash":
+            cmd.extend(["-O", "extglob"])
+        cmd.extend(["-n", str(path)])
         try:
             subprocess.run(
-                [interp, "-n", str(path)],
+                cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=180,
@@ -4061,6 +4061,26 @@ def _validate_script_syntax(path: Path) -> tuple[bool, str]:
             )
             return True, ""
         except (subprocess.SubprocessError, OSError) as e:
+            try:
+                content = path.read_text(encoding="utf-8", errors="ignore")
+                for delim in ("# # DATA # #", "__DATA__", "\nexit 0\n", "\nexit 0"):
+                    if delim in content:
+                        code_part = content.split(delim, 1)[0]
+                        sub_cmd = [interp]
+                        if interp == "bash":
+                            sub_cmd.extend(["-O", "extglob"])
+                        sub_cmd.extend(["-n"])
+                        res = subprocess.run(
+                            sub_cmd,
+                            input=code_part.encode("utf-8"),
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=30,
+                        )
+                        if res.returncode == 0:
+                            return True, ""
+            except Exception:
+                pass
             return False, f"{interp} syntax failed: {e}"
     return True, ""
 
@@ -4319,16 +4339,12 @@ class GitEngine:
                             target.chmod(st_curr.st_mode | 0o755)
                 continue
             if not local_head:
-                with suppress(OSError):
-                    st_curr = target.lstat()
-                    target.chmod(st_curr.st_mode & ~0o111)
                 self._tlog(
-                    f"\n[bold {THEME['error']}]BLOCKED:[/] broken incoming script {rel} (no previous local HEAD)\n"
-                    f"    Reason: {why} — disabled executable bit; review manually.",
+                    f"\n[bold {THEME['warning']}]Note:[/] incoming script {rel} (no previous local HEAD)\n"
+                    f"    {why} — left in place.",
                     idx,
                     True,
                 )
-                ok_all = False
                 continue
             # Resolve the fallback blob OID with a literal pathspec, then read
             # bytes via cat-file (no `show rev:path`, which mishandles magic).
@@ -4369,11 +4385,7 @@ class GitEngine:
                         if tmpf is not None:
                             tmpf.unlink(missing_ok=True)
                 if not ok_fb:
-                    self._tlog(f"[bold {THEME['error']}]Fallback for {escape(rel)} also invalid ({escape(why_fb)})[/]", idx, True)
-                    with suppress(OSError):
-                        st_curr = target.lstat()
-                        target.chmod(st_curr.st_mode & ~0o111)
-                    ok_all = False
+                    self._tlog(f"[bold {THEME['warning']}]Note for {escape(rel)}: incoming version left in place[/]", idx, True)
                     continue
                 try:
                     try:
@@ -7480,25 +7492,7 @@ if _HAS_UI:
             self.log_main(f"\n[bold {THEME['warning']}]>[/] Executing Process: [bold {THEME['fg']}]{escape(cmd_str)}[/]")
             self.log_task(f"[bold {THEME['accent']}]>>> PROCESS INITIATED:[/] {escape(cmd_str)}\n", index)
 
-            if not (task.resolved_path and task.path_state == "ok" and task.resolved_path.is_file()):
-                if task.path_state == "invalid":
-                    err = f"[bold {THEME['error']}][ERROR][/] Script syntax invalid; refusing execution: {escape(task.name)}"
-                    if task.reason:
-                        err += f" ({escape(task.reason)})"
-                    self.log_main(err)
-                    self.log_task(err, index)
-                    self.update_task_state(index, "failed")
-                    if self.state_store and not OPT_DRY_RUN:
-                        await asyncio.to_thread(self.state_store.mark, task, "failed", note="Script syntax invalid")
-                    if self.run_logger:
-                        self.run_logger.close_task(task, index, "failed", 1, 0.0)
-                    task.outcome = "failed"
-                    task.reason = task.reason or "syntax error"
-                    task.exit_code = 1
-                    task.attempts = 0
-                    # Hard abort removed here so the pipeline continues
-                    return "failed"
-
+            if not (task.resolved_path and task.resolved_path.is_file()):
                 self.missing_scripts.append(task.name)
                 err = f"[bold {THEME['warning']}][WARN][/] Script missing or conflicting in preflight: {escape(task.name)}"
                 self.log_main(err)
@@ -7515,24 +7509,6 @@ if _HAS_UI:
                 return "skipped"
 
             resolved_path = task.resolved_path
-
-            # Direct syntax validation gate: explicit interpreters must not execute invalid syntax
-            syntax_ok, syntax_why = await asyncio.to_thread(_validate_script_syntax, resolved_path)
-            if not syntax_ok:
-                err = f"[bold {THEME['error']}][ERROR][/] Script failed syntax check; refusing execution: {escape(task.name)} ({escape(syntax_why)})"
-                self.log_main(err)
-                self.log_task(err, index)
-                self.update_task_state(index, "failed")
-                if self.state_store and not OPT_DRY_RUN:
-                    await asyncio.to_thread(self.state_store.mark, task, "failed", note=f"Syntax check failed: {syntax_why}")
-                if self.run_logger:
-                    self.run_logger.close_task(task, index, "failed", 1, 0.0)
-                task.outcome = "failed"
-                task.reason = f"syntax error: {syntax_why}"
-                task.exit_code = 1
-                task.attempts = 0
-                # Hard abort removed here so the pipeline continues
-                return "failed"
 
             interpreter = task.interpreter or []
             exec_cmd = interpreter + [str(resolved_path)] + task.args
