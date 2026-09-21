@@ -6342,8 +6342,8 @@ if _HAS_UI:
     class ConfirmQuitScreen(ModalScreen[str]):
         BINDINGS = [
             Binding("escape", "cancel", "Cancel", priority=True),
-            Binding("y,a,enter", "confirm_abort", "Abort", priority=True),
-            Binding("n,c,q", "cancel", "Cancel", priority=True),
+            Binding("y,a,q,enter", "confirm_abort", "Abort", priority=True),
+            Binding("n,c", "cancel", "Cancel", priority=True),
         ]
 
         def compose(self) -> ComposeResult:
@@ -6364,9 +6364,9 @@ if _HAS_UI:
 
         def on_key(self, event: events.Key) -> None:
             key = event.key.lower()
-            if key in ("a", "y", "enter", "space"):
+            if key in ("a", "y", "enter", "space", "q"):
                 self.dismiss("abort")
-            elif key in ("c", "n", "escape", "q"):
+            elif key in ("c", "n", "escape"):
                 self.dismiss("cancel")
 
         def action_confirm_abort(self) -> None:
@@ -6592,6 +6592,7 @@ if _HAS_UI:
             self._finalized: set[int] = set()
             self._task_widgets: list = []
             self.exit_code: int = 0
+            self.pipeline_finished: bool = False
             self._restart_handoff: Path | None = None
             self.run_start_mono: float = time.monotonic()
             self.phase_durations: dict[str, float] = {
@@ -6624,23 +6625,23 @@ if _HAS_UI:
             try:
                 from textual.screen import ModalScreen as _Modal
                 if isinstance(getattr(self, "screen", None), _Modal):
-                    return None
+                    return True
             except Exception:
                 pass
             try:
                 from textual.widgets import Input as _Input
                 if isinstance(getattr(self, "focused", None), _Input):
-                    return None
+                    return True
             except Exception:
                 pass
             if getattr(self, "child_input_mode", False) and getattr(self, "current_pty_master", None) is not None:
                 if action in ("toggle_child_input", "request_quit"):
                     # Ctrl+O exits mode, Ctrl+Q emergency aborts (handled in
                     # on_key, but also allow binding path for Ctrl+Q).
-                    return None
+                    return True
                 # All other app bindings disabled in child-input mode.
                 return False
-            return None
+            return True
 
         def compose(self) -> ComposeResult:
             with Horizontal(id="top_header"):
@@ -6936,13 +6937,14 @@ if _HAS_UI:
             item = event.item
             if item is None:
                 return
-            switcher = self.query_one("#log_switcher", ContentSwitcher)
-            if isinstance(item, MainLogItem):
-                switcher.current = "log-main"
-            elif isinstance(item, ReportLogItem):
-                switcher.current = "log-report"
-            elif isinstance(item, TaskItem):
-                switcher.current = f"log-task-{item.task_index}"
+            with suppress(Exception):
+                switcher = self.query_one("#log_switcher", ContentSwitcher)
+                if isinstance(item, MainLogItem):
+                    switcher.current = "log-main"
+                elif isinstance(item, ReportLogItem):
+                    switcher.current = "log-report"
+                elif isinstance(item, TaskItem):
+                    switcher.current = f"log-task-{item.task_index}"
 
         def on_list_view_selected(self, event: ListView.Selected) -> None:
             self.follow_mode = False
@@ -8636,6 +8638,8 @@ if _HAS_UI:
                 except Exception:
                     pass
                 return
+            finally:
+                self.pipeline_finished = True
 
         def action_open_search(self) -> None:
             if isinstance(self.screen, ModalScreen):
@@ -8834,11 +8838,15 @@ if _HAS_UI:
                 return
 
             if isinstance(self.screen, ConfirmQuitScreen):
-                self.screen.dismiss("cancel")
+                self.screen.dismiss("abort")
                 return
 
             if isinstance(self.screen, CompletionDialog):
-                self.screen.dismiss(False)
+                self.screen.dismiss(True)
+                return
+
+            if getattr(self, "pipeline_finished", False):
+                self.action_quit()
                 return
 
             def on_quit_decision(result: str | None) -> None:
@@ -8976,6 +8984,7 @@ if _HAS_UI:
             self.exit()
 
         def _show_completion_dialog(self, title: str, message: str, level: str) -> None:
+            self.pipeline_finished = True
             self.push_screen(
                 CompletionDialog(title=title, message=message, level=level),
                 self._on_completion_reply,
@@ -9115,6 +9124,7 @@ if _HAS_UI:
             return "restart"
 
         def _on_completion_reply(self, quit_now: bool | None) -> None:
+            self.pipeline_finished = True
             if quit_now:
                 self.exit()
             else:
