@@ -7,13 +7,12 @@ Pure bleeding-edge implementation with zero legacy shims or backwards compatibil
 import sys
 import os
 if not os.environ.get('WAYLAND_DISPLAY') and (not os.environ.get('DISPLAY')):
-    sys.stderr.write('dusky-quickpanal: error: WAYLAND_DISPLAY and DISPLAY are not set. Cannot run GUI application.\\n')
+    sys.stderr.write('dusky-quickpanal: error: WAYLAND_DISPLAY and DISPLAY are not set. Cannot run GUI application.\n')
     sys.exit(5)
 import json
 import gc
 import signal
 import tomllib
-import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Final, override
@@ -32,8 +31,8 @@ from dusky_backend import (
     LatestValueWorker, RefreshPool, HyprsunsetController, LOG, start_thread, gi_object_c_pointer,
     HAS_VOLUME, HAS_BRIGHTNESS, HAS_LOCAL_BRIGHTNESS, HAS_SUNSET, DDC_MANAGER,
     get_volume, apply_volume, get_brightness, apply_local_brightness, 
-    get_hyprsunset_state, is_hyprsunset_service_enabled, _RE_MAKO_BADGE, _RE_UPDATES_TOTAL,
-    BRIGHTNESS_POST_SUBMIT_REFRESH_GRACE_SECONDS, SUNSET_STATE_WRITE_DEBOUNCE_SECONDS
+    get_hyprsunset_state, _RE_MAKO_BADGE, _RE_UPDATES_TOTAL,
+    BRIGHTNESS_POST_SUBMIT_REFRESH_GRACE_SECONDS
 )
 WINDOW_CLASS: str = 'dusky_quickpanal.py'
 try:
@@ -71,17 +70,6 @@ def load_or_create_config() -> dict[str, Any]:
         LOG.error(f'Error loading {CONFIG_FILE}: {e}')
         return tomllib.loads(DEFAULT_TOML_CONFIG)
 
-def _get_active_monitor_scaled_height() -> float:
-    try:
-        r = run_command(['hyprctl', '-j', 'monitors'], timeout=0.8, capture_stdout=True)
-        if r is not None and r.returncode == 0 and r.stdout:
-            for m in json.loads(r.stdout):
-                if m.get('focused'):
-                    return float(m['height']) / float(m.get('scale', 1.0))
-    except Exception:
-        pass
-    return 1080.0
-
 def is_pointer_inside_window(win: Gtk.Widget) -> bool:
     try:
         gdk_win = win.get_window()
@@ -109,6 +97,8 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         self.config = config
         self.layout_cfg = self.config.get('layout', {})
         self._timer_id: int | None = None
+        self._visible = False
+        self._updating_radios = False
         self._reposition_scheduled = False
         self._cpu_last = (0, 0)
         self._updating_power = False
@@ -117,6 +107,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         self._grab_active = False
         self._wifi_pending = False
         self._bt_pending = False
+        self._bt_adapter: str | None = None
         self._power_pending_revision = 0
         self._power_pending_profile: str | None = None
         self.set_default_size(320, -1)
@@ -144,8 +135,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         self.scrolled_main.add(main_box)
         self.scrolled_main.set_propagate_natural_width(False)
         self.scrolled_main.set_propagate_natural_height(True)
-        max_h = _get_active_monitor_scaled_height() * 0.85
-        self.scrolled_main.set_max_content_height(int(max_h))
+        self.scrolled_main.set_max_content_height(720)
         self.bottom_fade = Gtk.EventBox()
         self.bottom_fade.set_valign(Gtk.Align.END)
         self.bottom_fade.set_size_request(-1, 48)
@@ -305,10 +295,6 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
                 self.sliders_box.pack_start(row, False, False, 0)
             if HAS_SUNSET:
                 row = CompactSliderRow("󰡬", "sunset", 1000.0, 6000.0, 50.0, lambda: get_hyprsunset_state(getattr(self.app, "_sunset_controller", None)), sunset_submit, self.pool, post_submit_refresh_grace_seconds=BRIGHTNESS_POST_SUBMIT_REFRESH_GRACE_SECONDS)
-                if not is_hyprsunset_service_enabled():
-                    row.set_no_show_all(True)
-                    row.set_visible(False)
-                    row.hide()
                 self._slider_rows.append(row)
                 self.sliders_box.pack_start(row, False, False, 0)
             if self._slider_rows:
@@ -325,7 +311,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
             self.bottom_fade.hide()
 
     def _update_ui_state(self) -> int:
-        if not self.get_visible():
+        if not self._visible:
             return GLib.SOURCE_REMOVE
         now = datetime.now()
         self.lbl_time.set_label(now.strftime('%I:%M'))
@@ -348,7 +334,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         return GLib.SOURCE_CONTINUE
 
     def _fetch_audio(self) -> None:
-        if not self.dynamic_toggles.get('audio') or not self.get_visible():
+        if not self.dynamic_toggles.get('audio') or not self._visible:
             return
         pid_file = Path(HOME) / '.config' / 'dusky' / 'settings' / 'dusky_studio' / 'daemon.pid'
         if not pid_file.exists():
@@ -381,7 +367,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
             )
 
     def _fetch_weather(self) -> None:
-        if not self.layout_cfg.get('show_weather', True) or not self.get_visible():
+        if not self.layout_cfg.get('show_weather', True) or not self._visible:
             return
         try:
             weather_file = Path(HOME) / '.config' / 'dusky' / 'settings' / 'waybar_weather'
@@ -407,7 +393,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         self.weather_box.show()
 
     def _fetch_mako(self) -> None:
-        if not self.dynamic_toggles.get('dnd') or not self.get_visible():
+        if not self.dynamic_toggles.get('dnd') or not self._visible:
             return
         data = fetch_json_output(f'{HOME}/user_scripts/waybar/mako.sh --horizontal')
         if data:
@@ -428,7 +414,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
             tg.update_state(icon='notification-symbolic', css_class='normal', tooltip=final_tt, badge=badge)
 
     def _fetch_idle(self) -> None:
-        if not self.dynamic_toggles.get('idle') or not self.get_visible():
+        if not self.dynamic_toggles.get('idle') or not self._visible:
             return
         r = run_command(['pgrep', '-x', 'hypridle'], timeout=0.8, capture_stdout=True)
         GLib.idle_add(self._apply_idle, r is not None and r.returncode == 0)
@@ -443,7 +429,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
             tg.update_state(icon='view-reveal-symbolic', css_class='active', tooltip='Idle Inhibited (Awake)\nLMB: Toggle | RMB: Lock Screen')
 
     def _fetch_blur(self) -> None:
-        if not self.dynamic_toggles.get('blur') or not self.get_visible():
+        if not self.dynamic_toggles.get('blur') or not self._visible:
             return
         try:
             with open(f'{HOME}/.config/dusky/settings/opacity_blur', 'r', encoding='utf-8') as f:
@@ -465,72 +451,88 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
     def _is_bt_rfkill_blocked() -> bool:
         r = run_command(['rfkill', 'list', 'bluetooth'], timeout=0.5, capture_stdout=True)
         if r is not None and r.returncode == 0 and r.stdout:
-            return 'Soft blocked: yes' in r.stdout
+            return 'Soft blocked: yes' in r.stdout or 'Hard blocked: yes' in r.stdout
         return False
 
     def _fetch_net_bt_state(self) -> None:
-        if not hasattr(self, 'wifi_switch') or not self.get_visible():
+        if not hasattr(self, 'wifi_switch') or not self._visible:
             return
         try:
             wifi_r = run_command(['busctl', 'get-property', 'org.freedesktop.NetworkManager', '/org/freedesktop/NetworkManager', 'org.freedesktop.NetworkManager', 'WirelessEnabled'], timeout=0.8, capture_stdout=True)
-            wifi_on = wifi_r is not None and wifi_r.returncode == 0 and ('true' in wifi_r.stdout)
-            bt_r = run_command(['busctl', 'get-property', 'org.bluez', '/org/bluez/hci0', 'org.bluez.Adapter1', 'Powered'], timeout=0.8, capture_stdout=True)
+            wifi_on = ('true' in wifi_r.stdout) if wifi_r is not None and wifi_r.returncode == 0 else None
+            adapters = sorted(p.name for p in Path('/sys/class/bluetooth').glob('hci*') if p.name[3:].isdigit())
+            adapter = self._bt_adapter if self._bt_adapter in adapters else next(iter(adapters), None)
+            bt_r = run_command(['busctl', 'get-property', 'org.bluez', f'/org/bluez/{adapter}', 'org.bluez.Adapter1', 'Powered'], timeout=0.8, capture_stdout=True) if adapter else None
             bt_powered = bt_r is not None and bt_r.returncode == 0 and ('true' in bt_r.stdout)
             bt_rfkill_blocked = self._is_bt_rfkill_blocked()
             bt_on = bt_powered and (not bt_rfkill_blocked)
-            GLib.idle_add(self._apply_net_bt_state, wifi_on, bt_on)
+            GLib.idle_add(self._apply_net_bt_state, wifi_on, bt_on, adapter if bt_r is not None and bt_r.returncode == 0 else None)
         except Exception:
             pass
 
-    def _apply_net_bt_state(self, wifi_on: bool, bt_on: bool) -> None:
-        wifi_icon = 'network-wireless-symbolic' if wifi_on else 'network-wireless-disconnected-symbolic'
-        self.wifi_icon.set_from_icon_name(wifi_icon, Gtk.IconSize.BUTTON)
-        bt_icon = 'bluetooth-active-symbolic' if bt_on else 'bluetooth-disabled-symbolic'
-        self.bt_icon.set_from_icon_name(bt_icon, Gtk.IconSize.BUTTON)
-        if self._wifi_pending:
-            return
-        if self.wifi_switch.get_active() != wifi_on:
-            self.wifi_switch.set_active(wifi_on)
-        if self._bt_pending:
-            return
-        if self.bt_switch.get_active() != bt_on:
-            self.bt_switch.set_active(bt_on)
+    def _apply_net_bt_state(self, wifi_on: bool | None, bt_on: bool, adapter: str | None) -> None:
+        self._bt_adapter = adapter
+        self._updating_radios = True
+        try:
+            if not self._wifi_pending:
+                self.wifi_switch.set_sensitive(wifi_on is not None)
+                icon = 'network-wireless-symbolic' if wifi_on else 'network-wireless-disconnected-symbolic'
+                self.wifi_icon.set_from_icon_name(icon, Gtk.IconSize.BUTTON)
+                self.wifi_switch.set_active(bool(wifi_on))
+            if not self._bt_pending:
+                self.bt_switch.set_sensitive(adapter is not None)
+                icon = 'bluetooth-active-symbolic' if bt_on else 'bluetooth-disabled-symbolic'
+                self.bt_icon.set_from_icon_name(icon, Gtk.IconSize.BUTTON)
+                self.bt_switch.set_active(bt_on)
+        finally:
+            self._updating_radios = False
 
     def _on_wifi_state_set(self, switch: Gtk.Switch, state: bool) -> bool:
+        if self._updating_radios:
+            return False
         val = 'true' if state else 'false'
         execute_cmd(f'busctl set-property org.freedesktop.NetworkManager /org/freedesktop/NetworkManager org.freedesktop.NetworkManager WirelessEnabled b {val}')
         icon = 'network-wireless-symbolic' if state else 'network-wireless-disconnected-symbolic'
         self.wifi_icon.set_from_icon_name(icon, Gtk.IconSize.BUTTON)
         self._wifi_pending = True
+        switch.set_sensitive(False)
         GLib.timeout_add(800, self._clear_wifi_pending)
         return False
 
     def _clear_wifi_pending(self) -> bool:
         self._wifi_pending = False
-        if self.get_visible() and self.pool:
+        self.wifi_switch.set_sensitive(True)
+        if self._visible and self.pool:
             self.pool.submit(self._fetch_net_bt_state)
         return GLib.SOURCE_REMOVE
 
     def _on_bt_state_set(self, switch: Gtk.Switch, state: bool) -> bool:
+        if self._updating_radios:
+            return False
+        if self._bt_adapter is None:
+            return True
+        adapter_path = f'/org/bluez/{self._bt_adapter}'
         if state:
-            execute_cmd("sudo -n /usr/bin/rfkill unblock bluetooth && busctl set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 Powered b true")
+            execute_cmd(f"sudo -n /usr/bin/rfkill unblock bluetooth; busctl set-property org.bluez {adapter_path} org.bluez.Adapter1 Powered b true")
             icon = "bluetooth-active-symbolic"
         else:
-            execute_cmd("busctl set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 Powered b false && sudo -n /usr/bin/rfkill block bluetooth")
+            execute_cmd(f"busctl set-property org.bluez {adapter_path} org.bluez.Adapter1 Powered b false")
             icon = "bluetooth-disabled-symbolic"
         self.bt_icon.set_from_icon_name(icon, Gtk.IconSize.BUTTON)
         self._bt_pending = True
+        switch.set_sensitive(False)
         GLib.timeout_add(800, self._clear_bt_pending)
         return False
 
     def _clear_bt_pending(self) -> bool:
         self._bt_pending = False
-        if self.get_visible() and self.pool:
+        self.bt_switch.set_sensitive(True)
+        if self._visible and self.pool:
             self.pool.submit(self._fetch_net_bt_state)
         return GLib.SOURCE_REMOVE
 
     def _fetch_power_profile(self) -> None:
-        if not hasattr(self, 'power_container') or not self.get_visible():
+        if not hasattr(self, 'power_container') or not self._visible:
             return
         if getattr(self, '_power_pending_profile', None) is not None:
             return
@@ -578,6 +580,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
             self._power_pending_profile = profile_key
             for btn in (self.btn_save, self.btn_bal, self.btn_perf):
                 _remove_css_class(btn, 'applying')
+                btn.set_sensitive(False)
             _add_css_class(button, 'applying')
             start_thread('power-profile', self._run_power_cmd_worker, cmd, current_rev)
 
@@ -615,18 +618,19 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         self._power_pending_profile = None
         for btn in (self.btn_save, self.btn_bal, self.btn_perf):
             _remove_css_class(btn, 'applying')
-        if self.get_visible() and self.pool:
+            btn.set_sensitive(True)
+        if self._visible and self.pool:
             self.pool.submit(self._fetch_power_profile)
         return GLib.SOURCE_REMOVE
 
     def _fetch_hardware_metrics(self) -> None:
-        if not hasattr(self, 'metrics_row') or not self.get_visible():
+        if not hasattr(self, 'metrics_row') or not self._visible:
             return
         try:
             with open('/proc/stat', 'r', encoding='utf-8') as f:
                 parts = [int(p) for p in f.readline().split()[1:]]
             idle = parts[3] + parts[4]
-            total = sum(parts)
+            total = sum(parts[:8])  # Guest time is already included in user/nice.
             last_idle, last_total = self._cpu_last
             d_idle, d_total = (idle - last_idle, total - last_total)
             cpu_usage = 100 * (1.0 - d_idle / d_total) if d_total > 0 else 0
@@ -647,7 +651,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
             pass
 
     def _fetch_network(self) -> None:
-        if not hasattr(self, 'metrics_row') or not self.get_visible():
+        if not hasattr(self, 'metrics_row') or not self._visible:
             return
         rt = Path(f'/run/user/{os.getuid()}/waybar-net')
         try:
@@ -677,7 +681,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         GLib.idle_add(self.pill_net.apply_json, data, 'network-disconnected')
 
     def _fetch_updates(self) -> None:
-        if not self.dynamic_toggles.get('updates') or not self.get_visible():
+        if not self.dynamic_toggles.get('updates') or not self._visible:
             return
         try:
             with open(f'{HOME}/.config/dusky/settings/waybar_update_counter_h', 'r', encoding='utf-8') as f:
@@ -700,11 +704,10 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
 
     def _on_map(self, *args: Any) -> None:
         if LIBGRAB and self.get_visible() and self._grab_cb and (not self._grab_active):
-            self._grab_active = True
-            ptr_val = hash(self)
-            if ptr_val < 0:
-                ptr_val += 1 << (ctypes.sizeof(ctypes.c_void_p) * 8)
-            LIBGRAB.init_wayland_grab(ctypes.c_void_p(ptr_val), self._grab_cb)
+            pointer = gi_object_c_pointer(self)
+            if pointer is not None:
+                self._grab_active = True
+                LIBGRAB.init_wayland_grab(pointer, self._grab_cb)
 
     def _on_unmap(self, *args: Any) -> None:
         if LIBGRAB and self._grab_active:
@@ -720,7 +723,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         else:
             execute_cmd(cmd)
             def _single_shot_update() -> bool:
-                if self.get_visible():
+                if self._visible:
                     self._update_ui_state()
                 return GLib.SOURCE_REMOVE
             GLib.timeout_add(150, _single_shot_update)
@@ -748,7 +751,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         return False
 
     def request_reposition(self) -> None:
-        if not self.get_visible():
+        if not self._visible:
             return
         self.resize(320, 1)
         if not self._reposition_scheduled:
@@ -761,29 +764,40 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _on_size_allocate(self, widget: Gtk.Widget, allocation: Gdk.Rectangle) -> None:
-        if self.get_visible() and (not self._reposition_scheduled):
+        if self._visible and (not self._reposition_scheduled):
             self._reposition_scheduled = True
             GLib.idle_add(self._do_reposition_idle)
 
     def _reposition_to_corner(self) -> None:
+        if self._visible and self.pool:
+            self.pool.submit(self._fetch_position)
+
+    def _apply_monitor_height(self, height: int) -> None:
+        if self._visible and height != self.scrolled_main.get_max_content_height():
+            self.scrolled_main.set_max_content_height(height)
+
+    def _fetch_position(self) -> None:
         """
-        August 2026 Production-Grade Absolute Positioning Strategy:
-        Calculates pixel-exact coordinate bounds and dispatches them via the
-        canonical Hyprland movewindowpixel exact dispatcher.
+        Position using Hyprland's Lua dispatcher without blocking GTK.
         """
-        if not self.get_visible():
+        if not self._visible:
             return
         try:
             r = run_command(['hyprctl', '-j', 'monitors'], timeout=0.8, capture_stdout=True)
             if r is None or r.returncode != 0 or (not r.stdout):
                 return
             monitors = json.loads(r.stdout)
+            if not monitors:
+                return
             mon = next((m for m in monitors if m.get('focused')), monitors[0])
             mon_x = float(mon.get('x', 0))
             mon_y = float(mon.get('y', 0))
             scale = float(mon.get('scale', 1.0))
             mon_w = float(mon['width']) / scale
             mon_h = float(mon['height']) / scale
+            if int(mon.get('transform', 0)) % 2:
+                mon_w, mon_h = mon_h, mon_w
+            GLib.idle_add(self._apply_monitor_height, max(1, int(mon_h * 0.85)))
             r = run_command(['hyprctl', '-j', 'clients'], timeout=0.8, capture_stdout=True)
             if r is None or r.returncode != 0 or (not r.stdout):
                 return
@@ -795,12 +809,16 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
             win_h = float(win['size'][1])
             target_x = int(mon_x + mon_w - win_w - 20)
             target_y = int(mon_y + mon_h - win_h - 20)
+            if win.get('at') == [target_x, target_y]:
+                return
             win_target = f"address:{win['address']}" if win.get('address') else 'class:dusky_quickpanal.py'
-            run_command(['hyprctl', 'dispatch', f'hl.dsp.window.move({{ window = "{win_target}", x = {target_x}, y = {target_y} }})'], timeout=1.0, capture_stdout=True)
+            if self._visible:
+                run_command(['hyprctl', 'dispatch', f'hl.dsp.window.move({{ window = "{win_target}", x = {target_x}, y = {target_y}, relative = false }})'], timeout=1.0, capture_stdout=True)
         except Exception as e:
             LOG.debug(f'Reposition dispatch error: {e}')
 
     def _on_show(self, *args: Any) -> None:
+        self._visible = True
         app = self.get_application()
         if app and hasattr(app, 'resume_workers'):
             app.resume_workers()
@@ -811,9 +829,10 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         self._update_ui_state()
         self._timer_id = GLib.timeout_add(2000, self._update_ui_state)
         self.request_reposition()
-        GLib.timeout_add(150, lambda: (self._reposition_to_corner() if self.get_visible() else None, GLib.SOURCE_REMOVE)[1])
+        GLib.timeout_add(150, lambda: (self._reposition_to_corner() if self._visible else None, GLib.SOURCE_REMOVE)[1])
 
     def _on_hide(self, *args: Any) -> None:
+        self._visible = False
         if self._timer_id is not None:
             GLib.source_remove(self._timer_id)
             self._timer_id = None
@@ -822,7 +841,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         app = self.get_application()
         if app and hasattr(app, 'suspend_workers'):
             app.suspend_workers()
-        GLib.timeout_add(500, lambda: (self.get_visible() or _reclaim_idle_memory(), GLib.SOURCE_REMOVE)[1])
+        GLib.timeout_add(500, lambda: (self._visible or _reclaim_idle_memory(), GLib.SOURCE_REMOVE)[1])
 
 class QuickPanalApp(Gtk.Application):
 
@@ -879,8 +898,6 @@ class QuickPanalApp(Gtk.Application):
         GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda *_: self.quit() or GLib.SOURCE_REMOVE)
         self.hold()
         config_data = load_or_create_config()
-        if DDC_MANAGER:
-            DDC_MANAGER.start()
         self.pool = RefreshPool(max_workers=4)
         self._volume_worker = LatestValueWorker('volume', apply_volume) if HAS_VOLUME else None
         self._local_brightness_worker = LatestValueWorker('local-brightness', apply_local_brightness) if HAS_LOCAL_BRIGHTNESS else None

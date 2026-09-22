@@ -5,22 +5,19 @@ Target Specification: Arch Linux (Kernel 7.1+ / August 2026 Spec), Python 3.14.6
 Pure bleeding-edge implementation with zero legacy shims or backwards compatibility shims.
 """
 from __future__ import annotations
-from datetime import datetime
 import json
 import math
-import os
 import re
 import shlex
 import time
 from concurrent.futures import Future, CancelledError
-from pathlib import Path
 from typing import Any, Callable, Final
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
 gi.require_version('Pango', '1.0')
-from gi.repository import Gdk, Gio, GLib, Gtk, Pango
-from dusky_backend import HOME, LOG, execute_cmd, run_command, snap_to_step, fetch_notifications, NotificationData, RefreshPool, NOTIF_CACHE_FILE, MAKO_BLACKLIST_FILE, atomic_write_json, is_dusky_notif_time_service_enabled
+from gi.repository import Gdk, GLib, Gtk, Pango
+from dusky_backend import LOG, execute_cmd, run_command, start_thread, snap_to_step, fetch_notifications, NotificationData, RefreshPool, NOTIF_CACHE_FILE, MAKO_BLACKLIST_FILE, is_dusky_notif_time_service_enabled
 
 def _add_css_class(widget: Gtk.Widget, cls: str) -> None:
     widget.get_style_context().add_class(cls)
@@ -140,6 +137,8 @@ class MetricPill(Gtk.EventBox):
                 self._val_lbl.set_markup(text)
             except Exception:
                 self._val_lbl.set_text(text)
+        if data and data.get('tooltip'):
+            self.set_tooltip_text(str(data['tooltip']))
 
 class CompactSliderRow(Gtk.Box):
 
@@ -243,11 +242,12 @@ class CompactSliderRow(Gtk.Box):
         value = scale.get_value()
         snapped = snap_to_step(value, self.adjustment.get_lower(), self.adjustment.get_upper(), self.adjustment.get_step_increment())
         if not math.isclose(snapped, value, rel_tol=0.0, abs_tol=1e-09):
+            was_suppressed = self._suppress_apply
             self._suppress_apply = True
             try:
                 self.adjustment.set_value(snapped)
             finally:
-                self._suppress_apply = False
+                self._suppress_apply = was_suppressed
         self.value_label.set_label(str(int(round(snapped))))
         if self._suppress_apply:
             return
@@ -389,6 +389,7 @@ class NotificationsPanel(Gtk.Box):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self._pool = pool
         self._refresh_token = 0
+        self._refresh_future: Future | None = None
         self.expanded_apps: set[str] = set()
         self.notif_times: dict[str, str] = {}
         self._last_notifs: tuple[NotificationData, ...] | None = None
@@ -421,22 +422,13 @@ class NotificationsPanel(Gtk.Box):
         _add_css_class(self.listbox, 'notif-list')
         self.listbox.connect('row-activated', self._on_row_activated)
         self.pack_start(self.listbox, True, True, 0)
-        initial_notifs: list[NotificationData] = []
-        try:
-            initial_notifs = fetch_notifications()
-        except Exception as e:
-            LOG.error('Failed executing initial notification collection: %s', e)
-        if not initial_notifs:
-            self._last_notifs = ()
-            self.set_no_show_all(True)
-            self.hide()
-        else:
-            self._last_notifs = tuple(initial_notifs)
-            self.set_no_show_all(False)
-            self._render_notifs_list(initial_notifs)
+        self.set_no_show_all(True)
+        self.hide()
 
-    def _render_notifs_list(self, notifs: list[NotificationData]) -> None:
-        self.notif_times = {}
+    @staticmethod
+    def _fetch_snapshot() -> tuple[list[NotificationData], dict[str, str]]:
+        notifs = fetch_notifications()
+        times = {}
         if is_dusky_notif_time_service_enabled():
             cache_file = NOTIF_CACHE_FILE
             if cache_file.is_file():
@@ -444,25 +436,12 @@ class NotificationsPanel(Gtk.Box):
                     with open(cache_file, 'r', encoding='utf-8') as f:
                         cached = json.load(f)
                         if isinstance(cached, dict):
-                            self.notif_times = {str(k): str(v) for k, v in cached.items()}
+                            times = {str(k): str(v) for k, v in cached.items()}
                 except Exception:
                     pass
-        if is_dusky_notif_time_service_enabled():
-            now_str = datetime.now().strftime('%I:%M %p').lstrip('0')
-            changed = False
-            for n in notifs:
-                str_id = str(n.id)
-                if str_id not in self.notif_times:
-                    self.notif_times[str_id] = now_str
-                    changed = True
-            if len(self.notif_times) > 1000:
-                excess = len(self.notif_times) - 1000
-                keys_to_remove = list(self.notif_times.keys())[:excess]
-                for k in keys_to_remove:
-                    del self.notif_times[k]
-                changed = True
-            if changed:
-                atomic_write_json(NOTIF_CACHE_FILE, self.notif_times)
+        return notifs, times
+
+    def _render_notifs_list(self, notifs: list[NotificationData]) -> None:
         groups: dict[str, list[NotificationData]] = {}
         for n in notifs[:50]:
             app = n.app_name if n.app_name else 'Unknown'
@@ -526,9 +505,12 @@ class NotificationsPanel(Gtk.Box):
         self._request_layout_update()
 
     def refresh_async(self) -> None:
+        if self._refresh_future is not None and not self._refresh_future.done():
+            return
         self._refresh_token += 1
         token = self._refresh_token
-        f = self._pool.submit(fetch_notifications)
+        f = self._pool.submit(self._fetch_snapshot)
+        self._refresh_future = f
         if f:
             f.add_done_callback(lambda fut: self._on_refresh_done(fut, token))
         self._pool.submit(self._fetch_dnd_state)
@@ -546,22 +528,23 @@ class NotificationsPanel(Gtk.Box):
             self.btn_dnd.set_image(Gtk.Image.new_from_icon_name('notification-symbolic', Gtk.IconSize.BUTTON))
             _remove_css_class(self.btn_dnd, 'dnd-active-btn')
 
-    def _on_refresh_done(self, fut: Future[list[NotificationData]], token: int) -> None:
+    def _on_refresh_done(self, fut: Future, token: int) -> None:
         try:
-            notifs = fut.result()
+            notifs, times = fut.result()
         except CancelledError:
             return
         except Exception as e:
             LOG.error('Failed fetching active notification buffer: %s', e)
-            notifs = []
-        GLib.idle_add(self._apply_notifs, notifs, token)
+            return
+        GLib.idle_add(self._apply_notifs, notifs, times, token)
 
-    def _apply_notifs(self, notifs: list[NotificationData], token: int) -> bool:
+    def _apply_notifs(self, notifs: list[NotificationData], times: dict[str, str], token: int) -> bool:
         if token != self._refresh_token:
             return GLib.SOURCE_REMOVE
         notifs_tuple = tuple(notifs)
-        if notifs_tuple == self._last_notifs:
+        if notifs_tuple == self._last_notifs and times == self.notif_times:
             return GLib.SOURCE_REMOVE
+        self.notif_times = times
         self._last_notifs = notifs_tuple
         self._clear_listbox_safely()
         if not notifs:
@@ -575,6 +558,7 @@ class NotificationsPanel(Gtk.Box):
         return GLib.SOURCE_REMOVE
 
     def _on_row_closed(self, row: NotificationRow) -> None:
+        self._refresh_token += 1
         n = row.notif
         bl_path = MAKO_BLACKLIST_FILE
         try:
@@ -594,6 +578,7 @@ class NotificationsPanel(Gtk.Box):
         self._request_layout_update()
 
     def _on_stack_closed(self, app_name: str) -> None:
+        self._refresh_token += 1
         bl_path = MAKO_BLACKLIST_FILE
         for child in self.listbox.get_children():
             if isinstance(child, NotificationRow):
@@ -628,6 +613,7 @@ class NotificationsPanel(Gtk.Box):
         if not isinstance(row, NotificationRow):
             return
         n = row.notif
+        self._refresh_token += 1
         bl_path = MAKO_BLACKLIST_FILE
         try:
             with open(bl_path, 'a', encoding='utf-8') as f:
@@ -635,12 +621,11 @@ class NotificationsPanel(Gtk.Box):
         except Exception:
             pass
         if n.source == 'active':
-            execute_cmd(f'makoctl invoke -n {n.id} default')
+            execute_cmd(f'makoctl invoke -n {n.id} default; makoctl dismiss -n {n.id}')
         else:
             app = n.desktop_entry or n.app_name
             if app and app not in ('notify-send', 'mako'):
                 execute_cmd(f'gtk-launch {shlex.quote(app)} || {shlex.quote(app)}')
-        execute_cmd(f'makoctl dismiss -n {n.id}')
         self.listbox.remove(row)
         row.destroy()
         self._last_notifs = None
@@ -652,24 +637,30 @@ class NotificationsPanel(Gtk.Box):
         self._request_layout_update()
 
     def _on_dnd_toggle(self, _btn: Gtk.Button) -> None:
-        execute_cmd("makoctl mode | grep -qw 'do-not-disturb' && makoctl mode -r do-not-disturb || makoctl mode -a do-not-disturb")
+        execute_cmd('makoctl mode -t do-not-disturb')
         GLib.timeout_add(150, lambda: (self.refresh_async(), GLib.SOURCE_REMOVE)[1])
 
     def _on_clear_all(self, _btn: Gtk.Button) -> None:
-        bl_path = MAKO_BLACKLIST_FILE
-        try:
-            bl_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        cmd = 'if systemctl --user is-active --quiet mako.service; then systemctl --user restart mako.service; else pkill -x mako && dusky-run -- mako & fi'
-        execute_cmd(cmd)
+        self._refresh_token += 1
+        start_thread('clear-notifications', self._clear_notifications)
         self.expanded_apps.clear()
         self._last_notifs = ()
         self._clear_listbox_safely()
         self.set_no_show_all(True)
         self.hide()
-        self.refresh_async()
         self._request_layout_update()
+
+    def _clear_notifications(self) -> None:
+        # Mako has no history deletion command. Hide its existing history and
+        # dismiss active notifications without restarting the notification daemon.
+        notifs = fetch_notifications()
+        try:
+            with MAKO_BLACKLIST_FILE.open('a', encoding='utf-8') as handle:
+                handle.writelines(f'{n.id}\n' for n in notifs)
+        except OSError as exc:
+            LOG.warning('Failed clearing notification history: %s', exc)
+        run_command(['makoctl', 'dismiss', '--all', '--no-history'])
+        GLib.idle_add(self.refresh_async)
 CSS: Final[str] = """
 window.panel-window {
     background-color: alpha(@theme_bg_color, 0.95);
@@ -902,6 +893,7 @@ switch.compact-switch:checked {
     color: transparent;
 }
 switch.compact-switch slider {
+    opacity: 1;
     min-width: 18px;
     min-height: 18px;
     border-radius: 9999px;

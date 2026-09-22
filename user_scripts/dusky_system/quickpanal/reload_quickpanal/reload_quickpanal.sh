@@ -29,7 +29,6 @@ readonly GRACE_PERIOD_LOOPS=20
 readonly GRACE_SLEEP_SEC=0.1
 readonly POST_KILL_SETTLE_SEC=0.2
 readonly SERVICE_INIT_DELAY_SEC=0.3
-readonly DBUS_REGISTRATION_DELAY_SEC=1
 
 readonly SELF_PID=$$
 
@@ -77,7 +76,7 @@ get_target_pids() {
         if [[ "$pid" =~ ^[0-9]+$ ]] && ((pid != SELF_PID)); then
             printf '%s\n' "$pid"
         fi
-    done < <(pgrep -f -- "$PROCESS_PATTERN" 2>/dev/null || true)
+    done < <(pgrep -u "$UID" -f -- "$PROCESS_PATTERN" 2>/dev/null || true)
 }
 
 terminate_processes() {
@@ -152,7 +151,7 @@ activate_ui() {
 
     log_info "Activating UI window via D-Bus..."
 
-    # GTK4 Adw.Application natively handles D-Bus activation.
+    # GTK3 Gtk.Application natively handles D-Bus activation.
     # Running it sends the signal to the primary daemon and exits immediately.
     if [[ -x "$GUI_SCRIPT_PATH" ]]; then
         "$GUI_SCRIPT_PATH" >/dev/null 2>&1
@@ -178,6 +177,9 @@ main() {
 
     log_info "Initiating restart for ${C_BOLD}${APP_NAME}${C_RESET}..."
 
+    # Stop first so Restart=on-failure cannot race manual process cleanup.
+    systemctl --user stop -- "$SERVICE_NAME" || return 1
+
     local -a target_pids
     mapfile -t target_pids < <(get_target_pids)
 
@@ -189,8 +191,7 @@ main() {
 
     start_and_verify_service || return 1
 
-    log_info "Waiting for DBus registration (${DBUS_REGISTRATION_DELAY_SEC}s)..."
-    sleep "$DBUS_REGISTRATION_DELAY_SEC"
+    # Type=dbus makes systemctl start wait for bus-name registration.
     
     if (( quiet_mode == 0 )); then
         activate_ui
