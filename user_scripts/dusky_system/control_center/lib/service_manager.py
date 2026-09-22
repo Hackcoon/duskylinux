@@ -20,7 +20,6 @@ import logging
 import re
 import shlex
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Callable, Final, Literal
 
 import gi
@@ -91,10 +90,6 @@ def _sanitize_unit(raw: object) -> str | None:
             return name
         return None
     return None
-    # Reject overly long names (systemd limit ~256)
-    if len(name) > 256:
-        return None
-    return name
 
 
 def _sanitize_scope(raw: object) -> Scope:
@@ -182,7 +177,7 @@ def _run_argv_async(
         proc = launcher.spawnv(argv)
     except GLib.Error as e:
         log.debug("Failed to spawn %.80s: %s", shlex.join(argv), e.message)
-        GLib.idle_add(lambda: (on_complete(None, e.message, False, None), GLib.SOURCE_REMOVE)[1])
+        GLib.idle_add(lambda message=e.message: (on_complete(None, message, False, None), GLib.SOURCE_REMOVE)[1])
         return None
 
     handle = _ServiceCommandHandle(proc, cancellable)
@@ -274,7 +269,7 @@ def check_single_service_async(
         # For single unit, exit_code 0 => active, 3 => inactive
         # We treat only "active" as True, everything else False (including activating)
         normalized = stdout.strip().lower()
-        is_active = normalized == "active"
+        is_active = (normalized == "active") if normalized else None
         GLib.idle_add(lambda: (on_result(is_active), GLib.SOURCE_REMOVE)[1])
 
     return _run_argv_async(argv, timeout, _on_complete)
@@ -353,13 +348,13 @@ def check_multiple_services_async(
                                 results[(s, u)] = val
                         else:
                             with lock:
-                                results[(s, u)] = False
+                                results[(s, u)] = None
                     # If expiry: if stdout parsing mismatched, fill remainder
                     if len(lines) < len(us):
                         for u in us[len(lines) :]:
                             with lock:
                                 if (s, u) not in results:
-                                    results[(s, u)] = False
+                                    results[(s, u)] = None
                 _maybe_emit()
 
             return _cb
@@ -367,10 +362,6 @@ def check_multiple_services_async(
         h = _run_argv_async(argv, timeout, _make_cb(scope, units))
         if h:
             handles.append(h)
-        else:
-            for u in units:
-                results[(scope, u)] = None
-            _maybe_emit()
 
     return handles
 

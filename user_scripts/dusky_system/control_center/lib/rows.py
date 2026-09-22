@@ -90,11 +90,6 @@ TRUE_VALUES: Final[frozenset[str]] = frozenset(
     {"enabled", "yes", "true", "1", "on", "active", "set", "running", "open", "high"}
 )
 
-# Shell metacharacters that mandate /bin/sh -c interpretation.
-# Quotes (' ") are intentionally excluded: shlex.split() handles them.
-_SHELL_METACHAR: Final[frozenset[str]] = frozenset('|&;<>()$`\\*?#~![]{}=\n')
-
-
 # =============================================================================
 # LAZY THREAD POOL (Singleton for File I/O & Legacy Tasks)
 # =============================================================================
@@ -269,6 +264,7 @@ class PollSlot:
     current_command: str = ""
     on_output: Any = None
     timeout: int = 2
+    interval: int = DEFAULT_INTERVAL_SECONDS
 
 
 @dataclass(slots=True)
@@ -311,6 +307,7 @@ class WidgetState:
 
                 slot.cancellable = None
                 slot.is_running = False
+                slot.on_output = None
 
                 if slot.source_id > 0:
                     sources.append(slot.source_id)
@@ -357,12 +354,11 @@ def _safe_int(value: object, default: int) -> int:
 
 
 def _safe_float(value: object, default: float) -> float:
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
+    if isinstance(value, (int, float, str)):
         try:
-            return float(value)
-        except ValueError:
+            parsed = float(value)
+            return parsed if math.isfinite(parsed) else default
+        except (ValueError, OverflowError):
             pass
     return default
 
@@ -525,6 +521,25 @@ def _batch_source_remove(*source_ids: int) -> None:
         _safe_source_remove(sid)
 
 
+def _connect_owned(owner: Gtk.Widget, child: GObject.Object, *args) -> int:
+    """Track callbacks whose child emitter would otherwise retain its owner."""
+    handler_id = child.connect(*args)
+    owner.__dict__.setdefault("_owned_handlers", []).append((child, handler_id))
+    return handler_id
+
+
+def _dispose_row(widget: Gtk.Widget) -> tuple[int, ...]:
+    """Break child-to-ancestor references before GTK releases a removed page."""
+    sources = widget._state.mark_destroyed_and_get_sources()
+    for child, handler_id in widget.__dict__.pop("_owned_handlers", []):
+        child.disconnect(handler_id)
+    widget.context = {}
+    for attr in ("config", "sidebar", "toast_overlay", "nav_view", "builder_func"):
+        if attr in widget.__dict__:
+            setattr(widget, attr, None)
+    return sources
+
+
 def _submit_task_safe(func: Callable[[], None], state: WidgetState) -> bool:
     with state.lock:
         if state.is_destroyed:
@@ -552,20 +567,19 @@ def _submit_setting_save_safe(key: str, value: object) -> bool:
 # ASYNC SUBPROCESS INFRASTRUCTURE
 # =============================================================================
 def _parse_simple_argv(command: str) -> list[str] | None:
-    if _SHELL_METACHAR.intersection(command):
-        return None
     try:
         argv = shlex.split(command)
-        return argv if argv else None
+        return argv if argv and not utility._requires_shell(command, argv) else None
     except ValueError:
         return None
 
 
 class _AsyncCommandHandle:
-    __slots__ = ("_proc", "_cancellable", "_lock", "_timeout_source_id")
+    __slots__ = ("_proc", "_pgid", "_cancellable", "_lock", "_timeout_source_id")
 
     def __init__(self, proc: Gio.Subprocess, cancellable: Gio.Cancellable) -> None:
         self._proc = proc
+        self._pgid = int(proc.get_identifier() or 0)
         self._cancellable = cancellable
         self._lock = threading.Lock()
         self._timeout_source_id = 0
@@ -586,8 +600,15 @@ class _AsyncCommandHandle:
 
     def cancel(self) -> None:
         self.clear_timeout_source()
+        with self._lock:
+            pgid, self._pgid = self._pgid, 0
         with suppress(Exception):
             self._cancellable.cancel()
+        # Polling commands may spawn children that keep stdout open after the
+        # shell exits. Terminate the session's process group as well.
+        if pgid:
+            with suppress(ProcessLookupError):
+                os.killpg(pgid, signal.SIGKILL)
         with suppress(Exception):
             self._proc.force_exit()
 
@@ -598,6 +619,7 @@ def _run_shell_async(
     on_complete: Callable[[str | None], None],
 ) -> _AsyncCommandHandle | None:
     cancellable = Gio.Cancellable()
+    command = utility._normalize_command(command)
     argv = _parse_simple_argv(command)
     if argv is None:
         argv = ["/bin/sh", "-c", command]
@@ -606,7 +628,7 @@ def _run_shell_async(
         launcher = Gio.SubprocessLauncher.new(
             Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE
         )
-        proc = launcher.spawnv(argv)
+        proc = launcher.spawnv(["/usr/bin/setsid", "--", *argv])
     except GLib.Error as e:
         log.debug("Failed to spawn command '%.30s...': %s", command, e.message)
         GLib.idle_add(lambda: (on_complete(None), GLib.SOURCE_REMOVE)[1])
@@ -623,6 +645,8 @@ def _run_shell_async(
         proc: Gio.Subprocess, result: Gio.AsyncResult,
     ) -> None:
         handle.clear_timeout_source()
+        with handle._lock:
+            handle._pgid = 0
         try:
             success, stdout_data, _ = proc.communicate_utf8_finish(result)
             if success and proc.get_successful() and stdout_data is not None:
@@ -648,6 +672,8 @@ class HyprlandIPCMixin:
     properties: RowProperties
 
     def _start_hyprland_ipc(self) -> None:
+        if isinstance(self, Gtk.Widget) and not self.get_mapped():
+            return
         if not hasattr(self, "properties"):
             return
             
@@ -689,6 +715,8 @@ class HyprlandIPCMixin:
         client.connect_async(addr, cancellable, on_connected)
 
     def _schedule_hyprland_reconnect(self) -> None:
+        if isinstance(self, Gtk.Widget) and not self.get_mapped():
+            return
         with self._state.lock:
             if self._state.is_destroyed:
                 return
@@ -750,6 +778,14 @@ class AsyncPollingMixin:
     """
     _state: WidgetState
 
+    def _on_poll_map(self, _widget: Gtk.Widget) -> None:
+        self._start_hyprland_ipc()
+        self._resume_all_polls()
+
+    def _on_poll_unmap(self, _widget: Gtk.Widget) -> None:
+        self._stop_hyprland_ipc()
+        self._pause_all_polls()
+
     def _start_poll_loop(
         self,
         slot: PollSlot,
@@ -766,6 +802,7 @@ class AsyncPollingMixin:
             slot.current_command = command
             slot.on_output = on_output
             slot.timeout = timeout
+            slot.interval = interval
 
         if immediate and (not isinstance(self, Gtk.Widget) or self.get_mapped()):
             self._poll_command(slot, command, on_output, timeout)
@@ -798,6 +835,8 @@ class AsyncPollingMixin:
         """Stops all active polling timers and in-flight subprocesses to save battery while unmapped."""
         with self._state.lock:
             for slot in self._state._slots:
+                slot.generation += 1
+                slot.is_running = False
                 if slot.source_id > 0:
                     _safe_source_remove(slot.source_id)
                     slot.source_id = 0
@@ -810,7 +849,6 @@ class AsyncPollingMixin:
     def _resume_all_polls(self) -> None:
         """Resumes active polling timers when widget becomes mapped/visible."""
         slots_to_resume = []
-        interval = max(1, _safe_int(self.properties.get("interval"), DEFAULT_INTERVAL_SECONDS)) if hasattr(self, "properties") else DEFAULT_INTERVAL_SECONDS
         with self._state.lock:
             if self._state.is_destroyed:
                 return
@@ -822,7 +860,7 @@ class AsyncPollingMixin:
             with self._state.lock:
                 if not self._state.is_destroyed:
                     sl.source_id = GLib.timeout_add_seconds(
-                        interval,
+                        sl.interval,
                         self._poll_tick,
                         sl,
                         cmd,
@@ -970,6 +1008,8 @@ class StateMonitorMixin(AsyncPollingMixin):
             return
 
         if has_state_cmd:
+            if self._state.monitor.current_command:
+                return
             interval = _safe_int(self.properties.get("interval"), MONITOR_INTERVAL_SECONDS)
             self._start_poll_loop(
                 self._state.monitor,
@@ -994,8 +1034,6 @@ class StateMonitorMixin(AsyncPollingMixin):
 
         try:
             file_path.parent.mkdir(parents=True, exist_ok=True)
-            if not file_path.exists():
-                file_path.touch()
 
             gfile = Gio.File.new_for_path(str(file_path.parent))
             monitor = gfile.monitor_directory(Gio.FileMonitorFlags.NONE, None)
@@ -1006,6 +1044,7 @@ class StateMonitorMixin(AsyncPollingMixin):
                     monitor.cancel()
                     return
                 self._state.monitor.cancellable = monitor
+            self._apply_state_update(utility.load_setting(key, default=False))
         except Exception as e:
             log.error("File monitor setup failed for %s: %s", key, e)
 
@@ -1133,15 +1172,14 @@ class BaseActionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ActionRow):
         if _is_dynamic_icon(icon_config) and isinstance(icon_config, dict):
             self._start_icon_update_loop(icon_config)
             
-        self.connect("map", self._on_base_map)
-        self.connect("unmap", self._on_base_unmap)
+        _connect_owned(self, self, "map", self._on_base_map)
+        _connect_owned(self, self, "unmap", self._on_base_unmap)
 
     def _on_base_map(self, _widget: Gtk.Widget) -> None:
         self._start_hyprland_ipc()
         self._resume_all_polls()
         if hasattr(self, "_start_state_monitor"):
             self._start_state_monitor()
-        self.force_refresh()
 
     def _on_base_unmap(self, _widget: Gtk.Widget) -> None:
         self._stop_hyprland_ipc()
@@ -1166,7 +1204,7 @@ class BaseActionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ActionRow):
         return img
 
     def do_unroot(self) -> None:
-        sources = self._state.mark_destroyed_and_get_sources()
+        sources = _dispose_row(self)
         _batch_source_remove(*sources)
         Adw.ActionRow.do_unroot(self)
 
@@ -1213,7 +1251,7 @@ class ButtonRow(BaseActionRow):
                 else:
                     b.set_label(str(btn_text or "Action"))
 
-                b.connect("clicked", self._on_multi_clicked, btn_cfg)
+                _connect_owned(self, b, "clicked", self._on_multi_clicked, btn_cfg)
                 if s := btn_cfg.get("style"):
                     if s == "suggested":
                         b.add_css_class("suggested-action")
@@ -1251,7 +1289,7 @@ class ButtonRow(BaseActionRow):
                 self.style_map = properties.get("style_map", {})
                 self._start_dynamic_poll()
 
-            self.btn.connect("clicked", self._on_button_clicked)
+            _connect_owned(self, self.btn, "clicked", self._on_button_clicked)
             self.add_suffix(self.btn)
             self.set_activatable_widget(self.btn)
 
@@ -1266,7 +1304,14 @@ class ButtonRow(BaseActionRow):
             case _:
                 self.btn.add_css_class("default-action")
 
+    def _on_base_map(self, widget: Gtk.Widget) -> None:
+        super()._on_base_map(widget)
+        if getattr(self, "text_file", None) and self._state.misc.source_id == 0:
+            self._start_dynamic_poll()
+
     def _start_dynamic_poll(self) -> None:
+        if not self.get_mapped():
+            return
         self._queue_dynamic_state_read()
 
         with self._state.lock:
@@ -1278,7 +1323,8 @@ class ButtonRow(BaseActionRow):
 
     def _update_dynamic_state(self) -> bool:
         if not self.get_mapped():
-            return GLib.SOURCE_CONTINUE
+            self._state.misc.source_id = 0
+            return GLib.SOURCE_REMOVE
 
         self._queue_dynamic_state_read()
         return GLib.SOURCE_CONTINUE
@@ -1371,10 +1417,10 @@ class KeybindRow(BaseActionRow):
         self.btn.add_css_class("suggested-action")
         
         self.key_ctrl = Gtk.EventControllerKey.new()
-        self.key_ctrl.connect("key-pressed", self._on_key_pressed)
+        _connect_owned(self, self.key_ctrl, "key-pressed", self._on_key_pressed)
         self.btn.add_controller(self.key_ctrl)
         
-        self.btn.connect("clicked", self._on_btn_clicked)
+        _connect_owned(self, self.btn, "clicked", self._on_btn_clicked)
         self.add_suffix(self.btn)
         self.set_activatable_widget(self.btn)
         self._listening = False
@@ -1435,7 +1481,6 @@ class ColorRow(BaseActionRow):
         self.dialog = Gtk.ColorDialog.new()
         self.btn = Gtk.ColorDialogButton.new(self.dialog)
         self.btn.set_valign(Gtk.Align.CENTER)
-        self.btn.connect("notify::rgba", self._on_color_changed)
         self.add_suffix(self.btn)
         
         if key := properties.get("key"):
@@ -1444,13 +1489,14 @@ class ColorRow(BaseActionRow):
                 rgba = Gdk.RGBA()
                 if rgba.parse(val):
                     self.btn.set_rgba(rgba)
+        _connect_owned(self, self.btn, "notify::rgba", self._on_color_changed)
 
     def _on_color_changed(self, btn: Gtk.ColorDialogButton, param: GObject.ParamSpec) -> None:
         rgba = btn.get_rgba()
         if not rgba:
             return
             
-        r, g, b, a = int(rgba.red * 255), int(rgba.green * 255), int(rgba.blue * 255), int(rgba.alpha * 255)
+        r, g, b, a = (round(channel * 255) for channel in (rgba.red, rgba.green, rgba.blue, rgba.alpha))
         hex_color = f"#{r:02x}{g:02x}{b:02x}" + (f"{a:02x}" if a < 255 else "")
         
         if key := self.properties.get("key"):
@@ -1475,7 +1521,7 @@ class PathRow(BaseActionRow):
         super().__init__(properties, on_action, context)
         self.btn = Gtk.Button(icon_name="document-open-symbolic")
         self.btn.set_valign(Gtk.Align.CENTER)
-        self.btn.connect("clicked", self._on_clicked)
+        _connect_owned(self, self.btn, "clicked", self._on_clicked)
         self.add_suffix(self.btn)
         self.set_activatable_widget(self.btn)
         self.mode = str(properties.get("mode", "file")).lower()
@@ -1532,11 +1578,11 @@ class SpinRow(SliderMonitorMixin, BaseActionRow):
             step_increment=self.step_val, 
             page_increment=self.step_val * 10
         )
-        digits = 0 if self.step_val.is_integer() else len(str(self.step_val).split('.')[-1])
+        digits = len(f"{self.step_val:.15f}".rstrip("0").partition(".")[2])
         
         self.spin = Gtk.SpinButton(adjustment=adj, numeric=True, digits=digits)
         self.spin.set_valign(Gtk.Align.CENTER)
-        self.spin.connect("value-changed", self._on_value_changed)
+        _connect_owned(self, self.spin, "value-changed", self._on_value_changed)
         self.add_suffix(self.spin)
         
         self._spin_changing = False
@@ -1545,7 +1591,7 @@ class SpinRow(SliderMonitorMixin, BaseActionRow):
 
     def _apply_value_update(self, new_value: float) -> bool:
         with self._state.lock:
-            if self._state.is_destroyed:
+            if self._state.is_destroyed or self._pending_value is not None:
                 return GLib.SOURCE_REMOVE
                 
         clamped = max(self.min_val, min(new_value, self.max_val))
@@ -1621,7 +1667,7 @@ class SecretRow(BaseActionRow):
         btn = Gtk.Button(label="Apply")
         btn.add_css_class("suggested-action")
         btn.set_valign(Gtk.Align.CENTER)
-        btn.connect("clicked", self._on_apply)
+        _connect_owned(self, btn, "clicked", self._on_apply)
         self.add_suffix(btn)
 
     def _on_apply(self, btn: Gtk.Button) -> None:
@@ -1671,7 +1717,7 @@ class MultiTextRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ExpanderRow):
         self.textview.set_margin_end(8)
         
         if key := properties.get("key"):
-            val = utility.load_setting(str(key).strip(), default="")
+            val = utility.load_setting(str(key).strip(), default="", preserve_whitespace=True)
             self.textview.get_buffer().set_text(str(val))
             
         self._changed_handler_id = self.textview.get_buffer().connect("changed", self._on_buffer_changed)
@@ -1688,7 +1734,8 @@ class MultiTextRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ExpanderRow):
         if _is_dynamic_icon(icon) and isinstance(icon, dict):
             self._start_icon_update_loop(icon)
             
-        self._start_hyprland_ipc()
+        _connect_owned(self, self, "map", self._on_poll_map)
+        _connect_owned(self, self, "unmap", self._on_poll_unmap)
 
     def _create_icon_widget(self, icon: object) -> Gtk.Image:
         if isinstance(icon, dict) and icon.get("type") == "file":
@@ -1729,11 +1776,14 @@ class MultiTextRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ExpanderRow):
 
     def do_unroot(self) -> None:
         if hasattr(self, "_changed_handler_id") and self._changed_handler_id > 0:
+            if self._state.debounce_source_id:
+                _safe_source_remove(self._state.debounce_source_id)
+                self._save_text()
             with suppress(Exception):
                 self.textview.get_buffer().disconnect(self._changed_handler_id)
             self._changed_handler_id = 0
             
-        sources = self._state.mark_destroyed_and_get_sources()
+        sources = _dispose_row(self)
         _batch_source_remove(*sources)
         Adw.ExpanderRow.do_unroot(self)
 
@@ -1759,7 +1809,7 @@ class ToggleRow(StateMonitorMixin, BaseActionRow):
             if isinstance(val, bool):
                 self.toggle_switch.set_active(val)
 
-        self.toggle_switch.connect("state-set", self._on_toggle_changed)
+        _connect_owned(self, self.toggle_switch, "state-set", self._on_toggle_changed)
         self.add_suffix(self.toggle_switch)
         self.set_activatable_widget(self.toggle_switch)
         self._start_state_monitor()
@@ -1843,7 +1893,7 @@ class LabelRow(BaseActionRow):
                 self._update_label(LABEL_NA)
         else:
             self._trigger_update()
-            if interval > 0:
+            if interval > 0 and self.get_mapped():
                 with self._state.lock:
                     if not self._state.is_destroyed:
                         self._state.value.source_id = GLib.timeout_add_seconds(
@@ -1855,7 +1905,8 @@ class LabelRow(BaseActionRow):
 
     def _on_base_map(self, widget: Gtk.Widget) -> None:
         super()._on_base_map(widget)
-        self._trigger_update()
+        if not self._state.value.current_command:
+            self._trigger_update()
         interval = _safe_int(self.properties.get("interval"), 0)
         is_exec = isinstance(self.value_config, dict) and self.value_config.get("type") == "exec"
         if not is_exec and interval > 0:
@@ -2003,7 +2054,7 @@ class SliderRow(SliderMonitorMixin, BaseActionRow):
         self.slider.set_draw_value(False)
         self.slider.set_margin_start(4)
         self.slider.set_margin_end(4)
-        self.slider.connect("value-changed", self._on_value_changed)
+        _connect_owned(self, self.slider, "value-changed", self._on_value_changed)
 
         self.add_suffix(self.slider)
 
@@ -2032,7 +2083,7 @@ class SliderRow(SliderMonitorMixin, BaseActionRow):
 
     def _apply_value_update(self, new_value: float) -> bool:
         with self._state.lock:
-            if self._state.is_destroyed:
+            if self._state.is_destroyed or self._pending_value is not None:
                 return GLib.SOURCE_REMOVE
 
         safe_val = self._snap_value(new_value)
@@ -2161,9 +2212,9 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
         self.options_map = {str(k).lower(): str(v) for k, v in raw_map.items()}
         self.reverse_map = {str(v): str(k) for k, v in raw_map.items()}
 
-        self.connect("notify::selected", self._on_selected)
-        self.connect("map", self._on_map)
-        self.connect("unmap", self._on_unmap)
+        _connect_owned(self, self, "notify::selected", self._on_selected)
+        _connect_owned(self, self, "map", self._on_map)
+        _connect_owned(self, self, "unmap", self._on_unmap)
 
         if _is_dynamic_icon(icon_config) and isinstance(icon_config, dict):
             self._start_icon_update_loop(icon_config)
@@ -2318,7 +2369,7 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
         except Exception as e:
             log.error("Options fetch failed: %s", e)
         finally:
-            self._complete_options_fetch()
+            GLib.idle_add(self._complete_options_fetch)
 
     def _update_options_ui(self, new_options: list[str], generation: int) -> bool:
         with self._state.lock:
@@ -2326,14 +2377,20 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
                 return GLib.SOURCE_REMOVE
 
         if new_options != self.options_list:
+            selected = self.get_selected_item()
+            selected_text = selected.get_string() if selected is not None else None
             self.options_list = new_options
             with self._suppress_change_signal():
                 self.set_model(Gtk.StringList.new(self.options_list))
+                if selected_text in new_options:
+                    self.set_selected(new_options.index(selected_text))
             self._queue_selection_fetch()
 
         return GLib.SOURCE_REMOVE
 
     def _start_selection_monitor(self) -> None:
+        if not self.get_mapped():
+            return
         interval = max(
             1,
             _safe_int(self.properties.get("interval"), DEFAULT_INTERVAL_SECONDS),
@@ -2360,6 +2417,10 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
         self._stop_hyprland_ipc()
         self._pause_all_polls()
         with self._state.lock:
+            self._selection_fetch_generation += 1
+            self._options_fetch_generation += 1
+            self._selection_fetch_pending = False
+            self._options_fetch_pending = False
             if self._state.value.source_id > 0:
                 _safe_source_remove(self._state.value.source_id)
                 self._state.value.source_id = 0
@@ -2411,7 +2472,7 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
             except Exception:
                 pass
         finally:
-            self._complete_selection_fetch()
+            GLib.idle_add(self._complete_selection_fetch)
 
     def _update_selection_ui(self, value: str, generation: int) -> bool:
         with self._state.lock:
@@ -2433,6 +2494,8 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
     def _on_selected(self, _row: Adw.ComboRow, _param: GObject.ParamSpec) -> None:
         if self._programmatic_update:
             return
+        with self._state.lock:
+            self._selection_fetch_generation += 1
         model = self.get_model()
         if not model:
             return
@@ -2464,7 +2527,7 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
                 )
 
     def do_unroot(self) -> None:
-        sources = self._state.mark_destroyed_and_get_sources()
+        sources = _dispose_row(self)
         _batch_source_remove(*sources)
         Adw.ComboRow.do_unroot(self)
 
@@ -2502,12 +2565,12 @@ class EntryRow(DynamicIconMixin, HyprlandIPCMixin, Adw.EntryRow):
         btn = Gtk.Button(label=btn_text)
         btn.add_css_class("suggested-action")
         btn.set_valign(Gtk.Align.CENTER)
-        btn.connect("clicked", self._on_apply)
+        _connect_owned(self, btn, "clicked", self._on_apply)
         self.add_suffix(btn)
 
         # Trigger on Enter key in addition to button click
-        self.connect("apply", self._on_apply)
-        self.connect("entry-activated", self._on_apply)
+        _connect_owned(self, self, "apply", self._on_apply)
+        _connect_owned(self, self, "entry-activated", self._on_apply)
 
         if initial_val := properties.get("initial_value"):
             self.set_text(str(initial_val))
@@ -2515,8 +2578,8 @@ class EntryRow(DynamicIconMixin, HyprlandIPCMixin, Adw.EntryRow):
         if _is_dynamic_icon(icon_config) and isinstance(icon_config, dict):
             self._start_icon_update_loop(icon_config)
 
-        self.connect("map", self._on_entry_map)
-        self.connect("unmap", self._on_entry_unmap)
+        _connect_owned(self, self, "map", self._on_entry_map)
+        _connect_owned(self, self, "unmap", self._on_entry_unmap)
         # Hide libadwaita's built-in trailing icons (edit/apply/indicator).
         # Under Papirus-Dark, adw-entry-edit-symbolic / adw-entry-apply-symbolic
         # are unresolvable (has_icon=False) and fall back to image-missing.svg
@@ -2568,7 +2631,7 @@ class EntryRow(DynamicIconMixin, HyprlandIPCMixin, Adw.EntryRow):
 
     def _on_initial_value_loaded(self, output: str) -> None:
         val = output.strip()
-        if val and val != LABEL_NA:
+        if val and val != LABEL_NA and not self.get_text():
             self.set_text(val)
 
     def _create_icon_widget(self, icon: object) -> Gtk.Image:
@@ -2611,7 +2674,7 @@ class EntryRow(DynamicIconMixin, HyprlandIPCMixin, Adw.EntryRow):
                 utility.toast(self.toast_overlay, f"Applied: {text}")
 
     def do_unroot(self) -> None:
-        sources = self._state.mark_destroyed_and_get_sources()
+        sources = _dispose_row(self)
         _batch_source_remove(*sources)
         Adw.EntryRow.do_unroot(self)
 
@@ -2629,7 +2692,7 @@ class NavigationRow(BaseActionRow):
         self.layout_data: list[object] = layout_data or []
         self.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
         self.set_activatable(True)
-        self.connect("activated", self._on_activated)
+        _connect_owned(self, self, "activated", self._on_activated)
 
     def _on_activated(self, _row: Adw.ActionRow) -> None:
         if self.nav_view and self.builder_func:
@@ -2674,7 +2737,8 @@ class ExpanderRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ExpanderRow):
         if _is_dynamic_icon(icon_config) and isinstance(icon_config, dict):
             self._start_icon_update_loop(icon_config)
             
-        self._start_hyprland_ipc()
+        _connect_owned(self, self, "map", self._on_poll_map)
+        _connect_owned(self, self, "unmap", self._on_poll_unmap)
 
     def _create_icon_widget(self, icon: object) -> Gtk.Image:
         if isinstance(icon, dict) and icon.get("type") == "file":
@@ -2695,6 +2759,7 @@ class ExpanderRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ExpanderRow):
                 continue
             row = self._build_single_row(item)
             if row is not None:
+                row.set_name(f"cfg_{id(item):x}")
                 self.add_row(row)
 
     def _build_single_row(self, item: dict[str, object]) -> Adw.PreferencesRow | None:
@@ -2747,7 +2812,7 @@ class ExpanderRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ExpanderRow):
             return None
 
     def do_unroot(self) -> None:
-        sources = self._state.mark_destroyed_and_get_sources()
+        sources = _dispose_row(self)
         _batch_source_remove(*sources)
         Adw.ExpanderRow.do_unroot(self)
 
@@ -2806,7 +2871,7 @@ class FlagGroupRow(DynamicIconMixin, HyprlandIPCMixin, Adw.PreferencesRow):
         btn_text = str(properties.get("button_text", "Execute"))
         self.action_btn = Gtk.Button(label=btn_text)
         self.action_btn.set_valign(Gtk.Align.CENTER)
-        self.action_btn.connect("clicked", self._on_action_clicked)
+        _connect_owned(self, self.action_btn, "clicked", self._on_action_clicked)
 
         btn_style = str(properties.get("style", "default")).lower()
         if btn_style == "destructive":
@@ -2855,7 +2920,8 @@ class FlagGroupRow(DynamicIconMixin, HyprlandIPCMixin, Adw.PreferencesRow):
         if _is_dynamic_icon(icon_config) and isinstance(icon_config, dict):
             self._start_icon_update_loop(icon_config)
             
-        self._start_hyprland_ipc()
+        _connect_owned(self, self, "map", self._on_poll_map)
+        _connect_owned(self, self, "unmap", self._on_poll_unmap)
 
     def _create_icon_widget(self, icon: object) -> Gtk.Image:
         if isinstance(icon, dict) and icon.get("type") == "file":
@@ -2891,7 +2957,7 @@ class FlagGroupRow(DynamicIconMixin, HyprlandIPCMixin, Adw.PreferencesRow):
             _perform_redirect(self.on_action, self.context)
 
     def do_unroot(self) -> None:
-        sources = self._state.mark_destroyed_and_get_sources()
+        sources = _dispose_row(self)
         _batch_source_remove(*sources)
         Adw.PreferencesRow.do_unroot(self)
 
@@ -2928,7 +2994,7 @@ class AsyncSelectorRow(DynamicIconMixin, HyprlandIPCMixin, Adw.PreferencesRow):
             command_timeout = float(raw_timeout)
         except (TypeError, ValueError):
             command_timeout = 60.0
-        self.command_timeout = command_timeout if command_timeout > 0 else 60.0
+        self.command_timeout = command_timeout if math.isfinite(command_timeout) and command_timeout > 0 else 60.0
 
         button_text = str(properties.get("button_text", "Execute"))
         button_style = str(properties.get("style", "default")).lower()
@@ -2972,7 +3038,7 @@ class AsyncSelectorRow(DynamicIconMixin, HyprlandIPCMixin, Adw.PreferencesRow):
         self.refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic")
         self.refresh_btn.set_valign(Gtk.Align.CENTER)
         self.refresh_btn.set_tooltip_text("Load Data")
-        self.refresh_btn.connect("clicked", self._on_refresh_clicked)
+        _connect_owned(self, self.refresh_btn, "clicked", self._on_refresh_clicked)
         self.refresh_btn.add_css_class("flat")
 
         if self.auto_refresh:
@@ -2982,11 +3048,11 @@ class AsyncSelectorRow(DynamicIconMixin, HyprlandIPCMixin, Adw.PreferencesRow):
         self.dropdown = Gtk.DropDown(model=self.model)
         self.dropdown.set_valign(Gtk.Align.CENTER)
         self.dropdown.set_hexpand(True)
-        self.dropdown.connect("notify::selected", self._on_dropdown_selected)
+        _connect_owned(self, self.dropdown, "notify::selected", self._on_dropdown_selected)
 
         factory = Gtk.SignalListItemFactory()
-        factory.connect("setup", self._on_dropdown_setup)
-        factory.connect("bind", self._on_dropdown_bind)
+        _connect_owned(self, factory, "setup", self._on_dropdown_setup)
+        _connect_owned(self, factory, "bind", self._on_dropdown_bind)
         self.dropdown.set_factory(factory)
 
         bottom_box.append(self.refresh_btn)
@@ -3001,7 +3067,7 @@ class AsyncSelectorRow(DynamicIconMixin, HyprlandIPCMixin, Adw.PreferencesRow):
         if self.has_action and not self.auto_execute:
             self.action_btn = Gtk.Button(label=button_text)
             self.action_btn.set_valign(Gtk.Align.CENTER)
-            self.action_btn.connect("clicked", self._on_action_clicked)
+            _connect_owned(self, self.action_btn, "clicked", self._on_action_clicked)
             self.action_btn.set_sensitive(False)
 
             if button_style == "destructive":
@@ -3017,7 +3083,8 @@ class AsyncSelectorRow(DynamicIconMixin, HyprlandIPCMixin, Adw.PreferencesRow):
         main_box.append(bottom_box)
         self.set_child(main_box)
 
-        self.connect("map", self._on_map)
+        _connect_owned(self, self, "map", self._on_map)
+        _connect_owned(self, self, "unmap", self._on_poll_unmap)
 
         if _is_dynamic_icon(icon_config) and isinstance(icon_config, dict):
             self._start_icon_update_loop(icon_config)
@@ -3063,6 +3130,7 @@ class AsyncSelectorRow(DynamicIconMixin, HyprlandIPCMixin, Adw.PreferencesRow):
             label.set_text(string_obj.get_string())
 
     def _on_map(self, _widget: Gtk.Widget) -> None:
+        self._on_poll_map(_widget)
         if self.auto_refresh and not self.json_data and not self._fetch_in_progress:
             self._on_refresh_clicked(self.refresh_btn)
 
@@ -3088,9 +3156,6 @@ class AsyncSelectorRow(DynamicIconMixin, HyprlandIPCMixin, Adw.PreferencesRow):
         utility.toast(self.toast_overlay, "✖ Failed to queue data fetch", 4)
 
     def _signal_process_group(self, proc: subprocess.Popen, sig: signal.Signals) -> None:
-        if proc.poll() is not None:
-            return
-
         try:
             os.killpg(proc.pid, sig)
         except ProcessLookupError:
@@ -3100,8 +3165,7 @@ class AsyncSelectorRow(DynamicIconMixin, HyprlandIPCMixin, Adw.PreferencesRow):
                 proc.send_signal(sig)
 
     def _kill_and_reap_process(self, proc: subprocess.Popen) -> None:
-        if proc.poll() is None:
-            self._signal_process_group(proc, signal.SIGTERM)
+        self._signal_process_group(proc, signal.SIGTERM)
 
         try:
             proc.communicate(timeout=1)
@@ -3118,7 +3182,7 @@ class AsyncSelectorRow(DynamicIconMixin, HyprlandIPCMixin, Adw.PreferencesRow):
         with self._state.lock:
             proc = self._fetch_process
 
-        if proc is None or proc.poll() is not None:
+        if proc is None:
             return
 
         self._signal_process_group(proc, signal.SIGKILL)
@@ -3131,11 +3195,7 @@ class AsyncSelectorRow(DynamicIconMixin, HyprlandIPCMixin, Adw.PreferencesRow):
         proc: subprocess.Popen | None = None
 
         try:
-            argv = (
-                shlex.split(self.list_command)
-                if not _SHELL_METACHAR.intersection(self.list_command)
-                else ["/bin/sh", "-c", self.list_command]
-            )
+            argv = _parse_simple_argv(self.list_command) or ["/bin/sh", "-c", self.list_command]
 
             with subprocess.Popen(
                 argv,
@@ -3284,7 +3344,7 @@ class AsyncSelectorRow(DynamicIconMixin, HyprlandIPCMixin, Adw.PreferencesRow):
             _perform_redirect(self.on_action, self.context)
 
     def do_unroot(self) -> None:
-        sources = self._state.mark_destroyed_and_get_sources()
+        sources = _dispose_row(self)
         self._cancel_active_fetch()
         _batch_source_remove(*sources)
         Adw.PreferencesRow.do_unroot(self)
@@ -3335,7 +3395,7 @@ class GridCardBase(Gtk.Button):
         self._current_card_style = style
 
     def do_unroot(self) -> None:
-        sources = self._state.mark_destroyed_and_get_sources()
+        sources = _dispose_row(self)
         _batch_source_remove(*sources)
         Gtk.Button.do_unroot(self)
 
@@ -3396,7 +3456,7 @@ class GridCard(DynamicIconMixin, HyprlandIPCMixin, GridCardBase):
         else:
             self.set_child(box)
 
-        self.connect("clicked", self._on_clicked)
+        _connect_owned(self, self, "clicked", self._on_clicked)
 
         if _is_dynamic_icon(icon_conf) and isinstance(icon_conf, dict):
             self._start_icon_update_loop(icon_conf)
@@ -3409,8 +3469,8 @@ class GridCard(DynamicIconMixin, HyprlandIPCMixin, GridCardBase):
         if self.text_file:
             self._start_dynamic_style_poll()
             
-        self.connect("map", self._on_grid_map)
-        self.connect("unmap", self._on_grid_unmap)
+        _connect_owned(self, self, "map", self._on_grid_map)
+        _connect_owned(self, self, "unmap", self._on_grid_unmap)
 
     def _on_grid_map(self, _widget: Gtk.Widget) -> None:
         self._start_hyprland_ipc()
@@ -3419,7 +3479,6 @@ class GridCard(DynamicIconMixin, HyprlandIPCMixin, GridCardBase):
             self._start_dynamic_style_poll()
         if (badge_file := self.properties.get("badge_file")) and self._state.misc.source_id == 0:
             self._start_badge_monitor(str(badge_file))
-        self.force_refresh()
 
     def _on_grid_unmap(self, _widget: Gtk.Widget) -> None:
         self._stop_hyprland_ipc()
@@ -3441,6 +3500,8 @@ class GridCard(DynamicIconMixin, HyprlandIPCMixin, GridCardBase):
                 self._queue_dynamic_state_fetch()
 
     def _start_dynamic_style_poll(self) -> None:
+        if not self.get_mapped():
+            return
         self._queue_dynamic_state_fetch()
 
         with self._state.lock:
@@ -3512,6 +3573,8 @@ class GridCard(DynamicIconMixin, HyprlandIPCMixin, GridCardBase):
         return GLib.SOURCE_REMOVE
 
     def _start_badge_monitor(self, path_str: str) -> None:
+        if not self.get_mapped():
+            return
         self._check_badge_tick(path_str)
 
         with self._state.lock:
@@ -3627,9 +3690,9 @@ class GridToggleCard(DynamicIconMixin, StateMonitorMixin, HyprlandIPCMixin, Grid
             if isinstance(val, bool):
                 self._set_visual(val)
 
-        self.connect("clicked", self._on_clicked)
-        self.connect("map", self._on_grid_toggle_map)
-        self.connect("unmap", self._on_grid_toggle_unmap)
+        _connect_owned(self, self, "clicked", self._on_clicked)
+        _connect_owned(self, self, "map", self._on_grid_toggle_map)
+        _connect_owned(self, self, "unmap", self._on_grid_toggle_unmap)
 
         self._start_state_monitor()
 
@@ -3640,7 +3703,6 @@ class GridToggleCard(DynamicIconMixin, StateMonitorMixin, HyprlandIPCMixin, Grid
         self._start_hyprland_ipc()
         self._resume_all_polls()
         self._start_state_monitor()
-        self.force_refresh()
 
     def _on_grid_toggle_unmap(self, _widget: Gtk.Widget) -> None:
         self._stop_hyprland_ipc()
@@ -3778,12 +3840,12 @@ class ServiceToggleRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ActionRow, _Servi
             # Show checking state initially
             self.set_subtitle(GLib.markup_escape_text(self._format_subtitle(None, checking=True)))
 
-        self.toggle_switch.connect("state-set", self._on_toggle_changed)
+        _connect_owned(self, self.toggle_switch, "state-set", self._on_toggle_changed)
         self.add_suffix(self.toggle_switch)
         self.set_activatable_widget(self.toggle_switch)
 
-        self.connect("map", self._on_service_map)
-        self.connect("unmap", self._on_service_unmap)
+        _connect_owned(self, self, "map", self._on_service_map)
+        _connect_owned(self, self, "unmap", self._on_service_unmap)
         self._start_hyprland_ipc()
 
     def _create_icon_widget(self, icon: object) -> Gtk.Image:
@@ -3827,12 +3889,6 @@ class ServiceToggleRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ActionRow, _Servi
                 except Exception:
                     pass
                 self._service_handle = None
-            if self._toggle_handle is not None:
-                try:
-                    self._toggle_handle.cancel()
-                except Exception:
-                    pass
-                self._toggle_handle = None
 
     def force_refresh(self) -> None:
         """Public hook for control_center page switch to force fresh check."""
@@ -3993,7 +4049,7 @@ class ServiceToggleRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ActionRow, _Servi
         return False
 
     def do_unroot(self) -> None:
-        sources = self._state.mark_destroyed_and_get_sources()
+        sources = _dispose_row(self)
         # cancel service handles
         if self._service_handle is not None:
             with suppress(Exception):
@@ -4041,9 +4097,9 @@ class ServiceToggleCard(DynamicIconMixin, HyprlandIPCMixin, GridCardBase, _Servi
             self.set_sensitive(False)
             self.set_tooltip_text(self._service_invalid_reason)
 
-        self.connect("clicked", self._on_clicked)
-        self.connect("map", self._on_card_map)
-        self.connect("unmap", self._on_card_unmap)
+        _connect_owned(self, self, "clicked", self._on_clicked)
+        _connect_owned(self, self, "map", self._on_card_map)
+        _connect_owned(self, self, "unmap", self._on_card_unmap)
 
         if _is_dynamic_icon(icon_conf) and isinstance(icon_conf, dict):
             self._start_icon_update_loop(icon_conf)
@@ -4067,10 +4123,6 @@ class ServiceToggleCard(DynamicIconMixin, HyprlandIPCMixin, GridCardBase, _Servi
                 with suppress(Exception):
                     self._service_handle.cancel()
                 self._service_handle = None
-            if self._toggle_handle is not None:
-                with suppress(Exception):
-                    self._toggle_handle.cancel()
-                self._toggle_handle = None
 
     def force_refresh(self) -> None:
         if self.get_mapped() and self._service_valid and not self._operation_in_progress:
@@ -4189,7 +4241,7 @@ class ServiceToggleCard(DynamicIconMixin, HyprlandIPCMixin, GridCardBase, _Servi
             self._toggle_handle = handle
 
     def do_unroot(self) -> None:
-        sources = self._state.mark_destroyed_and_get_sources()
+        sources = _dispose_row(self)
         if self._service_handle is not None:
             with suppress(Exception):
                 self._service_handle.cancel()

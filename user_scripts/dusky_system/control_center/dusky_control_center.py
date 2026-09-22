@@ -18,19 +18,16 @@ Validated Production Improvements:
 
 from __future__ import annotations
 
-import gc
 import logging
-import subprocess
+import signal
 import sys
 import threading
 import traceback
 from collections.abc import Callable, Iterator
-from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import (
-    TYPE_CHECKING,
     Any,
     Final,
     Literal,
@@ -91,7 +88,8 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
+gi.require_version("GLibUnix", "2.0")
+from gi.repository import Adw, Gdk, Gio, GLib, GLibUnix, Gtk, Pango
 
 import lib.rows as rows
 
@@ -331,13 +329,17 @@ class DuskyControlCenter(Adw.Application):
         Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.DEFAULT)
 
         self.hold()
+        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda *_: self.quit())
 
         result = self._load_config_and_css_sync()
         self._state.config = result["config"]
         self._state.css_content = result["css"]
         self._state.config_error = result["error"]
 
-        self._apply_css()
+        try:
+            self._apply_css()
+        except ValueError as error:
+            log.error("%s", error)
         self._build_ui()
 
         if self._window:
@@ -352,14 +354,15 @@ class DuskyControlCenter(Adw.Application):
         if self._window:
             if self._window.get_visible():
                 self._window.set_visible(False)
-                self._cancel_debounce()
-                gc.collect()
             else:
                 self._window.present()
 
     def do_shutdown(self) -> None:
         """Cleanup resources on application exit."""
         self._cancel_debounce()
+        if self._window:
+            self._window.destroy()
+        utility.flush_settings()
         self._remove_css_provider()
         self._directory_generator_cache.clear()
         self._file_generator_cache.clear()
@@ -521,11 +524,19 @@ class DuskyControlCenter(Adw.Application):
             return
 
         provider = Gtk.CssProvider()
+        errors: list[str] = []
+        def on_parse_error(_provider, _section, error):
+            if error.domain == "gtk-css-parser-error-quark":
+                errors.append(error.message)
+        provider.connect("parsing-error", on_parse_error)
         try:
             provider.load_from_string(self._state.css_content)
         except GLib.Error as e:
             log.error("CSS parsing failed: %s", e.message)
             return
+
+        if errors:
+            raise ValueError("CSS parsing failed: " + "; ".join(errors))
 
         old_provider = self._css_provider
         old_display = self._display
@@ -607,8 +618,6 @@ class DuskyControlCenter(Adw.Application):
         Hide window and suspend all background activity to achieve zero-CPU idle.
         """
         window.set_visible(False)
-        self._cancel_debounce()
-        gc.collect()
         return True
 
     def _on_key_pressed(
@@ -667,7 +676,7 @@ class DuskyControlCenter(Adw.Application):
         log.info("Hot Reload Initiated...")
 
         current_page = self._get_current_page_index()
-        old_config = deepcopy(self._state.config)
+        old_config = self._state.config
         old_css = self._state.css_content
         old_error = self._state.config_error
 
@@ -693,6 +702,10 @@ class DuskyControlCenter(Adw.Application):
 
                 if result is None:
                     self._toast("Reload Failed: No result", 3)
+                    return
+
+                if not result["success"]:
+                    self._toast(f"Reload Failed: {result['error']}", 4)
                     return
 
                 self._state.config = result["config"]
@@ -763,7 +776,7 @@ class DuskyControlCenter(Adw.Application):
         """
         Clear existing UI elements and rebuild from current config.
         """
-        self._cancel_debounce()
+        self._deactivate_search()
         self._directory_generator_cache.clear()
         self._file_generator_cache.clear()
         self._state.last_visible_page = None
@@ -808,6 +821,11 @@ class DuskyControlCenter(Adw.Application):
         """Find the widget by its ID, auto-scroll to it, and trigger a visual pulse."""
         widget = self._find_widget_by_name(parent, unique_id)
         if widget:
+            ancestor = widget.get_parent()
+            while ancestor is not None:
+                if isinstance(ancestor, Adw.ExpanderRow):
+                    ancestor.set_expanded(True)
+                ancestor = ancestor.get_parent()
             widget.grab_focus()
             widget.add_css_class("highlight-pulse")
             GLib.timeout_add(
@@ -915,6 +933,8 @@ class DuskyControlCenter(Adw.Application):
 
         if not normalized_query:
             self._reset_search_results("Search Results")
+            if self._state.last_visible_page:
+                self._stack.set_visible_child_name(self._state.last_visible_page)
             return GLib.SOURCE_REMOVE
 
         if self._state.last_visible_page is None:
@@ -1325,6 +1345,12 @@ class DuskyControlCenter(Adw.Application):
         if self._stack:
             if child := self._stack.get_child_by_name(page_name):
                 if isinstance(child, Adw.NavigationView):
+                    if child.get_visible_page() is None:
+                        idx = int(page_name.removeprefix(PAGE_PREFIX))
+                        config = self._state.config["pages"][idx]
+                        title = str(config.get("title", "Untitled"))
+                        ctx = self._get_context(child, self._build_nav_page, [title])
+                        child.add(self._build_nav_page(title, config.get("layout", []), ctx, root_tag=root_tag))
                     child.pop_to_tag(root_tag)
 
             self._stack.set_visible_child_name(page_name)
@@ -1347,8 +1373,6 @@ class DuskyControlCenter(Adw.Application):
         for idx, page in enumerate(pages):
             title = str(page.get("title", "Untitled"))
             icon = str(page.get("icon", ICON_DEFAULT))
-            root_tag = f"root_{idx}"
-
             row = self._create_sidebar_row(title, icon)
 
             if self._sidebar_list:
@@ -1359,15 +1383,6 @@ class DuskyControlCenter(Adw.Application):
                     target_row = row
 
             nav = Adw.NavigationView()
-
-            ctx = self._get_context(
-                nav_view=nav,
-                builder_func=self._build_nav_page,
-                path=[title],
-            )
-
-            root = self._build_nav_page(title, page.get("layout", []), ctx, root_tag=root_tag)
-            nav.add(root)
 
             if self._stack:
                 self._stack.add_named(nav, f"{PAGE_PREFIX}{idx}")
