@@ -49,7 +49,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
-VERSION = "9.7.3"
+VERSION = "9.7.4"
 SCRIPT_DIR: Path = Path(__file__).resolve().parent
 SCRIPT_PATH: Path = Path(__file__).resolve()
 PROFILES_DIR: Path = Path(
@@ -8700,16 +8700,41 @@ if _HAS_UI:
 
         @contextmanager
         def _suspend_ui(self):
-            # Public suspend API only: no private Textual driver fallbacks.
-            # When the terminal cannot be suspended, run inline with a warning
-            # rather than touching driver internals.
-            suspend = getattr(self, "suspend", None)
-            if callable(suspend):
-                with suspend():
-                    yield
-            else:
-                self.log_main("[WARN] UI suspend unavailable; running interactive task inline.")
-                yield
+            # The async child wait leaves Textual timers alive. Prevent them
+            # from writing to the stopped driver's bounded output queue.
+            error: BaseException | None = None
+            with self.batch_update():
+                with self.suspend():
+                    tty_fd: int | None = None
+                    tty_attrs = None
+                    try:
+                        # Capture cooked mode AFTER suspension, before a child
+                        # TUI can change it (or leave raw mode after a crash).
+                        try:
+                            tty_fd = os.open("/dev/tty", os.O_RDWR | os.O_CLOEXEC)
+                            tty_attrs = termios.tcgetattr(tty_fd)
+                        except (OSError, termios.error):
+                            pass
+                        yield
+                    except BaseException as exc:
+                        # App.suspend() resumes only on normal context exit.
+                        # Defer even cancellation until its driver is restored.
+                        error = exc
+                    finally:
+                        if tty_fd is not None:
+                            try:
+                                if tty_attrs is not None:
+                                    termios.tcsetattr(tty_fd, termios.TCSANOW, tty_attrs)
+                            except (OSError, termios.error) as exc:
+                                self.log_main(f"[WARN] Terminal mode restoration failed: {exc}")
+                            finally:
+                                with suppress(OSError):
+                                    os.close(tty_fd)
+                # A nested TUI replaces the alternate screen. Invalidate the
+                # whole screen, including regions unchanged in our widget tree.
+                self.screen.refresh(repaint=True, layout=True)
+            if error is not None:
+                raise error.with_traceback(error.__traceback__)
 
         @staticmethod
         def _interactive_tree_pids(root_pid: int) -> list[int]:
@@ -10736,10 +10761,44 @@ def _adopt_inherited_lock(info: dict) -> bool:
                 os.close(old_fd)
         else:
             _LOCK_FD = old_fd
+        os.set_inheritable(_LOCK_FD, False)
         atexit.register(_cleanup_lock)
         return True
     except (TypeError, ValueError, OSError):
         return False
+
+
+def _adopt_current_process_lock() -> bool:
+    """Recover an exec-inherited lock independently of handoff schema changes.
+
+    Match the live descriptor, current lock inode, and our unchanged exec PID.
+    Never remove a lock file or release another process's lock.
+    """
+    try:
+        effective = lock_path()
+        target = effective.stat()
+        for name in os.listdir("/proc/self/fd"):
+            if not name.isdecimal() or int(name) < 3:
+                continue
+            fd = int(name)
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                if (st.st_dev, st.st_ino) != (target.st_dev, target.st_ino):
+                    continue
+                if os.pread(fd, 64, 0).strip() != str(os.getpid()).encode("ascii"):
+                    continue
+                if _adopt_inherited_lock({
+                    "fd": fd, "ino": st.st_ino, "dev": st.st_dev,
+                    "path": str(effective),
+                }):
+                    return True
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return False
 
 
 def _adopt_handoff_sudo(payload: dict | Path | None) -> bool:
@@ -10802,6 +10861,8 @@ if __name__ == "__main__":
                 if _early_handoff is not None and isinstance(_early_handoff.get("lock"), dict):
                     inherited_lock = _early_handoff["lock"]
             if inherited_lock is not None and _adopt_inherited_lock(inherited_lock):
+                adopted_lock = True
+            elif OPT_POST_SELF_UPDATE and _adopt_current_process_lock():
                 adopted_lock = True
             else:
                 # A malformed/stale handoff must not leave the old exec-inherited
