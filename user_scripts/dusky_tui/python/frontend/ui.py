@@ -8,11 +8,9 @@ import shlex
 import shutil
 import asyncio
 import math
-import copy
 import sys
 import signal
 import tempfile
-import threading
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,8 +61,9 @@ _ICON_PENCIL = "\uf040"    # nf-fa-pencil
 _ICON_ARROW  = "\uf061"    # nf-fa-arrow-right
 
 _RE_RGB = re.compile(r"rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)")
-_RE_HSL = re.compile(r"hsla?\(\s*([\d.]+)\s*,\s*([\d.]+)%?\s*,\s*([\d.]+)%?")
-_RE_OKLCH = re.compile(r"oklch\(\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)")
+_COLOR_NUMBER = r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))"
+_RE_HSL = re.compile(rf"hsla?\(\s*{_COLOR_NUMBER}\s*,\s*{_COLOR_NUMBER}%?\s*,\s*{_COLOR_NUMBER}%?")
+_RE_OKLCH = re.compile(rf"oklch\(\s*{_COLOR_NUMBER}(%)?\s+{_COLOR_NUMBER}\s+{_COLOR_NUMBER}")
 _RE_RGBA_ALPHA = re.compile(r"rgba\([^,]+,[^,]+,[^,]+,\s*([0-9.]+)\)")
 _RE_HSLA_ALPHA = re.compile(r"hsla\([^,]+,[^,]+,[^,]+,\s*([0-9.]+)\)")
 
@@ -229,6 +228,8 @@ class PresetMatchMatrix:
 
         for p in presets:
             puid = p.uid
+            if puid in self._expected:
+                continue
             self._preset_uids.append(puid)
             payload = p.preset_payload or {}
             all_def = bool(payload.get("__ALL_DEFAULTS__", False))
@@ -347,15 +348,6 @@ class PresetMatchMatrix:
                 return item.serialize(raw)
             except Exception:
                 pass
-        # Legacy fallback – some callers may populate a single-item map
-        single = getattr(self._app, "_item_by_uid", None)
-        if isinstance(single, dict):
-            item2 = single.get(uid)
-            if item2 is not None:
-                try:
-                    return item2.serialize(raw)
-                except Exception:
-                    pass
         match raw:
             case None:
                 return "nil"
@@ -416,8 +408,6 @@ def _oklch_to_rgb(L: float, C: float, H: float) -> tuple[int, int, int]:
 
 
 _RE_HYPR_HEX = re.compile(r"^rgba?\(([0-9a-fA-F]+)\)$")
-_RE_VAR_CSS = re.compile(r"^var\(--([^)]+)\)$")
-_RE_VAR_MAT = re.compile(r"^\{\{([^}]+)\}\}$")
 
 
 @lru_cache(maxsize=1024)
@@ -491,19 +481,23 @@ def color_to_rgb(val: str) -> tuple[int, int, int]:
 
     # Functional rgb/rgba.
     if m_rgb := _RE_RGB.match(val):
-        return (int(m_rgb.group(1)), int(m_rgb.group(2)), int(m_rgb.group(3)))
+        return tuple(min(255, int(component)) for component in m_rgb.groups())
 
     # Functional hsl/hsla.
     if m_hsl := _RE_HSL.match(val):
-        h = float(m_hsl.group(1)) / 360.0
-        s = float(m_hsl.group(2)) / 100.0
-        l_ = float(m_hsl.group(3)) / 100.0
+        h = (float(m_hsl.group(1)) % 360.0) / 360.0
+        s = max(0.0, min(1.0, float(m_hsl.group(2)) / 100.0))
+        l_ = max(0.0, min(1.0, float(m_hsl.group(3)) / 100.0))
         r, g, b = colorsys.hls_to_rgb(h, l_, s)
         return (int(r * 255), int(g * 255), int(b * 255))
 
     # OKLCH.
     if m_oklch := _RE_OKLCH.match(val):
-        r, g, b = _oklch_to_rgb(float(m_oklch.group(1)), float(m_oklch.group(2)), float(m_oklch.group(3)))
+        lightness = float(m_oklch.group(1)) / (100 if m_oklch.group(2) else 1)
+        chroma, hue = float(m_oklch.group(3)), float(m_oklch.group(4))
+        if not all(map(math.isfinite, (lightness, chroma, hue))):
+            return (128, 128, 128)
+        r, g, b = _oklch_to_rgb(max(0.0, min(1.0, lightness)), max(0.0, min(1.0, chroma)), hue % 360)
         return (
             max(0, min(255, int(r))),
             max(0, min(255, int(g))),
@@ -513,6 +507,7 @@ def color_to_rgb(val: str) -> tuple[int, int, int]:
     return KNOWN_COLORS_LOWER.get(val, (128, 128, 128))
 
 
+@lru_cache(maxsize=1024)
 def get_color_name(r: int, g: int, b: int) -> str:
     best_name = "Unknown"
     best_dist = float("inf")
@@ -527,6 +522,7 @@ def get_color_name(r: int, g: int, b: int) -> str:
 
 
 def format_rgb(color_name: str, fmt: str, original_val: str) -> str:
+    original_val = original_val.strip()
     r, g, b = KNOWN_COLORS.get(color_name, (128, 128, 128))
 
     if fmt == "hypr_hex":
@@ -541,6 +537,8 @@ def format_rgb(color_name: str, fmt: str, original_val: str) -> str:
         return f"{prefix}({r:02x}{g:02x}{b:02x}{suffix})"
 
     if fmt == "hex":
+        if len(original_val) == 5 and original_val.startswith("#"):
+            return f"#{r:02x}{g:02x}{b:02x}{original_val[-1] * 2}"
         if len(original_val) == 9 and original_val.startswith("#"):
             return f"#{r:02x}{g:02x}{b:02x}{original_val[7:9]}"
         return f"#{r:02x}{g:02x}{b:02x}"
@@ -600,7 +598,7 @@ def load_matugen_json(file_path: Path) -> dict[str, str] | None:
             if isinstance(data, dict):
                 return data
             return None
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return None
 
 
@@ -961,7 +959,7 @@ class HybridInputScreen(ModalScreen[str | None]):
 
     @on(OptionList.OptionHighlighted)
     def handle_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
-        if self.options and event.option_index is not None and 0 <= event.option_index < len(self.options):
+        if event.option_list.has_focus and self.options and event.option_index is not None and 0 <= event.option_index < len(self.options):
             val = str(self.options[event.option_index])
             inp = self.query_one(Input)
             if inp.value != val:
@@ -1087,8 +1085,8 @@ class PickerScreen(ModalScreen[str | None]):
 class SearchScreen(ModalScreen[tuple[int, int] | None]):
     BINDINGS = [
         Binding("escape", "dismiss_modal", "Cancel", priority=True),
-        Binding("down,j", "cursor_down", "Down", priority=True),
-        Binding("up,k", "cursor_up", "Up", priority=True),
+        Binding("down", "cursor_down", "Down", priority=True),
+        Binding("up", "cursor_up", "Up", priority=True),
         Binding("page_up,ctrl+u", "page_up", "Page Up", priority=True),
         Binding("page_down,ctrl+d", "page_down", "Page Down", priority=True),
     ]
@@ -1109,7 +1107,7 @@ class SearchScreen(ModalScreen[tuple[int, int] | None]):
         self._last_query = None
 
         for tab_idx, tab_items in self.app.schema.items():
-            tab_name = self.app.tabs[tab_idx] if tab_idx < len(self.app.tabs) else f"Tab {tab_idx}"
+            tab_name = self.app.tabs.get(tab_idx, f"Tab {tab_idx}")
             for item_idx, item in enumerate(tab_items):
                 label_norm = item.label.casefold()
                 haystack = f"{tab_name} {item.label} {item.key} {item.type_}".casefold()
@@ -1424,20 +1422,14 @@ class ConfigOptionList(OptionList):
         self._last_click_x = getattr(event, "x", 0)
         self._last_click_button = getattr(event, "button", 1)
 
-        if hasattr(super(), "on_mouse_down"):
-            super().on_mouse_down(event)
-
         self._mouse_down_highlight = self.highlighted
 
     def on_mouse_move(self, event: events.MouseMove) -> None:
-        if hasattr(super(), "on_mouse_move"):
-            super().on_mouse_move(event)
-
         try:
-            line_idx = int(self.scroll_y) + int(event.y)
+            line_idx = event.style.meta.get("option")
             new_tooltip = None
 
-            if 0 <= line_idx < self.option_count:
+            if line_idx is not None and 0 <= line_idx < self.option_count:
                 opt = self.get_option_at_index(line_idx)
                 parsed = self.app._get_item_from_id(opt.id)
 
@@ -1463,29 +1455,13 @@ class ConfigOptionList(OptionList):
             if self.tooltip is not None:
                 self.tooltip = None
 
-    def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
-        if hasattr(super(), "on_mouse_scroll_down"):
-            super().on_mouse_scroll_down(event)
-        else:
-            self.scroll_down(animate=False)
-
-    def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
-        if hasattr(super(), "on_mouse_scroll_up"):
-            super().on_mouse_scroll_up(event)
-        else:
-            self.scroll_up(animate=False)
-
     def watch_scroll_y(self, old_value: float, new_value: float) -> None:
-        if hasattr(super(), "watch_scroll_y"):
-            super().watch_scroll_y(old_value, new_value)
+        super().watch_scroll_y(old_value, new_value)
 
         if hasattr(self.app, "_update_scroll_indicators"):
             self.app._update_scroll_indicators()
 
     def watch_max_scroll_y(self, old_value: float, new_value: float) -> None:
-        if hasattr(super(), "watch_max_scroll_y"):
-            super().watch_max_scroll_y(old_value, new_value)
-
         if hasattr(self.app, "_update_scroll_indicators"):
             self.app._update_scroll_indicators()
 
@@ -1677,17 +1653,6 @@ class FlowContainer(Widget):
 
         width = self.size.width
         if width <= 0:
-            # Width not yet resolved (hidden tab or initial layout).  A
-            # single retry is enough – the next Resize event will reflow
-            # anyway.  Avoid infinite call_after_refresh loops.
-            if not getattr(self, "_reflow_retry_scheduled", False):
-                self._reflow_retry_scheduled = True
-
-                def _retry() -> None:
-                    self._reflow_retry_scheduled = False
-                    self.reflow()
-
-                self.call_after_refresh(_retry)
             return
 
         visible_children = []
@@ -1797,6 +1762,7 @@ class TabContainer(Horizontal):
     """
 
     def watch_scroll_x(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_x(old_value, new_value)
         if hasattr(self.app, "check_tab_overflow"):
             self.app.check_tab_overflow()
 
@@ -1863,6 +1829,8 @@ class CustomRichTabWidget(Static):
         self.refresh_interval = refresh_interval
         self._refresh_timer: Timer | None = None
         self._refresh_inflight = False
+        self._factory_source = None
+        self._factory_takes_app = False
 
     def on_mount(self) -> None:
         self.update_content()
@@ -1896,24 +1864,20 @@ class CustomRichTabWidget(Static):
         if not callable(factory):
             return factory
 
-        import inspect
-        try:
-            sig = inspect.signature(factory)
-        except (TypeError, ValueError):
+        if factory is not self._factory_source:
+            import inspect
             try:
-                return factory(self.app_ref)
-            except TypeError:
-                return factory()
-
-        required_positional = [
-            p for p in sig.parameters.values()
-            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            and p.default is inspect.Parameter.empty
-        ]
-
-        if not required_positional:
-            return factory()
-        return factory(self.app_ref)
+                parameters = inspect.signature(factory).parameters.values()
+            except (TypeError, ValueError):
+                self._factory_takes_app = True
+            else:
+                self._factory_takes_app = any(
+                    p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                    and p.default is inspect.Parameter.empty
+                    for p in parameters
+                )
+            self._factory_source = factory
+        return factory(self.app_ref) if self._factory_takes_app else factory()
 
     def update_content(self) -> None:
         if self._refresh_inflight:
@@ -2262,6 +2226,9 @@ Tooltip {
         else:
             self.tabs = {0: "General"}
 
+        self._initial_tab = next(iter(self.tabs), None)
+        self.user_presets_tab_idx = self._initial_tab if self._initial_tab is not None else 0
+
         # Route User Presets to their proper schema tab assignment automatically.
         if self.user_presets_tab_name:
             for idx, name in self.tabs.items():
@@ -2291,7 +2258,6 @@ Tooltip {
                 self._committed[(t_idx, i_idx)] = clone_value(item.value)
 
         self._save_lock: asyncio.Lock | None = None
-        self._global_save_timer: Timer | None = None
         self._save_queued_during_run = False
 
         self._key_map: dict[str, tuple[int, int]] = {}
@@ -2315,13 +2281,16 @@ Tooltip {
         }
 
         self.last_theme_mtime: float = 0.0
+        self._last_theme_fingerprint = None
         if self.theme_path:
             loaded_theme = load_matugen_json(self.theme_path)
             if loaded_theme:
                 self.theme_colors.update(loaded_theme)
 
             try:
-                self.last_theme_mtime = self.theme_path.stat().st_mtime
+                theme_stat = self.theme_path.stat()
+                self.last_theme_mtime = theme_stat.st_mtime
+                self._last_theme_fingerprint = (theme_stat.st_mtime_ns, theme_stat.st_size, theme_stat.st_ino)
             except OSError:
                 pass
 
@@ -2344,6 +2313,7 @@ Tooltip {
 
         # Schema indexes.
         self._items_by_uid: dict[str, list[tuple[int, int, ConfigItem]]] = {}
+        self._item_refs: dict[int, tuple[int, int]] = {}
         self._items_by_engine: dict[tuple[str, str], list[tuple[int, int, ConfigItem]]] = {}
         self._children_by_parent: defaultdict[tuple[int, str], list[ConfigItem]] = defaultdict(list)
         self._configurable_items: list[tuple[int, int, ConfigItem]] = []
@@ -2371,7 +2341,10 @@ Tooltip {
         # Color variable registry.
         self._color_var_registry: dict[str, str] = {}
         self._color_var_counter: int = 1
+        self._deferred_started = False
 
+        self._engine_info_cache: dict[tuple[str | None, str | None], tuple[str, str]] = {}
+        self._init_boot_state()
         self._rebuild_indexes()
 
     # =========================================================================
@@ -2391,7 +2364,7 @@ Tooltip {
             self._sudo_keepalive = None
 
         # BATCH mode: don't silently throw away queued writes.
-        if not self.auto_save and self.pending_commits:
+        if self.pending_commits and not self._save_tasks and (not self.auto_save or not self._save_timers):
             def on_reply(reply: str) -> None:
                 if reply == "save":
                     self._quit_after_save = True
@@ -2458,7 +2431,7 @@ Tooltip {
             yield Label("", id="telemetry-banner")
 
             with Horizontal(id="content-area"):
-                with ContentSwitcher(initial="tab-0", id="content-switcher"):
+                with ContentSwitcher(initial=f"tab-{self._initial_tab}" if self._initial_tab is not None else None, id="content-switcher"):
                     for i, name in self.tabs.items():
                         with Vertical(id=f"tab-{i}"):
                             tab_notices = self.tab_notices.get(i)
@@ -2521,10 +2494,19 @@ Tooltip {
     def _sync_pending(self, tab_idx: int, item_idx: int, item: ConfigItem) -> None:
         key = (tab_idx, item_idx)
         baseline = self._committed.get(key, item.default)
-        if item.value == baseline:
+        if (
+            item.serialize(item.value) == item.serialize(baseline)
+            and not is_trigger_item(item)
+            and not self._active_save_count
+        ):
             self.pending_commits.discard(key)
         else:
             self.pending_commits.add(key)
+
+    def _item_is_pending(self, item: ConfigItem) -> bool:
+        ref = self._item_refs.get(id(item))
+        baseline = self._committed.get(ref, item.initial_value)
+        return item.serialize(item.value) != item.serialize(baseline)
 
     def _current_tab_index(self) -> int | None:
         try:
@@ -2570,6 +2552,11 @@ Tooltip {
         """
         Resolves target engine and file config dynamically via overrides.
         """
+        overrides = (item.engine_type_override, item.target_file_override)
+        if overrides == (None, None):
+            return self.default_engine_key
+        if cached := self._engine_info_cache.get(overrides):
+            return cached
         e_type = (
             item.engine_type_override.lower()
             if item.engine_type_override
@@ -2582,11 +2569,14 @@ Tooltip {
             else self.default_engine_key[1]
         )
 
-        return (e_type, t_file)
+        result = (e_type, t_file)
+        self._engine_info_cache[overrides] = result
+        return result
 
     def _uid_engine_key(self, item: ConfigItem) -> str:
         """Composite key for per-file isolation: UID + engine."""
-        return f"{self._get_item_uid(item)}@@{self._get_item_engine_info(item)[0]}@@{self._get_item_engine_info(item)[1]}"
+        engine_type, target_file = self._get_item_engine_info(item)
+        return f"{item.uid}@@{engine_type}@@{target_file}"
 
     def _get_engine_for_item(self, item: ConfigItem) -> BaseEngine:
         key = self._get_item_engine_info(item)
@@ -2643,8 +2633,10 @@ Tooltip {
     # SCHEMA INDEXES
     # =========================================================================
     def _rebuild_indexes(self) -> None:
+        self._engine_info_cache.clear()
         self._key_map.clear()
         self._items_by_uid.clear()
+        self._item_refs.clear()
         self._items_by_engine.clear()
         self._children_by_parent.clear()
         self._configurable_items.clear()
@@ -2652,6 +2644,7 @@ Tooltip {
 
         for t_idx, items in self.schema.items():
             for i_idx, item in enumerate(items):
+                self._item_refs[id(item)] = (t_idx, i_idx)
                 uid = self._get_item_uid(item)
 
                 self._key_map[uid] = (t_idx, i_idx)
@@ -2718,10 +2711,8 @@ Tooltip {
         if parent_item.type_ not in ("menu", "action", "preset"):
             v_ser = parent_item.serialize(parent_item.value)
             d_ser = parent_item.serialize(parent_item.default)
-            init_val = parent_item.initial_value if getattr(parent_item, "initial_value", None) is not None else parent_item.value
-            i_ser = parent_item.serialize(init_val)
             parent_modified = (v_ser != d_ser)
-            parent_pending = (v_ser != i_ser)
+            parent_pending = self._item_is_pending(parent_item)
 
         parent_key = parent_item.key
         parent_uid = self._get_item_uid(parent_item)
@@ -2751,12 +2742,10 @@ Tooltip {
                 if itm.type_ not in ("menu", "action", "preset"):
                     v_ser = itm.serialize(itm.value)
                     d_ser = itm.serialize(itm.default)
-                    init_val = itm.initial_value if getattr(itm, "initial_value", None) is not None else itm.value
-                    i_ser = itm.serialize(init_val)
 
                     if v_ser != d_ser:
                         any_modified = True
-                    if v_ser != i_ser:
+                    if self._item_is_pending(itm):
                         any_pending = True
 
                     if _settled():
@@ -2779,15 +2768,13 @@ Tooltip {
         tab_idx: int | None = None
     ) -> Text:
         val_ser = item.serialize(item.value)
-        init_val = item.initial_value if getattr(item, "initial_value", None) is not None else item.value
-        init_ser = item.serialize(init_val)
         def_ser = item.serialize(item.default)
         ratio_bucket = int(self._get_preset_match_ratio(item) * 10) if item.type_ == "preset" else -1
 
         if item.is_parent or item.type_ == "menu":
             is_modified, is_pending = self._get_parent_children_status(item, tab_idx)
         else:
-            is_pending = (val_ser != init_ser)
+            is_pending = self._item_is_pending(item)
             is_modified = (val_ser != def_ser)
 
         try:
@@ -3077,19 +3064,7 @@ Tooltip {
             return self._option_cache.put(cache_key, txt)
         return txt
 
-    def _intern_styles(self) -> None:
-        c = getattr(self, "theme_colors", {})
-        self._style = {
-            "cursor_hl": f"{c.get('accent', '#a8c8ff')} bold",
-            "cursor": "",
-            "muted": c.get("muted", "#43474e"),
-            "accent_bold": f"{c.get('accent', '#a8c8ff')} bold",
-            "fg": c.get("fg", "#e1e2e9"),
-            "fg_bold": f"{c.get('fg', '#e1e2e9')} bold",
-            "success": c.get("success", "#dbbce1"),
-            "warning": c.get("warning", "#bdc7dc"),
-            "error": c.get("error", "#ffb4ab"),
-        }
+    def _invalidate_theme_cache(self) -> None:
         self._theme_version = getattr(self, "_theme_version", 0) + 1
         if hasattr(self, "_option_cache"):
             self._option_cache.clear()
@@ -3115,9 +3090,9 @@ Tooltip {
                 if not isinstance(payload, dict):
                     payload = {"__INVALID__": True, "__ERROR__": "Expected JSON object"}
                     warning = "Invalid preset payload: expected JSON object"
-            except json.JSONDecodeError as exc:
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
                 payload = {"__INVALID__": True, "__ERROR__": str(exc)}
-                warning = "Invalid preset JSON file"
+                warning = f"Unable to read preset: {exc}"
             records.append((name, payload, warning))
         return records
 
@@ -3287,9 +3262,8 @@ Tooltip {
         except Exception:
             pass
 
-        self._intern_styles()
         self.call_after_refresh(self.check_tab_overflow)
-        self.run_deferred_boot(initial_tab=0)
+        self.run_deferred_boot(initial_tab=self._initial_tab)
 
         if first_ol := self.current_option_list:
             first_ol.focus()
@@ -3316,26 +3290,6 @@ Tooltip {
         self.call_after_refresh(self.check_tab_overflow)
         self.call_after_refresh(self._update_scroll_indicators)
         self._update_footer_legend()
-
-        # Deferred loading in background.
-        if self.deferred_load:
-            def _deferred_worker():
-                try:
-                    res = self.deferred_load()
-
-                    if isinstance(res, tuple) and len(res) == 2:
-                        updated_tabs, new_items = res
-                    else:
-                        updated_tabs = res
-                        new_items = None
-
-                    deferred_states = {ekey: eng.load_state() for ekey, eng in self.engine_pool.items()}
-                    self.call_from_thread(self._apply_deferred_tabs, updated_tabs, deferred_states, new_items)
-
-                except Exception as e:
-                    print(f"[DuskyTUI] Deferred load error: {e}", file=sys.stderr)
-
-            threading.Thread(target=_deferred_worker, daemon=True).start()
 
         # Global schema popup.
         if self.global_popup:
@@ -3466,11 +3420,34 @@ Tooltip {
             if hasattr(self, "_option_cache"):
                 self._option_cache.invalidate_presets()
             self._schema_dirty_counter += 1
+            self._refresh_presets_ui()
+        if self._boot_complete and self.deferred_load and not self._deferred_started:
+            self._deferred_started = True
+            self._run_deferred_load()
+
+    @work(exclusive=True, group="deferred-tabs", exit_on_error=False)
+    async def _run_deferred_load(self) -> None:
+        try:
+            result = await asyncio.to_thread(self.deferred_load)
+            if isinstance(result, tuple) and len(result) == 2:
+                updated_tabs, new_items = result
+            else:
+                updated_tabs, new_items = result, None
+            def load_states():
+                return {key: engine.load_state() for key, engine in self.engine_pool.items()}
+            async with self._save_lock:
+                states = await self._run_save_io(load_states)
+            self._apply_deferred_tabs(updated_tabs, states, new_items)
+        except Exception:
+            LOGGER.exception("Deferred tab loading failed")
 
     @work(exclusive=True, group="engine-boot", exit_on_error=False)
-    async def run_deferred_boot(self, *, initial_tab: int = 0) -> None:
-        self._init_boot_state()
-        preset_records = await asyncio.to_thread(self._read_user_presets)
+    async def run_deferred_boot(self, *, initial_tab: int | None = 0) -> None:
+        try:
+            preset_records = await asyncio.to_thread(self._read_user_presets)
+        except OSError as exc:
+            preset_records = []
+            self.notify_status(f"Unable to load user presets: {exc}", level="error")
         self._apply_user_presets(preset_records)
         self._rebuild_indexes()
 
@@ -3537,6 +3514,9 @@ Tooltip {
 
     def require_boot_complete(self) -> bool:
         if getattr(self, "_boot_complete", True):
+            if self._failed_engines:
+                self.notify_status("A configuration backend failed to load; restart after fixing it.", level="error")
+                return False
             return True
         self.notify_status(
             "Still loading configuration backends — try again in a moment.",
@@ -3566,13 +3546,32 @@ Tooltip {
         current_group = None
         first_item_id = None
 
-        children_map = {self._get_item_uid(itm): [] for itm in items}
+        parents = {itm.uid: idx for idx, itm in enumerate(items) if itm.is_parent or itm.type_ == "menu"}
+        for idx, itm in enumerate(items):
+            if itm.is_parent or itm.type_ == "menu":
+                parents.setdefault(itm.key, idx)
+        children_map = defaultdict(list)
         root_items = []
-
+        parent_indices = {
+            idx: parents[itm.parent_ref]
+            for idx, itm in enumerate(items)
+            if itm.parent_ref in parents and parents[itm.parent_ref] != idx
+        }
+        # Break malformed cycles so every tree has a visible root.
+        checked = set()
+        for start in tuple(parent_indices):
+            chain = set()
+            current = start
+            while current in parent_indices and current not in checked:
+                if current in chain:
+                    del parent_indices[current]
+                    break
+                chain.add(current)
+                current = parent_indices[current]
+            checked.update(chain)
         for orig_idx, itm in enumerate(items):
-            pref = itm.parent_ref
-            if pref and pref in children_map:
-                children_map[pref].append((orig_idx, itm))
+            if orig_idx in parent_indices:
+                children_map[parent_indices[orig_idx]].append((orig_idx, itm))
             else:
                 root_items.append((orig_idx, itm))
 
@@ -3583,8 +3582,14 @@ Tooltip {
             if not k.startswith(prefix_key)
         }
 
+        visited: set[int] = set()
+        stack = [(idx, itm, [i == len(root_items) - 1]) for i, (idx, itm) in reversed(list(enumerate(root_items)))]
+
         def traverse(node_idx: int, node_item: ConfigItem, is_last_sibling_list: list[bool]):
             nonlocal current_group, first_item_id
+            if node_idx in visited:
+                return
+            visited.add(node_idx)
 
             if node_item.group and node_item.group != current_group:
                 current_group = node_item.group
@@ -3599,7 +3604,7 @@ Tooltip {
             is_hl = (
                 (maintain_highlight_id == opt_id)
                 if maintain_highlight_id
-                else (tab_idx == 0 and first_item_id == opt_id)
+                else first_item_id == opt_id
             )
 
             prefix = ""
@@ -3620,28 +3625,32 @@ Tooltip {
                 )
             )
 
-            if node_item.is_parent and node_item.expanded:
-                uid = self._get_item_uid(node_item)
-                children = children_map.get(uid, [])
+            if (node_item.is_parent or node_item.type_ == "menu") and node_item.expanded:
+                children = children_map.get(node_idx, [])
 
-                for i, (child_idx, child_item) in enumerate(children):
+                for i, (child_idx, child_item) in reversed(list(enumerate(children))):
                     is_last = (i == len(children) - 1)
-                    traverse(child_idx, child_item, is_last_sibling_list + [is_last])
+                    stack.append((child_idx, child_item, is_last_sibling_list + [is_last]))
 
-        for i, (orig_idx, itm) in enumerate(root_items):
-            is_last = (i == len(root_items) - 1)
-            traverse(orig_idx, itm, [is_last])
+        while stack:
+            traverse(*stack.pop())
 
         ol.clear_options()
         ol.add_options(options)
+        positions = []
+        count = 0
+        for option in options:
+            count += not option.disabled
+            positions.append(count)
+        ol._selectable_positions = positions
 
         if maintain_highlight_id:
             try:
                 ol.highlighted = ol.get_option_index(maintain_highlight_id)
             except OptionDoesNotExist:
-                ol.highlighted = 0 if ol.option_count > 0 else None
+                ol.highlighted = ol.get_option_index(first_item_id) if first_item_id else None
 
-        elif first_item_id and tab_idx == 0:
+        elif first_item_id:
             ol.last_highlighted_id = first_item_id
             try:
                 ol.highlighted = ol.get_option_index(first_item_id)
@@ -3664,11 +3673,50 @@ Tooltip {
         states: dict,
         new_items: dict[int, list[ConfigItem]] | None = None
     ) -> None:
+        if new_items and (self._save_tasks or self._save_timers or self._save_auth_pending):
+            # Save callbacks hold positional references. Finish them before
+            # replacing lists; ordinary batch edits can be remapped below.
+            self.set_timer(0.1, lambda: self._apply_deferred_tabs(tab_indices, states, new_items))
+            return
         self._schema_dirty_counter += 1
 
+        remapped = {}
+        replaced_tabs = set()
         for tab_idx in tab_indices:
             if new_items and tab_idx in new_items:
+                replaced_tabs.add(tab_idx)
+                old_items = defaultdict(deque)
+                for old_idx, old_item in enumerate(self.schema.get(tab_idx, [])):
+                    identity = self._uid_engine_key(old_item)
+                    old_items[identity].append((old_idx, old_item))
+                    self._bump_write_generation(identity)
+                for new_idx, new_item in enumerate(new_items[tab_idx]):
+                    matches = old_items.get(self._uid_engine_key(new_item))
+                    if not matches:
+                        continue
+                    old_idx, old_item = matches.popleft()
+                    remapped[(tab_idx, old_idx)] = (tab_idx, new_idx)
+                    if old_item._initial_loaded:
+                        new_item.value = clone_value(old_item.value)
+                        new_item.initial_value = clone_value(old_item.initial_value)
+                        new_item.exists_in_target = old_item.exists_in_target
+                        new_item._initial_loaded = True
+                        new_item.expanded = old_item.expanded
                 self.schema[tab_idx] = new_items[tab_idx]
+
+        if replaced_tabs:
+            def remap(ref):
+                return remapped.get(ref) if ref[0] in replaced_tabs else ref
+
+            self._committed = {new_ref: value for ref, value in self._committed.items() if (new_ref := remap(ref)) is not None}
+            self.pending_commits = {new_ref for ref in self.pending_commits if (new_ref := remap(ref)) is not None}
+            for history in (self.undo_stack, self.redo_stack):
+                transactions = [
+                    [(*new_ref, old, new) for ti, ii, old, new in transaction if (new_ref := remap((ti, ii))) is not None]
+                    for transaction in history
+                ]
+                history.clear()
+                history.extend(transaction for transaction in transactions if transaction)
 
         self._rebuild_indexes()
 
@@ -3682,6 +3730,10 @@ Tooltip {
 
         for tab_idx in tab_indices:
             for idx, item in enumerate(self.schema.get(tab_idx, [])):
+                # A late discovery refresh must not overwrite edits or reset
+                # launch/committed baselines for already loaded settings.
+                if item._initial_loaded:
+                    continue
                 engine_key = self._get_item_engine_info(item)
                 state = states.get(engine_key, {})
                 raw = self._lookup_state(state, item)
@@ -3926,7 +3978,6 @@ Tooltip {
             tabs = self.query_one(Tabs)
 
             if tab_widget.region.width == 0:
-                self.call_after_refresh(lambda: self.scroll_tab_into_view(tab_widget))
                 return
 
             tab_offset_x = tab_widget.region.x - tabs.region.x
@@ -3972,6 +4023,8 @@ Tooltip {
         return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
 
     async def watch_target_file(self) -> None:
+        if not self._boot_complete:
+            return
         try:
             changed_any = False
 
@@ -4031,7 +4084,8 @@ Tooltip {
                     for uek in items_by_uek
                 }
                 try:
-                    new_state = await asyncio.to_thread(engine.load_state)
+                    async with self._save_lock:
+                        new_state = await self._run_save_io(engine.load_state)
                 except Exception as exc:
                     # Do not consume the fingerprint when parsing/loading
                     # failed; the next poll can retry the same file.
@@ -4066,6 +4120,7 @@ Tooltip {
                             item.exists_in_target = expected_exists
                             self._on_item_value_changed(item)
                             group_changed = True
+                        self._committed[(_t_idx, _i_idx)] = clone_value(new_val)
 
                     if group_changed:
                         self._bump_write_generation(uek)
@@ -4099,7 +4154,8 @@ Tooltip {
 
     async def watch_presets_dir(self) -> None:
         if (
-            not self.enable_user_presets
+            not self._boot_complete
+            or not self.enable_user_presets
             or not hasattr(self, "user_presets_dir")
         ):
             return
@@ -4147,13 +4203,15 @@ Tooltip {
         try:
             stat_info = await asyncio.to_thread(self.theme_path.stat)
             current_mtime = stat_info.st_mtime
+            fingerprint = (stat_info.st_mtime_ns, stat_info.st_size, stat_info.st_ino)
 
-            if current_mtime > self.last_theme_mtime:
+            if fingerprint != self._last_theme_fingerprint:
                 new_theme = await asyncio.to_thread(load_matugen_json, self.theme_path)
 
                 if new_theme is not None:
                     self._schema_dirty_counter += 1
                     self.last_theme_mtime = current_mtime
+                    self._last_theme_fingerprint = fingerprint
 
                     self.theme_colors.update(new_theme)
                     self.apply_theme_to_engine()
@@ -4208,7 +4266,7 @@ Tooltip {
         self.register_theme(custom_theme)
         self.theme = theme_name
         # Invalidate render cache so next _build_option picks up new palette.
-        self._intern_styles()
+        self._invalidate_theme_cache()
 
     def _update_file_link(self, item: ConfigItem | None = None) -> None:
         try:
@@ -4432,15 +4490,9 @@ Tooltip {
             counter = self.query_one("#pos-counter", Label)
             if ol and ol.option_count > 0:
                 curr_idx = ol.highlighted if ol.highlighted is not None else 0
-                total_selectable = 0
-                selectable_idx = 0
-
-                for i in range(ol.option_count):
-                    opt = ol.get_option_at_index(i)
-                    if not getattr(opt, "disabled", False):
-                        total_selectable += 1
-                        if i <= curr_idx:
-                            selectable_idx += 1
+                positions = ol._selectable_positions
+                total_selectable = positions[-1] if positions else 0
+                selectable_idx = positions[curr_idx] if positions else 0
 
                 if total_selectable > 0 and selectable_idx > 0:
                     txt = Text()
@@ -4484,8 +4536,8 @@ Tooltip {
     def notify_status(self, msg: str, level: str = "info") -> None:
         try:
             app_footer = self.query_one(AppFooter)
-            app_footer.status_msg = msg
             app_footer.status_level = level
+            app_footer.status_msg = msg
 
             if self._status_timer:
                 self._status_timer.stop()
@@ -4574,9 +4626,9 @@ Tooltip {
             for dup_t, dup_i, dup_itm in self._items_by_uid.get(src_uid, []):
                 if (dup_t, dup_i) in seen:
                     continue
-                seen.add((dup_t, dup_i))
                 if self._get_item_engine_info(dup_itm) != src_eng:
                     continue
+                seen.add((dup_t, dup_i))
                 self._cancel_autosave_ref(dup_t, dup_i)
 
         for uek in uid_engines:
@@ -4603,6 +4655,8 @@ Tooltip {
 
     def _revert_transaction(self, transaction: list[tuple[int, int, Any, Any]]) -> None:
         self._apply_transaction_to_ram(transaction, undo=True)
+        for tab_idx, item_idx, _, _ in transaction:
+            self._sync_pending(tab_idx, item_idx, self.schema[tab_idx][item_idx])
 
         if self.undo_stack and list(self.undo_stack[-1]) == list(transaction):
             self.undo_stack.pop()
@@ -4618,6 +4672,8 @@ Tooltip {
             if self._get_item_engine_info(other_item) != src_eng:
                 continue
             other_item.value = item.default
+            self._committed[(t_idx, i_idx)] = clone_value(item.default)
+            self.pending_commits.discard((t_idx, i_idx))
             self._on_item_value_changed(other_item)
             self._refresh_single_ui(t_idx, i_idx, other_item)
 
@@ -4633,15 +4689,27 @@ Tooltip {
         action_type: str = "new",
         success_msg: str = ""
     ) -> None:
+        if not self.require_boot_complete():
+            return
+        # Every presentation of the same setting belongs to one transaction.
+        # Keep different target files isolated and write each setting once.
+        expanded = {(t, i): (t, i, clone_value(old), clone_value(new)) for t, i, old, new in transaction}
+        for t, i, old, new in transaction:
+            item = self.schema[t][i]
+            engine_key = self._get_item_engine_info(item)
+            for dt, di, duplicate in self._items_by_uid.get(item.uid, ()):
+                if self._get_item_engine_info(duplicate) == engine_key:
+                    expanded.setdefault((dt, di), (dt, di, clone_value(duplicate.value), clone_value(new)))
+        transaction = list(expanded.values())
         self._schema_dirty_counter += 1
         self._cancel_autosave_for_transaction(transaction)
 
         for t, i, o, n in transaction:
             item = self.schema[t][i]
-            item.value = o if action_type == "undo" else n
+            item.value = clone_value(o if action_type == "undo" else n)
             item.exists_in_target = True
             self._on_item_value_changed(item)
-            self.pending_commits.add((t, i))
+            self._sync_pending(t, i, item)
             self._refresh_single_ui(t, i, item)
 
         uid_engines: set[str] = set()
@@ -4779,6 +4847,8 @@ Tooltip {
         batch_mode: bool = False,
         record_undo: bool = True
     ) -> None:
+        if not self.require_boot_complete():
+            return
         if item.confirm_message and not is_undo and not batch_mode:
             def on_confirm(confirmed: bool) -> None:
                 if confirmed:
@@ -4805,7 +4875,7 @@ Tooltip {
         batch_mode: bool = False,
         record_undo: bool = True
     ) -> bool:
-        old_val = item.value
+        old_val = clone_value(item.value)
         self._schema_dirty_counter += 1
 
         item_uid = self._get_item_uid(item)
@@ -4859,7 +4929,8 @@ Tooltip {
             self._pending_autosave_args[k] = (item, val_str, old_val)
 
         else:
-            self.pending_commits.add((tab_idx, item_idx))
+            for ti, ii, _, _ in transaction:
+                self._sync_pending(ti, ii, self.schema[ti][ii])
 
         if not batch_mode:
             self._update_footer_legend()
@@ -4953,10 +5024,12 @@ Tooltip {
         transaction: list[tuple[int, int, Any, Any]],
         force: bool = False
     ) -> None:
+        uek = self._uid_engine_key(item)
+        # A superseded task must not remove a newer edit's debounce timer.
+        if self._write_generation.get(uek) != generation:
+            return
         self._save_timers.pop((tab_idx, item_idx), None)
         self._pending_autosave_args.pop((tab_idx, item_idx), None)
-
-        uek = self._uid_engine_key(item)
         current_task = asyncio.current_task()
         if current_task is not None:
             task_keys = getattr(self, "_save_task_keys", None)
@@ -5018,6 +5091,13 @@ Tooltip {
                 self._active_save_count -= 1
 
         if success:
+            for ti, ii, _, new_value in transaction:
+                self._committed[(ti, ii)] = clone_value(new_value)
+                other = self.schema[ti][ii]
+                if other.serialize(other.value) == other.serialize(new_value):
+                    self.pending_commits.discard((ti, ii))
+                else:
+                    self._sync_pending(ti, ii, other)
             # The write may have completed after a newer edit was made.  Do
             # not report the old value as current or roll anything back.
             if self._write_generation.get(uek) != generation:
@@ -5037,8 +5117,10 @@ Tooltip {
             self._bump_write_generation(uek)
 
             if is_trigger_item(item):
+                reset_generation = self._write_generation[uek]
                 def reset_trigger():
-                    self._reset_trigger_ui(item)
+                    if self._write_generation.get(uek) == reset_generation:
+                        self._reset_trigger_ui(item)
 
                 self.set_timer(0.15, reset_trigger)
 
@@ -5196,7 +5278,7 @@ Tooltip {
 
             # Frozen snapshot: (change_tuple, commit_key, val_str, frozen_val, ConfigItem)
             type FrozenItem = tuple[tuple[str, str, str, str], tuple[int, int], str, Any, ConfigItem]
-            batches: dict[tuple[str, str], list[FrozenItem]] = {}
+            batches: dict[tuple[tuple[str, str], str | None], list[FrozenItem]] = {}
 
             for tab_idx, item_idx in tuple(self.pending_commits):
                 item = self.schema[tab_idx][item_idx]
@@ -5205,7 +5287,8 @@ Tooltip {
                 val_str = item.serialize(frozen_val)
                 ekey = self._get_item_engine_info(item)
                 change = (item.key, item.scope, val_str, str(item.type_))
-                batches.setdefault(ekey, []).append((change, key, val_str, frozen_val, item))
+                trigger_key = self._uid_engine_key(item) if is_trigger_item(item) else None
+                batches.setdefault((ekey, trigger_key), []).append((change, key, val_str, frozen_val, item))
 
             final_success = True
             success_count = 0
@@ -5213,31 +5296,43 @@ Tooltip {
             auth_required = False
 
             def mark_success(key: tuple[int, int], frozen_val_str: str, frozen_val: Any, itm: ConfigItem) -> bool:
+                self._committed[key] = clone_value(frozen_val)
                 current_str = itm.serialize(itm.value)
                 if current_str != frozen_val_str:
                     self._save_queued_during_run = True
                     return False
                 self.pending_commits.discard(key)
-                self._committed[key] = clone_value(frozen_val)
                 return True
 
-            for ekey, batch in batches.items():
+            for (ekey, trigger_key), batch in batches.items():
                 engine = self.engine_pool[ekey]
-                changes = [b[0] for b in batch]
+                # Duplicate views must not execute a trigger multiple times.
+                changes = list({(b[0][0], b[0][1]): b[0] for b in batch}.values())
 
+                self._active_save_count += 1
                 try:
-                    success, msg, _ = await self._run_save_io(engine.write_batch, changes)
+                    if trigger_key is not None:
+                        key_s, scope, value, kind = changes[0]
+                        success, msg, _ = await self._run_save_io(engine.write_value, key_s, scope, value, item_type=kind)
+                    else:
+                        success, msg, _ = await self._run_save_io(engine.write_batch, changes)
                 except Exception as e:
                     success, msg = False, f"Engine Error: {e}"
+                finally:
+                    self._active_save_count -= 1
 
                 if success:
                     committed_ueks: set[str] = set()
+                    completed_triggers = {}
                     for _change, key, frozen_str, frozen_val, itm in batch:
                         if mark_success(key, frozen_str, frozen_val, itm):
                             success_count += 1
                             committed_ueks.add(self._uid_engine_key(itm))
                             if is_trigger_item(itm):
-                                self._reset_trigger_ui(itm)
+                                completed_triggers[self._uid_engine_key(itm)] = itm
+
+                    for trigger in completed_triggers.values():
+                        self._reset_trigger_ui(trigger)
 
                     for uek in committed_ueks:
                         self._bump_write_generation(uek)
@@ -5256,20 +5351,30 @@ Tooltip {
 
                     engine_success_count = 0
                     committed_ueks = set()
+                    completed_triggers = {}
 
+                    fallback_results = {}
+                    if trigger_key is not None:
+                        # An action may already have had side effects before
+                        # reporting failure. Never execute it again as fallback.
+                        fallback_results[(changes[0][0], changes[0][1])] = (success, msg)
                     for change, key, frozen_str, frozen_val, itm in batch:
                         key_s, scope, val_str, itype = change
 
-                        try:
-                            ok, item_msg, _ = await self._run_save_io(
-                                engine.write_value,
-                                key_s,
-                                scope,
-                                val_str,
-                                item_type=itype
-                            )
-                        except Exception as e:
-                            ok, item_msg = False, f"Engine Error: {e}"
+                        identity = (key_s, scope)
+                        if identity not in fallback_results:
+                            self._active_save_count += 1
+                            try:
+                                ok, item_msg, _ = await self._run_save_io(
+                                    engine.write_value, key_s, scope, val_str, item_type=itype
+                                )
+                            except Exception as e:
+                                ok, item_msg = False, f"Engine Error: {e}"
+                            finally:
+                                self._active_save_count -= 1
+                            fallback_results[identity] = (ok, item_msg)
+                        else:
+                            ok, item_msg = fallback_results[identity]
 
                         if ok:
                             if mark_success(key, frozen_str, frozen_val, itm):
@@ -5277,7 +5382,8 @@ Tooltip {
                                 engine_success_count += 1
                                 committed_ueks.add(self._uid_engine_key(itm))
                                 if is_trigger_item(itm):
-                                    self._reset_trigger_ui(itm)
+                                    uek = self._uid_engine_key(itm)
+                                    completed_triggers[uek] = (itm, self._write_generation.get(uek, 0))
 
                             try:
                                 if engine.target_path:
@@ -5295,6 +5401,9 @@ Tooltip {
                                 self.pending_commits.discard(key)
                                 self._reset_trigger_ui(itm)
 
+                    for uek, (trigger, generation) in completed_triggers.items():
+                        if self._write_generation.get(uek, 0) == generation:
+                            self._reset_trigger_ui(trigger)
                     for uek in committed_ueks:
                         self._bump_write_generation(uek)
 
@@ -5564,7 +5673,7 @@ Tooltip {
                         seen_prefs.add(current_pref)
 
                         for p_item in items:
-                            if self._get_item_uid(p_item) == current_pref and p_item.is_parent:
+                            if current_pref in (p_item.uid, p_item.key) and (p_item.is_parent or p_item.type_ == "menu"):
                                 if not p_item.expanded:
                                     p_item.expanded = True
                                     expanded_any = True
@@ -5617,7 +5726,7 @@ Tooltip {
                         seen_prefs.add(current_pref)
 
                         for p_item in self.schema[tab_idx]:
-                            if self._get_item_uid(p_item) == current_pref and p_item.is_parent:
+                            if current_pref in (p_item.uid, p_item.key) and (p_item.is_parent or p_item.type_ == "menu"):
                                 p_item.expanded = True
                                 current_pref = p_item.parent_ref
                                 break
@@ -5804,7 +5913,7 @@ Tooltip {
             if transaction:
                 self._apply_transaction(
                     transaction,
-                    action_type="reset",
+                    action_type="new",
                     success_msg=f"Reset settings under '{item.label}' to default."
                 )
 
@@ -5928,6 +6037,8 @@ Tooltip {
     def action_save_preset(self) -> None:
         if self._modal_active():
             return
+        if not self.enable_user_presets or not self.require_boot_complete():
+            return
 
         def check_reply(name: str | None) -> None:
             if not name:
@@ -5941,7 +6052,7 @@ Tooltip {
 
             for t_idx, items in self.schema.items():
                 for item in items:
-                    if item.type_ in ("action", "preset", "menu"):
+                    if item.type_ in ("action", "preset", "menu") or self._get_item_engine_info(item) != self.default_engine_key:
                         continue
 
                     payload[self._get_item_uid(item)] = item.value
@@ -6215,7 +6326,7 @@ Tooltip {
 
         tab_idx, item_idx, item = parsed
 
-        if item.is_parent:
+        if item.is_parent or item.type_ == "menu":
             item.expanded = not item.expanded
             self._populate_option_list(tab_idx, maintain_highlight_id=ol.last_highlighted_id)
 
@@ -6304,7 +6415,10 @@ Tooltip {
             return out
 
         try:
-            tokens = shlex.split(cmd_str)
+            lexer = shlex.shlex(cmd_str, posix=True, punctuation_chars="|&;")
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            tokens = list(lexer)
         except Exception:
             tokens = re.findall(r"[A-Za-z0-9_./+-]+", cmd_str)
 
@@ -6436,148 +6550,50 @@ Tooltip {
         return bytes(buf)
 
     def _kill_action_tree(self, proc: asyncio.subprocess.Process) -> None:
+        # Actions start in their own Linux session, so pgid == pid.
         try:
-            pid = proc.pid
-        except Exception:
-            return
-        if pid is None:
-            return
-        if sys.platform.startswith("linux") and hasattr(os, "killpg"):
-            try:
-                # Dedicated session/group (start_new_session=True) => pgid == pid.
-                os.killpg(pid, signal.SIGTERM)
-                return
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-            except Exception:
-                pass
-        try:
-            proc.terminate()
-        except (ProcessLookupError, OSError):
-            pass
-        except Exception:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
             pass
 
     @staticmethod
-    def _action_group_alive(pgid: int | None) -> bool:
-        if pgid is None:
-            return False
-        if not (sys.platform.startswith("linux") and hasattr(os, "killpg")):
-            return False
+    def _action_group_alive(pgid: int) -> bool:
         try:
             os.killpg(pgid, 0)
-            return True
         except ProcessLookupError:
             return False
         except PermissionError:
             return True
-        except Exception:
-            return False
+        return True
 
     def _close_action_pipes(self, proc: asyncio.subprocess.Process | None) -> None:
-        if proc is None:
-            return
-        try:
-            transport = getattr(proc, "_transport", None)
-            if transport is not None:
-                try:
-                    is_closing = transport.is_closing() if hasattr(transport, "is_closing") else False
-                    if not is_closing:
-                        transport.close()
-                    return
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
-            try:
-                pipe_transport = getattr(stream, "_transport", None)
-                if pipe_transport is not None and hasattr(pipe_transport, "close"):
-                    try:
-                        if hasattr(pipe_transport, "is_closing") and pipe_transport.is_closing():
-                            continue
-                        pipe_transport.close()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+        if proc is not None:
+            # asyncio exposes no public Process.close(). Closing its transport
+            # also releases pipes inherited by detached descendants.
+            proc._transport.close()
 
     async def _terminate_and_reap_action(self, proc: asyncio.subprocess.Process) -> None:
-        try:
-            pid = proc.pid
-        except Exception:
-            pid = None
-        pgid = pid if (pid is not None and sys.platform.startswith("linux") and hasattr(os, "killpg")) else None
-        if pgid is not None:
-            try:
-                os.killpg(pgid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-        else:
-            try:
-                proc.terminate()
-            except (ProcessLookupError, OSError):
-                pass
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        start = loop.time() if loop is not None else 0.0
+        self._kill_action_tree(proc)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _ACTION_KILL_GRACE
         try:
             await asyncio.wait_for(proc.wait(), timeout=_ACTION_KILL_GRACE)
         except TimeoutError:
             pass
-        # Honor the grace period: if the shell exited quickly, surviving
-        # group members still get the remaining interval to finish graceful
-        # SIGTERM cleanup before escalation to SIGKILL.
-        if pgid is not None and self._action_group_alive(pgid):
-            try:
-                remaining = _ACTION_KILL_GRACE - ((loop.time() - start) if loop is not None else _ACTION_KILL_GRACE)
-            except Exception:
-                remaining = 0.0
-            if remaining > 0:
-                try:
-                    deadline = (loop.time() + remaining) if loop is not None else 0.0
-                    while self._action_group_alive(pgid):
-                        now = loop.time() if loop is not None else deadline
-                        if now >= deadline:
-                            break
-                        await asyncio.sleep(0.05)
-                except Exception:
-                    pass
-        if pgid is not None and self._action_group_alive(pgid):
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-            except Exception:
-                pass
-            try:
-                proc.kill()
-            except (ProcessLookupError, OSError):
-                pass
-            except Exception:
-                pass
-            try:
-                loop = asyncio.get_running_loop()
-                deadline = loop.time() + _ACTION_KILL_GRACE
-                while self._action_group_alive(pgid):
-                    if loop.time() >= deadline:
-                        break
-                    await asyncio.sleep(0.05)
-            except Exception:
-                pass
-        elif pgid is None and proc.returncode is None:
-            try:
-                proc.kill()
-            except (ProcessLookupError, OSError):
-                pass
-            except Exception:
-                pass
+        while self._action_group_alive(proc.pid) and loop.time() < deadline:
+            await asyncio.sleep(min(0.05, max(0, deadline - loop.time())))
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         try:
             await asyncio.wait_for(proc.wait(), timeout=_ACTION_KILL_GRACE)
-        except (TimeoutError, Exception):
-            pass
+        except TimeoutError:
+            self._close_action_pipes(proc)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=_ACTION_KILL_GRACE)
+            except TimeoutError:
+                LOGGER.warning("Action process %s did not exit after SIGKILL", proc.pid)
 
     async def _cleanup_action_resources(
         self,
@@ -6641,45 +6657,23 @@ Tooltip {
             except Exception:
                 pass
 
-    def _track_action_task(self, task: asyncio.Task[Any]) -> asyncio.Task[Any]:
-        tasks = getattr(self, "_action_tasks", None)
-        if tasks is None:
-            tasks = self._action_tasks = set()
+    @staticmethod
+    def _track_background_task(task: asyncio.Task[Any], tasks: set[asyncio.Task[Any]]) -> asyncio.Task[Any]:
         tasks.add(task)
 
-        def _done(t: asyncio.Task[Any]) -> None:
-            try:
-                tasks.discard(t)
-            except Exception:
-                pass
-            try:
-                if not t.cancelled():
-                    t.exception()
-            except Exception:
-                pass
+        def done(completed: asyncio.Task[Any]) -> None:
+            tasks.discard(completed)
+            if not completed.cancelled() and (error := completed.exception()) is not None:
+                LOGGER.error("Background action failed", exc_info=error)
 
-        task.add_done_callback(_done)
+        task.add_done_callback(done)
         return task
+
+    def _track_action_task(self, task: asyncio.Task[Any]) -> asyncio.Task[Any]:
+        return self._track_background_task(task, self._action_tasks)
 
     def _track_action_cleanup(self, task: asyncio.Task[Any]) -> asyncio.Task[Any]:
-        tasks = getattr(self, "_action_cleanup_tasks", None)
-        if tasks is None:
-            tasks = self._action_cleanup_tasks = set()
-        tasks.add(task)
-
-        def _done(t: asyncio.Task[Any]) -> None:
-            try:
-                tasks.discard(t)
-            except Exception:
-                pass
-            try:
-                if not t.cancelled():
-                    t.exception()
-            except Exception:
-                pass
-
-        task.add_done_callback(_done)
-        return task
+        return self._track_background_task(task, self._action_cleanup_tasks)
 
     def _cancel_background_actions(self) -> None:
         """Synchronous best-effort kill/cancel; awaiting happens in shutdown."""
@@ -6817,16 +6811,12 @@ Tooltip {
                 stderr = b""
                 timed_out = False
                 try:
-                    popen_kwargs: dict[str, Any] = {}
-                    if sys.platform != "win32":
-                        popen_kwargs["start_new_session"] = True
-
                     async def _spawn() -> asyncio.subprocess.Process:
                         p = await asyncio.create_subprocess_shell(
                             command,
                             stdout=asyncio.subprocess.PIPE,
                             stderr=asyncio.subprocess.PIPE,
-                            **popen_kwargs
+                            start_new_session=True,
                         )
                         proc_box.append(p)
                         try:
@@ -6933,6 +6923,8 @@ Tooltip {
             do_execute()
 
     def apply_preset(self, preset_item: ConfigItem) -> None:
+        if not self.require_boot_complete():
+            return
         # Hot-reload user preset payload from disk before applying.
         if preset_item.group == "User Presets" and preset_item.key.startswith("__user_preset_"):
             name = preset_item.label.replace("User: ", "", 1)
@@ -6969,6 +6961,10 @@ Tooltip {
             self.notify_status("Preset payload is invalid.", level="error")
             return
 
+        global_items = [entry for entry in self._configurable_items if self._get_item_engine_info(entry[2]) == self.default_engine_key]
+        self._preset_matrix.rebuild(global_items + self._preset_items)
+        self._option_cache.invalidate_presets()
+
         def do_apply():
             transaction = []
             skipped = 0
@@ -6994,7 +6990,9 @@ Tooltip {
                 else:
                     target_val = target_item.default
 
-                if str(target_item.value) != str(target_val) and target_val is not None:
+                if target_item.serialize(target_item.value) != target_item.serialize(target_val):
+                    if target_val is not None:
+                        target_val = target_item.deserialize(target_val)
                     transaction.append((t_idx, i_idx, target_item.value, target_val))
 
             if not transaction:
@@ -7037,11 +7035,14 @@ Tooltip {
                         try:
                             parsed_val = int(text, 0)
                         except ValueError:
-                            float_val = float(text)
-                            if not math.isfinite(float_val):
-                                self.notify_status("Error: Value must be a finite integer.", level="error")
-                                return
-                            parsed_val = int(float_val)
+                            try:
+                                parsed_val = int(text, 10)
+                            except ValueError:
+                                float_val = float(text)
+                                if not math.isfinite(float_val):
+                                    self.notify_status("Error: Value must be a finite integer.", level="error")
+                                    return
+                                parsed_val = int(float_val)
 
                         if item.min_val is not None:
                             parsed_val = max(int(item.min_val), parsed_val)
