@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ==============================================================================
-#  DUSKY UPDATER (v9.6.0)
+#  DUSKY UPDATER (v9.7.3)
 # ==============================================================================
 import sys
 
@@ -13,6 +13,7 @@ import asyncio
 import atexit
 import base64
 import codecs
+import errno
 import fcntl
 import functools
 import hashlib
@@ -36,6 +37,7 @@ import struct
 import subprocess
 import tempfile
 import termios
+import threading
 import time
 import tomllib
 import uuid
@@ -47,7 +49,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
-VERSION = "9.6.0"
+VERSION = "9.7.3"
 SCRIPT_DIR: Path = Path(__file__).resolve().parent
 SCRIPT_PATH: Path = Path(__file__).resolve()
 PROFILES_DIR: Path = Path(
@@ -55,36 +57,275 @@ PROFILES_DIR: Path = Path(
 ).resolve()
 
 
-def global_config_path() -> Path | None:
+def global_config_context_path() -> Path:
+    """Return the configured settings pathname even when it is currently absent."""
     custom_path = os.environ.get("DUSKY_UPDATER_SETTINGS")
     if custom_path:
-        p = Path(custom_path).expanduser()
-        if p.is_file():
-            return p
-    config_path = PROFILES_DIR / "settings" / "update_dusky.toml"
-    if config_path.is_file():
-        return config_path
-    return None
+        return Path(custom_path).expanduser().resolve(strict=False)
+    return (PROFILES_DIR / "settings" / "update_dusky.toml").resolve(strict=False)
 
 
-def load_global_config() -> dict:
+def global_config_path() -> Path | None:
+    # An explicitly configured path is authoritative. Never silently fall back
+    # to a different settings file merely because that path is temporarily
+    # missing; creation/deletion of the configured file must remain observable.
+    p = global_config_context_path()
+    return p if p.is_file() else None
+
+
+CONFIG_WARNINGS: list[str] = []
+CONFIG_FATAL_ERRORS: list[str] = []
+
+
+def _config_warn(message: str) -> None:
+    if message not in CONFIG_WARNINGS:
+        CONFIG_WARNINGS.append(message)
+
+
+def _config_fatal(message: str) -> None:
+    _config_warn(message)
+    if message not in CONFIG_FATAL_ERRORS:
+        CONFIG_FATAL_ERRORS.append(message)
+
+
+def load_global_config() -> dict[str, Any]:
     p = global_config_path()
     if p and p.is_file():
         try:
             with open(p, "rb") as f:
                 data = tomllib.load(f)
-                return data if isinstance(data, dict) else {}
-        except Exception as e:
-            sys.stderr.write(f"[WARN] Failed to parse config ({p}): {e}\n")
+            if isinstance(data, dict):
+                return data
+            _config_warn(f"settings root is not a TOML table: {p}")
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            _config_fatal(f"failed to parse settings {p}: {e}")
     return {}
 
 
-GLOBAL_CONFIG = load_global_config()
+def _normalize_global_config(raw: dict[str, Any]) -> dict[str, Any]:
+    """Normalize every import-time setting before any consumer sees it.
+
+    Invalid optional values fall back explicitly and are recorded in
+    CONFIG_WARNINGS. Ambiguous destructive-path values are not silently
+    redirected: they are replaced only with the documented safe default and a
+    warning which later disables synchronization until acknowledged by the
+    normal preflight.
+    """
+    defaults: dict[str, dict[str, Any]] = {
+        "ui": {
+            "ascii_mode": False, "sidebar_width": 35, "max_log_lines": 6000,
+            "theme_paths": [".config/matugen/generated/dusky_tui.json", ".config/matugen/generated_fresh/dusky_tui.json"],
+        },
+        "paths": {
+            "documents_dir": "Documents", "namespace": "dusky-updater", "lock_file": "lock",
+            "askpass_prefix": ".dusky_askpass_", "logs_subdir": "logs", "backups_subdir": "dusky_backups",
+            "state_subdir": "state", "log_retention_days": 14, "backup_retention_days": 14,
+        },
+        "logging": {"enabled": True, "write_task_logs": True, "write_reports": True},
+        "execution": {
+            "disk_min_free_mb": 100, "disk_copy_reserve_mb": 64, "db_busy_timeout": 5000,
+            "default_interpreter": "bash", "default_task_timeout": 14400.0,
+            "validate_subscript_syntax": False,
+            "interactive_task_timeout": 21600.0, "prompt_wait_timeout": 900.0,
+            "max_defer_passes": 3, "log_max_bytes": 8 * 1024 * 1024, "log_max_line_bytes": 256 * 1024,
+        },
+        "git": {
+            "branch": "main", "repo_url": "https://github.com/dusklinux/dusky",
+            "fetch_timeout": 60, "fetch_max_attempts": 5, "clone_timeout": 120, "clone_max_attempts": 5,
+            "command_timeout": 300, "backup_timeout": 900,
+            "env_strip": ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_LITERAL_PATHSPECS", "GIT_ASKPASS", "SSH_ASKPASS"],
+            "env_inject": {"GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": "ssh -o BatchMode=yes", "GIT_PAGER": "cat", "PAGER": "cat", "GIT_OPTIONAL_LOCKS": "0"},
+        },
+        "conditions": {
+            "package_check_cmd": ["pacman", "-Qq"],
+            "service_active_cmd": ["systemctl", "is-active", "--quiet"],
+            "user_service_active_cmd": ["systemctl", "--user", "is-active", "--quiet"],
+        },
+        "notifications": {
+            "desktop_enabled": True, "app_name": "Dusky Updater", "audio_enabled": True,
+            "audio_players": ["pw-play", "paplay"],
+            "fallback_sound": "/usr/share/sounds/freedesktop/stereo/bell.oga",
+        },
+        "sudo": {
+            "heartbeat_interval": 60, "dropin_prefix": "99_dusky_",
+            "sudoers_dir": "/etc/sudoers.d", "timestamp_timeout": 15,
+        },
+        "prompts": {"cooldown": 0.35, "allow_insecure_password_autofeed": True},
+    }
+    cfg: dict[str, Any] = {}
+    for table, dflt in defaults.items():
+        value = raw.get(table, {})
+        if value is None:
+            value = {}
+        if not isinstance(value, dict):
+            _config_warn(f"[{table}] must be a table; using defaults")
+            value = {}
+        cfg[table] = dict(value)
+        for key, default in dflt.items():
+            cfg[table].setdefault(key, default)
+    # Preserve additional well-formed tables used elsewhere.
+    for key, value in raw.items():
+        if key not in cfg:
+            cfg[key] = value
+
+    def boolean(table: str, key: str, default: bool) -> None:
+        v = cfg[table].get(key, default)
+        if not isinstance(v, bool):
+            _config_warn(f"{table}.{key} must be boolean; using {default!r}")
+            v = default
+        cfg[table][key] = v
+
+    def string(table: str, key: str, default: str, *, nonempty: bool = True, no_nul: bool = True) -> None:
+        v = cfg[table].get(key, default)
+        bad = not isinstance(v, str) or (nonempty and not v.strip()) or (no_nul and isinstance(v, str) and "\x00" in v)
+        if bad:
+            _config_warn(f"{table}.{key} must be a valid string; using {default!r}")
+            v = default
+        cfg[table][key] = v
+
+    def integer(table: str, key: str, default: int, lo: int, hi: int) -> None:
+        v = cfg[table].get(key, default)
+        if isinstance(v, bool):
+            v = default
+        try:
+            x = int(v)
+        except (TypeError, ValueError, OverflowError):
+            x = default
+        if x < lo or x > hi:
+            x = default
+        if x != v:
+            _config_warn(f"{table}.{key} invalid; using {x}")
+        cfg[table][key] = x
+
+    def finite_number(table: str, key: str, default: float, lo: float, hi: float) -> None:
+        v = cfg[table].get(key, default)
+        try:
+            x = float(v)
+        except (TypeError, ValueError, OverflowError):
+            x = default
+        if not math.isfinite(x) or x < lo or x > hi:
+            x = default
+        if x != v:
+            _config_warn(f"{table}.{key} invalid; using {x:g}")
+        cfg[table][key] = x
+
+    for key, default in (("ascii_mode", False),): boolean("ui", key, default)
+    integer("ui", "sidebar_width", 35, 15, 80)
+    integer("ui", "max_log_lines", 6000, 100, 200000)
+    for key, default in (("enabled", True), ("write_task_logs", True), ("write_reports", True)):
+        boolean("logging", key, default)
+    critical_path_keys = {"documents_dir", "backups_subdir", "state_subdir"}
+    raw_paths = raw.get("paths", {}) if isinstance(raw.get("paths", {}), dict) else {}
+    for key, default in (("documents_dir", "Documents"), ("namespace", "dusky-updater"), ("lock_file", "lock"),
+                         ("askpass_prefix", ".dusky_askpass_"), ("logs_subdir", "logs"),
+                         ("backups_subdir", "dusky_backups"), ("state_subdir", "state")):
+        original = raw_paths.get(key, default)
+        string("paths", key, default)
+        if key in critical_path_keys and (not isinstance(original, str) or not original.strip() or "\x00" in original):
+            _config_fatal(f"paths.{key} is invalid; destructive synchronization is disabled until settings are fixed")
+    integer("paths", "log_retention_days", 14, 0, 36500)
+    integer("paths", "backup_retention_days", 14, 0, 36500)
+    integer("execution", "disk_min_free_mb", 100, 0, 1_000_000)
+    integer("execution", "disk_copy_reserve_mb", 64, 0, 1_000_000)
+    integer("execution", "db_busy_timeout", 5000, 1, 600_000)
+    integer("execution", "max_defer_passes", 3, 1, 100)
+    integer("execution", "log_max_bytes", 8 * 1024 * 1024, 64 * 1024, 1024 * 1024 * 1024)
+    integer("execution", "log_max_line_bytes", 256 * 1024, 4096, 16 * 1024 * 1024)
+    string("execution", "default_interpreter", "bash")
+    boolean("execution", "validate_subscript_syntax", False)
+    finite_number("execution", "default_task_timeout", 14400.0, 1.0, 7 * 24 * 3600.0)
+    finite_number("execution", "interactive_task_timeout", 21600.0, 1.0, 7 * 24 * 3600.0)
+    finite_number("execution", "prompt_wait_timeout", 900.0, 1.0, 24 * 3600.0)
+    raw_git = raw.get("git", {}) if isinstance(raw.get("git", {}), dict) else {}
+    raw_branch = raw_git.get("branch", "main")
+    raw_repo = raw_git.get("repo_url", "https://github.com/dusklinux/dusky")
+    string("git", "branch", "main")
+    string("git", "repo_url", "https://github.com/dusklinux/dusky")
+    if not isinstance(raw_branch, str) or not raw_branch.strip() or "\x00" in raw_branch:
+        _config_fatal("git.branch is invalid; synchronization target is ambiguous")
+    if not isinstance(raw_repo, str) or not raw_repo.strip() or "\x00" in raw_repo:
+        _config_fatal("git.repo_url is invalid; synchronization source is ambiguous")
+    integer("git", "fetch_timeout", 60, 1, 86400)
+    integer("git", "clone_timeout", 120, 1, 86400)
+    integer("git", "fetch_max_attempts", 5, 1, 100)
+    integer("git", "clone_max_attempts", 5, 1, 100)
+    integer("git", "command_timeout", 300, 1, 86400)
+    integer("git", "backup_timeout", 900, 1, 86400)
+    for key in ("package_check_cmd", "service_active_cmd", "user_service_active_cmd"):
+        v = cfg["conditions"].get(key, defaults["conditions"][key])
+        if not isinstance(v, list) or not v or any(not isinstance(x, str) or not x or "\x00" in x for x in v):
+            _config_warn(f"conditions.{key} must be a non-empty command string array; using defaults")
+            v = list(defaults["conditions"][key])
+        cfg["conditions"][key] = v
+    boolean("notifications", "desktop_enabled", True)
+    boolean("notifications", "audio_enabled", True)
+    string("notifications", "app_name", "Dusky Updater")
+    string("notifications", "fallback_sound", "/usr/share/sounds/freedesktop/stereo/bell.oga")
+    players = cfg["notifications"].get("audio_players", defaults["notifications"]["audio_players"])
+    if not isinstance(players, list) or any(not isinstance(x, str) or not x or "\x00" in x for x in players):
+        _config_warn("notifications.audio_players must be a string array; using defaults")
+        players = list(defaults["notifications"]["audio_players"])
+    cfg["notifications"]["audio_players"] = players
+    integer("sudo", "heartbeat_interval", 60, 5, 3600)
+    integer("sudo", "timestamp_timeout", 15, 0, 1440)
+    string("sudo", "dropin_prefix", "99_dusky_")
+    string("sudo", "sudoers_dir", "/etc/sudoers.d")
+    finite_number("prompts", "cooldown", 0.35, 0.0, 60.0)
+    boolean("prompts", "allow_insecure_password_autofeed", True)
+
+    theme_paths = cfg["ui"].get("theme_paths", defaults["ui"]["theme_paths"])
+    if not isinstance(theme_paths, list) or any(not isinstance(x, str) or not x.strip() or "\x00" in x for x in theme_paths):
+        _config_warn("ui.theme_paths must be a list of path strings; using defaults")
+        cfg["ui"]["theme_paths"] = list(defaults["ui"]["theme_paths"])
+
+    ext = cfg["execution"].get("extension_interpreters", {".py": "python3", ".sh": "bash", ".fish": "fish"})
+    if not isinstance(ext, dict) or any(not isinstance(k, str) or not isinstance(v, str) or not k or not v for k, v in ext.items()):
+        _config_warn("execution.extension_interpreters must map suffix strings to interpreter strings; using defaults")
+        ext = {".py": "python3", ".sh": "bash", ".fish": "fish"}
+    cfg["execution"]["extension_interpreters"] = ext
+
+    for key in ("env_strip",):
+        v = cfg["git"].get(key, defaults["git"][key])
+        if not isinstance(v, list) or any(not isinstance(x, str) or not x for x in v):
+            _config_warn(f"git.{key} must be a list of strings; using defaults")
+            v = list(defaults["git"][key])
+        cfg["git"][key] = v
+    inject = cfg["git"].get("env_inject", defaults["git"]["env_inject"])
+    if not isinstance(inject, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in inject.items()):
+        _config_warn("git.env_inject must map strings to strings; using defaults")
+        inject = dict(defaults["git"]["env_inject"])
+    cfg["git"]["env_inject"] = inject
+
+    palette_defaults = {"bg": "#1a110e", "fg": "#f1dfd9", "accent": "#ffb59b", "warning": "#e7bdaf", "success": "#d5c68e", "muted": "#53433e", "error": "#ffb4ab"}
+    palette = cfg["ui"].get("default_palette", palette_defaults)
+    if not isinstance(palette, dict):
+        _config_warn("ui.default_palette must be a table; using defaults")
+        palette = dict(palette_defaults)
+    else:
+        palette = dict(palette)
+        for key, default in palette_defaults.items():
+            value = palette.get(key, default)
+            if not isinstance(value, str) or re.fullmatch(r"#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})", value) is None:
+                _config_warn(f"ui.default_palette.{key} invalid; using {default}")
+                value = default
+            palette[key] = value
+    cfg["ui"]["default_palette"] = palette
+
+    rules = cfg["prompts"].get("rules")
+    if rules is not None and not isinstance(rules, list):
+        _config_warn("prompts.rules must be an array of rule tables; ignoring invalid value")
+        cfg["prompts"].pop("rules", None)
+    return cfg
 
 
-def _cfg_table(key: str) -> dict:
+RAW_GLOBAL_CONFIG = load_global_config()
+GLOBAL_CONFIG = _normalize_global_config(RAW_GLOBAL_CONFIG)
+
+
+def _cfg_table(key: str) -> dict[str, Any]:
     v = GLOBAL_CONFIG.get(key, {})
     return v if isinstance(v, dict) else {}
+
 
 ASCII_MODE = _cfg_table("ui").get("ascii_mode", False) if isinstance(_cfg_table("ui").get("ascii_mode", False), bool) else False
 try:
@@ -169,6 +410,16 @@ def _runtime_dir_path() -> Path:
     return runtime_dir(ensure=False)
 
 
+
+def supervisor_state_dir() -> Path | None:
+    raw = os.environ.get("DUSKY_SUPERVISOR_STATE_DIR")
+    if not raw:
+        return None
+    try:
+        return Path(raw).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+
 def state_dir(ensure: bool = True) -> Path:
     p = _documents_subdir("state_subdir", "state")
     if ensure:
@@ -229,6 +480,81 @@ def now_iso() -> str:
 
 def now_ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _fsync_directory(path: Path) -> None:
+    """Durably publish directory-entry changes on Linux filesystems."""
+    fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_regular_file(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
+    """Atomic file publication with file+parent fsync; never follows dest links."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        with suppress(OSError):
+            os.close(fd)
+        with suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        raise
+
+
+def _fsync_tree(path: Path) -> bool:
+    """Make an already-created recovery payload durable before destructive work."""
+    try:
+        st = path.lstat()
+        if stat.S_ISLNK(st.st_mode):
+            _fsync_directory(path.parent)
+            return True
+        if stat.S_ISREG(st.st_mode):
+            _fsync_regular_file(path)
+            _fsync_directory(path.parent)
+            return True
+        if not stat.S_ISDIR(st.st_mode):
+            return False
+        for root, dirs, files in os.walk(path, topdown=False, followlinks=False):
+            root_p = Path(root)
+            for name in files:
+                f = root_p / name
+                try:
+                    fst = f.lstat()
+                    if stat.S_ISREG(fst.st_mode):
+                        _fsync_regular_file(f)
+                except OSError:
+                    return False
+            for name in dirs:
+                d = root_p / name
+                try:
+                    if not stat.S_ISLNK(d.lstat().st_mode):
+                        _fsync_directory(d)
+                except OSError:
+                    return False
+            _fsync_directory(root_p)
+        _fsync_directory(path.parent)
+        return True
+    except OSError:
+        return False
 
 
 def file_checksum(path: Path) -> str:
@@ -318,9 +644,11 @@ SINGLE_NEWLINE_RE = re.compile(r"[\r\n]")
 
 def _build_prompt_rules() -> list[tuple[str, re.Pattern[str], str]]:
     # Authentication is routed through sudo askpass, never by matching generic
-    # "Password:" output from arbitrary children. Broad "[y/N]" default-No
-    # consent is NOT automated by default; only explicit package rules below
-    # (plus user-configured rules) auto-answer yes.
+    # "Password:" output from arbitrary children. Generic confirmation matching
+    # is intentionally permissive: the built-in generic_yes rule is
+    # case-insensitive, so both default-Yes forms such as [Y/n] and default-No
+    # forms such as [y/N] are answered Yes. The shipped settings preserve that
+    # policy; users can narrow or remove the generic rule through prompts.rules.
     default_rules = [
         ("sudo_password", r"(?i)(\[sudo\] password for [^:]+:|^\s*Password:\s*$|sudo: a password is required|Password:\s*$)", "password"),
         ("pgp_import", r"(?i)(::\s*Import PGP key.*\?\s*\[Y/n\]|::\s*Append key\?.*\[Y/n\]|Import PGP key.*\?\s*\[Y/n\])", "yes"),
@@ -328,7 +656,9 @@ def _build_prompt_rules() -> list[tuple[str, re.Pattern[str], str]]:
         ("pacman_replace", r"(?i)::\s*Replace\s+.*\?\s*\[Y/n\]", "yes"),
         ("pacman_remove_conflict", r"(?i)::\s*Remove conflicting file.*\?\s*\[Y/n\]", "yes"),
         ("aur_proceed", r"(?i)(Proceed with installation\?|Continue building\?|Continue installing\?|::\s*Proceed with (?:installation|download|build).*\?\s*\[Y/n\])", "yes"),
-        ("generic_yes", r"(?i)\[Y/n\]|\(Y/n\)|\[y/N\]|\(y/N\)", "yes"),
+        # Intentionally answer Yes to generic Y/n and y/N confirmation forms.
+        # The inline (?i) makes their casing variants equivalent.
+        ("generic_yes", r"(?i)\[Y/n\]|\(Y/n\)", "yes"),
     ]
     config_rules = _cfg_table("prompts").get("rules", None)
     rules = []
@@ -342,7 +672,8 @@ def _build_prompt_rules() -> list[tuple[str, re.Pattern[str], str]]:
             if kind not in ("password", "yes", "no"):
                 continue
             rules.append((name, re.compile(pattern, re.MULTILINE), kind))
-        except (KeyError, TypeError, re.error):
+        except (KeyError, TypeError, re.error) as e:
+            _config_warn(f"invalid prompts.rules entry ignored: {e}")
             continue
     return rules
 
@@ -359,6 +690,7 @@ class SudoEngine:
     _sudoers_path: Path | None = None
     _mode: str = "none"  # none | root | nopasswd | password
     _registered_atexit: bool = False
+    _last_cancelled: bool = False
 
     _ENV_KEEP_DEFAULT = [
             "HOME",
@@ -816,6 +1148,7 @@ done
         cli_password: str | None = None,
         password_file: Path | None = None,
     ) -> bool:
+        cls._last_cancelled = False
         if os.geteuid() == 0:
             cls._mode = "root"
             sys.stdout.write("\033[1;36m[DUSKY PRE-FLIGHT]\033[0m Running as root. No sudo escalation needed.\n")
@@ -905,7 +1238,8 @@ done
                 try:
                     password = getpass.getpass(f"[sudo] password for {target_user}: ")
                 except (EOFError, KeyboardInterrupt):
-                    sys.stderr.write("\n\033[1;31m[FATAL]\033[0m Sudo authentication cancelled.\n")
+                    cls._last_cancelled = True
+                    sys.stderr.write("\n\033[1;33m[CANCELLED]\033[0m Sudo authentication cancelled.\n")
                     return False
 
                 ok, err = cls.set_password(password)
@@ -948,6 +1282,13 @@ def safe_filename(name: str) -> str:
     # short hash of the full name so distinct profiles never share a state DB.
     digest = hashlib.blake2b(str(name).encode("utf-8"), digest_size=4).hexdigest()
     return f"{cleaned}_{digest}"
+
+
+PERSISTENCE_WARNINGS: list[str] = []
+
+def _persistence_warn(msg: str) -> None:
+    if msg not in PERSISTENCE_WARNINGS:
+        PERSISTENCE_WARNINGS.append(msg)
 
 
 class StateStore:
@@ -1031,24 +1372,18 @@ class StateStore:
     ) -> None:
         if getattr(self, "_read_only", False) or OPT_DRY_RUN:
             return
-        self.conn.execute(
-            """
-            INSERT OR REPLACE INTO state
-                (state_key, status, script, checksum, exit_code, note, updated, duration)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task.state_key,
-                status,
-                task.name,
-                task.checksum,
-                exit_code,
-                note,
-                now_iso(),
-                duration,
-            ),
-        )
-        self.conn.commit()
+        try:
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO state
+                    (state_key, status, script, checksum, exit_code, note, updated, duration)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (task.state_key, status, task.name, task.checksum, exit_code, note, now_iso(), duration),
+            )
+            self.conn.commit()
+        except sqlite3.Error as e:
+            _persistence_warn(f"state write failed for {task.name}: {e}")
 
     def reset(self) -> None:
         with suppress(Exception):
@@ -1193,7 +1528,7 @@ WHERE script_name = ?
         ).encode("utf-8")
         return hashlib.blake2b(material, digest_size=16).hexdigest()
 
-    def check_marker_status(self, task: 'DuskyTask', profile_name: str) -> Literal["run", "skip", "notify_sealed"]:
+    def check_marker_status(self, task: 'DuskyTask', profile_name: str) -> Literal["run", "skip", "notify_sealed", "error"]:
         if not task.once:
             return "run"
 
@@ -1204,8 +1539,9 @@ WHERE script_name = ?
                 (key,),
             )
             row = cur.fetchone()
-        except sqlite3.OperationalError:
-            return "run"
+        except sqlite3.Error as e:
+            _persistence_warn(f"once-state read failed for {task.name}: {e}")
+            return "error"
         if row is None:
             return "run"
 
@@ -1229,12 +1565,14 @@ WHERE script_name = ?
         if getattr(self, "_read_only", False) or OPT_DRY_RUN:
             return
         key = self.make_key(task, profile_name)
-        with suppress(sqlite3.OperationalError):
+        try:
             self.conn.execute(
                 "UPDATE once_markers SET notified_checksum = ?, updated = ? WHERE marker_key = ?",
                 (task.checksum, now_iso(), key)
             )
             self.conn.commit()
+        except sqlite3.Error as e:
+            _persistence_warn(f"once-state notification write failed for {task.name}: {e}")
 
     def mark_success(
         self,
@@ -1251,8 +1589,9 @@ WHERE script_name = ?
         key = self.make_key(task, profile_name)
         args_key = shlex.join(task.args)
 
-        self.conn.execute(
-            """
+        try:
+            self.conn.execute(
+                """
 INSERT INTO once_markers (
     marker_key, profile, scope, mode, script_name, args_key,
     resolved_path, checksum, once_mode, exit_code, run_id,
@@ -1265,13 +1604,15 @@ ON CONFLICT(marker_key) DO UPDATE SET
     once_mode=excluded.once_mode, exit_code=excluded.exit_code,
     run_id=excluded.run_id, version=excluded.version, updated=excluded.updated
 """,
-            (
-                key, profile_name, task.once_scope, task.mode, task.name,
-                args_key, str(task.resolved_path), task.checksum,
-                task.once_mode, exit_code, run_id, VERSION, now_iso(), now_iso(),
-            ),
-        )
-        self.conn.commit()
+                (
+                    key, profile_name, task.once_scope, task.mode, task.name,
+                    args_key, str(task.resolved_path), task.checksum,
+                    task.once_mode, exit_code, run_id, VERSION, now_iso(), now_iso(),
+                ),
+            )
+            self.conn.commit()
+        except sqlite3.Error as e:
+            _persistence_warn(f"once-state success write failed for {task.name}: {e}")
 
     def list_markers(self) -> list[dict[str, object]]:
         try:
@@ -1624,6 +1965,8 @@ class RunLogger:
         self._main = None
         self._task_handles: dict[int, Any] = {}
         self.run_id = run_id
+        self.warning_source: list[dict[str, str]] | None = None
+        self.git_summary_source: dict[str, Any] | None = None
 
         if not self.enabled:
             return
@@ -1729,6 +2072,8 @@ class RunLogger:
             "uid": target_user_pw().pw_uid,
             "home": str(user_home()),
             "counters": cnt,
+            "git_summary": dict(self.git_summary_source or {}),
+            "warnings": list(self.warning_source or []),
             "tasks": [],
         }
 
@@ -1747,7 +2092,20 @@ class RunLogger:
         for k, v in sorted(cnt.items()):
             lines.append(f"- {k}: {v}")
 
-        lines.extend(["", "## Tasks", ""])
+        warnings = list(self.warning_source or [])
+        if warnings:
+            lines.extend(["", "## Warnings", ""])
+            for w in warnings:
+                detail = w.get("message", "")
+                suffix = ""
+                if w.get("task"):
+                    suffix += f" task={w['task']}"
+                if w.get("path"):
+                    suffix += f" path={w['path']}"
+                if w.get("recovery"):
+                    suffix += f" recovery={w['recovery']}"
+                lines.append(f"- {w.get('kind', 'warning')}: {detail}{suffix}")
+        lines.extend(["", "## Git Summary", "", "```json", json.dumps(self.git_summary_source or {}, indent=2, default=str), "```", "", "## Tasks", ""])
 
         for task in tasks:
             st = getattr(task, "status", None)
@@ -2299,7 +2657,7 @@ def repair_missing_commas(text: str) -> tuple[str, int]:
             k = i
             while k < n and text[k] in ' \t':
                 k += 1
-            if depth and text[k] != '=':
+            if depth and (k >= n or text[k] != '='):
                 pending_value = True
                 pending_is_word = True
                 value_end = len(out)
@@ -2325,6 +2683,8 @@ class ProfileConfig:
     conflict_resolutions: dict[str, str]
     sequence: list[str]
     tasks: list['DuskyTask'] = field(default_factory=list)
+    diagnostics: list[str] = field(default_factory=list)
+    recovered_profile: bool = False
 
 
 def list_profiles() -> list[Path]:
@@ -2446,7 +2806,7 @@ def load_profile(name_or_path: str) -> ProfileConfig:
         return ProfileConfig(
             name=name,
             description=description,
-            filepath=p,
+            filepath=p.resolve(),
             repo_url=repo_url,
             branch=branch,
             search_dirs=search_dirs,
@@ -2606,7 +2966,7 @@ class DuskyTask:
     estimated_duration: float = 0.0
 
 
-def parse_manifest(profile: ProfileConfig) -> list[DuskyTask]:
+def _parse_manifest_strict(profile: ProfileConfig) -> list[DuskyTask]:
     tasks = [
         DuskyTask("Git Bare Repo Validation", 'GIT', False, False, []),
         DuskyTask("Fetch Upstream & Diff", 'GIT', False, False, []),
@@ -2709,7 +3069,7 @@ def parse_manifest(profile: ProfileConfig) -> list[DuskyTask]:
                             v = float(val_stripped)
                         except ValueError:
                             raise ValueError(f"Invalid timeout '{val_stripped}' in task: {entry}")
-                        if not math.isfinite(v) or v < 0:
+                        if not math.isfinite(v) or v <= 0:
                             raise ValueError(f"Invalid timeout '{val_stripped}' in task: {entry}")
                         timeout = v
                     case ("retry", _):
@@ -2751,14 +3111,67 @@ def parse_manifest(profile: ProfileConfig) -> list[DuskyTask]:
     return tasks
 
 
+def parse_manifest(profile: ProfileConfig) -> list[DuskyTask]:
+    """Parse task entries independently so one malformed task cannot brick sync.
+
+    The five Git pseudo-tasks are always present. Invalid user task entries are
+    omitted with indexed diagnostics retained on the profile for final warning
+    aggregation. This deliberately does not guess malformed task semantics.
+    """
+    base = ProfileConfig(
+        name=profile.name, description=profile.description, filepath=profile.filepath,
+        repo_url=profile.repo_url, branch=profile.branch,
+        search_dirs=list(profile.search_dirs), conflict_resolutions=dict(profile.conflict_resolutions),
+        sequence=[], diagnostics=profile.diagnostics, recovered_profile=profile.recovered_profile,
+    )
+    tasks = _parse_manifest_strict(base)
+    for seq_index, entry in enumerate(profile.sequence):
+        if not isinstance(entry, str):
+            profile.diagnostics.append(f"task[{seq_index}]: entry is not a string; skipped")
+            continue
+        stripped = entry.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        one = ProfileConfig(
+            name=profile.name, description=profile.description, filepath=profile.filepath,
+            repo_url=profile.repo_url, branch=profile.branch,
+            search_dirs=list(profile.search_dirs), conflict_resolutions=dict(profile.conflict_resolutions),
+            sequence=[entry], diagnostics=profile.diagnostics, recovered_profile=profile.recovered_profile,
+        )
+        try:
+            parsed = _parse_manifest_strict(one)
+        except (ValueError, TypeError, OverflowError) as e:
+            profile.diagnostics.append(f"task[{seq_index}]: {e}; skipped")
+            continue
+        if len(parsed) <= 5:
+            continue
+        task = parsed[5]
+        task.state_key = hashlib.blake2b(
+            f"{task.mode}|{task.name}|{shlex.join(task.args)}|{seq_index}".encode("utf-8")
+        ).hexdigest()
+        tasks.append(task)
+    return tasks
+
+
 # ==============================================================================
 #  GLOBAL SETTINGS VALIDATION (before auth/bootstrap/mutation)
 # ==============================================================================
 def validate_global_config(cfg: dict | None = None) -> list[str]:
-    cfg = GLOBAL_CONFIG if cfg is None else cfg
+    """Return only settings errors that make safe operation ambiguous.
+
+    Optional/type errors are normalized and remain structured run warnings;
+    they must not brick startup merely because a cosmetic/tuning field is bad.
+    """
+    if cfg is None:
+        return list(CONFIG_FATAL_ERRORS)
     if not isinstance(cfg, dict):
         return ["global settings root is not a table"]
-    return []
+    w0, f0 = len(CONFIG_WARNINGS), len(CONFIG_FATAL_ERRORS)
+    _normalize_global_config(cfg)
+    errors = CONFIG_FATAL_ERRORS[f0:]
+    del CONFIG_WARNINGS[w0:]
+    del CONFIG_FATAL_ERRORS[f0:]
+    return errors
 
 def bootstrap_dependencies() -> bool:
     """Ensure UI dependencies are available without mutating the system.
@@ -3044,6 +3457,8 @@ def make_private_dir_under(base: Path, folder_name: str) -> Path | None:
     try:
         candidate.mkdir(mode=0o700)
         candidate.chmod(0o700)
+        _fsync_directory(candidate)
+        _fsync_directory(base)
         return candidate
     except FileExistsError:
         for i in range(2, 100):
@@ -3051,6 +3466,8 @@ def make_private_dir_under(base: Path, folder_name: str) -> Path | None:
             try:
                 candidate.mkdir(mode=0o700)
                 candidate.chmod(0o700)
+                _fsync_directory(candidate)
+                _fsync_directory(base)
                 return candidate
             except FileExistsError:
                 continue
@@ -3122,21 +3539,31 @@ def setup_storage_roots():
             sys.stderr.write(f"Error: {label} directory ({cand}) overlaps GIT_DIR ({gd_res})\n")
             sys.exit(1)
 
-    if ensure_secure_dir(l_dir):
+    if OPT_DRY_RUN:
+        # Dry-run validates path relationships only; it must not create storage.
         ACTIVE_LOG_BASE_DIR = l_dir
-    else:
-        sys.stderr.write(f"Error: Cannot create log directory: {l_dir}\n")
-        sys.exit(1)
+        ACTIVE_BACKUP_BASE_DIR = b_dir
+        return
 
+    if GLOBAL_CONFIG["logging"]["enabled"]:
+        if ensure_secure_dir(l_dir):
+            ACTIVE_LOG_BASE_DIR = l_dir
+        else:
+            ACTIVE_LOG_BASE_DIR = l_dir
+            _config_warn(f"optional log directory unavailable: {l_dir}")
+    else:
+        ACTIVE_LOG_BASE_DIR = l_dir
+
+    # Recovery storage is mandatory for any real sync because destructive Git
+    # replacement must never proceed without a durable backup destination.
     if ensure_secure_dir(b_dir):
         ACTIVE_BACKUP_BASE_DIR = b_dir
     else:
-        sys.stderr.write(f"Error: Cannot create backup directory: {b_dir}\n")
+        sys.stderr.write(f"Error: Cannot create mandatory backup directory: {b_dir}\n")
         sys.exit(1)
 
     if not ensure_secure_dir(s_dir):
-        sys.stderr.write(f"Error: Cannot create state directory: {s_dir}\n")
-        sys.exit(1)
+        _persistence_warn(f"state directory unavailable: {s_dir}")
 
 
 async def wait_for_process(proc: asyncio.subprocess.Process, timeout: float | None = None) -> int:
@@ -3371,21 +3798,22 @@ def ensure_free_space_for_bytes(target_path: Path, required_bytes: int, context:
 
 def setup_logging():
     global LOG_FILE
-    if not GLOBAL_CONFIG.get("logging", {}).get("enabled", True):
+    LOG_FILE = None
+    if OPT_DRY_RUN or not GLOBAL_CONFIG["logging"]["enabled"]:
         return
     LOG_FILE = make_private_file_under(ACTIVE_LOG_BASE_DIR, f"dusky_update_{RUN_TIMESTAMP}_", ".log")
     if not LOG_FILE:
-        sys.stderr.write("Error: Cannot create log file\n")
-        sys.exit(1)
+        _config_warn(f"optional main log unavailable under {ACTIVE_LOG_BASE_DIR}")
+        return
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write("================================================================================\n")
+            f.write("=" * 80 + "\n")
             f.write(f" DUSKY UPDATE LOG — {RUN_TIMESTAMP}\n")
             f.write(f" Kernel: {os.uname().release} | User: {user_home().name} | Python: {sys.version.split()[0]}\n")
-            f.write("================================================================================\n")
-    except Exception as e:
-        sys.stderr.write(f"Error: Cannot write to log file: {e}\n")
-        sys.exit(1)
+            f.write("=" * 80 + "\n")
+    except OSError as e:
+        _config_warn(f"optional main log write failed: {e}")
+        LOG_FILE = None
 
 
 # ==============================================================================
@@ -3917,16 +4345,27 @@ def restart_handoff_path(run_id: str) -> Path:
 
 
 def _write_restart_handoff(path: Path, payload: dict) -> bool:
+    """Publish a single-use exec handoff durably before inheriting control."""
     try:
-        with suppress(OSError):
-            path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(
+            str(path),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False)
+                json.dump(payload, f, ensure_ascii=False, sort_keys=True)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            _fsync_directory(path.parent)
         except BaseException:
             with suppress(OSError):
+                os.close(fd)
+            with suppress(OSError):
                 path.unlink(missing_ok=True)
+                _fsync_directory(path.parent)
             raise
         return True
     except OSError:
@@ -3934,49 +4373,143 @@ def _write_restart_handoff(path: Path, payload: dict) -> bool:
 
 
 def validate_restart_handoff(path: Path | None, profile: 'ProfileConfig') -> dict | None:
+    """Validate every field consumed after exec without binding to new config.
+
+    Repository/branch/profile *values* may legitimately change in the candidate,
+    so they are shape-checked rather than compared with the newly loaded profile.
+    The handoff is instead bound to the inherited work-tree/git-dir, run-id file
+    name, owner, runtime directory, TTL, and inherited lock identity.
+    """
+    _ = profile
     try:
-        if path is None or not path.is_file():
+        if path is None:
+            return None
+        st = path.lstat()
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            return None
+        if stat.S_IMODE(st.st_mode) & 0o077:
+            return None
+        runtime = _runtime_dir_path().resolve()
+        if path.parent.resolve() != runtime:
             return None
         with open(path, "r", encoding="utf-8") as f:
             payload = json.load(f)
-        if not isinstance(payload, dict):
+        if not isinstance(payload, dict) or payload.get("schema") != 3:
             return None
-        if payload.get("git_dir") != str(GIT_DIR):
+        if payload.get("git_dir") != str(GIT_DIR) or payload.get("work_tree") != str(WORK_TREE):
             return None
-        if payload.get("repo_url") != profile.repo_url or payload.get("branch") != profile.branch:
+
+        def nonempty(name: str) -> str | None:
+            value = payload.get(name)
+            return value if isinstance(value, str) and value and "\x00" not in value else None
+
+        run_id = nonempty("run_id")
+        if run_id is None or path.name != f"handoff_{run_id}.json":
             return None
+        for key in ("repo_url", "branch", "profile_filepath", "profile_name"):
+            if nonempty(key) is None:
+                return None
+        created = payload.get("created_epoch")
+        if isinstance(created, bool) or not isinstance(created, (int, float)) or not math.isfinite(float(created)):
+            return None
+        age = time.time() - float(created)
+        if age > HANDOFF_TTL_SEC or age < -60:
+            return None
+
         tasks = payload.get("git_tasks")
         if not isinstance(tasks, list) or len(tasks) != 5:
             return None
+        valid_status = {"success", "failed", "skipped"}
+        for item in tasks:
+            if not isinstance(item, dict) or item.get("status") not in valid_status:
+                return None
+            code = item.get("exit_code")
+            if code is not None and (isinstance(code, bool) or not isinstance(code, int)):
+                return None
+
+        summary = payload.get("git_summary")
+        warnings = payload.get("warnings", [])
+        if not isinstance(summary, dict) or not isinstance(warnings, list):
+            return None
+        for key in ("branch", "before_head", "after_head", "commits", "diff",
+                    "collision_backup", "local_mods_backup", "status"):
+            value = summary.get(key, "")
+            if not isinstance(value, str) or "\x00" in value:
+                return None
+        commit_list = summary.get("commit_list", [])
+        if not isinstance(commit_list, list) or any(not isinstance(x, str) or "\x00" in x for x in commit_list):
+            return None
+        for key in ("files_changed",):
+            value = summary.get(key, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return None
+        for key in ("collisions", "local_mods"):
+            value = summary.get(key)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+                return None
+        restored = summary.get("local_mods_restored")
+        if restored is not None and not isinstance(restored, bool):
+            return None
+        if not isinstance(summary.get("unrelated_histories", False), bool):
+            return None
+        for warning in warnings:
+            if not isinstance(warning, dict):
+                return None
+            for key in ("kind", "message", "task", "path", "recovery"):
+                value = warning.get(key, "")
+                if not isinstance(value, str) or "\x00" in value:
+                    return None
+
+        lock = payload.get("lock")
+        if not isinstance(lock, dict):
+            return None
+        for key in ("fd", "ino", "dev"):
+            value = lock.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return None
+        lock_path_value = lock.get("path")
+        if not isinstance(lock_path_value, str) or "\x00" in lock_path_value:
+            return None
+
+        sudo = payload.get("sudo")
+        if not isinstance(sudo, dict) or sudo.get("mode") not in {"none", "password", "nopasswd"}:
+            return None
+        for key in ("askpass_path", "sudoers_path"):
+            value = sudo.get(key, "")
+            if not isinstance(value, str) or "\x00" in value:
+                return None
+
+        generation = payload.get("restart_generation")
+        if isinstance(generation, bool) or not isinstance(generation, int) or not (1 <= generation <= 3):
+            return None
         return payload
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError, OverflowError):
         return None
 
+
 def _append_manifest_line(path: Path, record: dict) -> bool:
-    # Structured recovery manifests: one JSON object per line, so newlines
-    # and non-UTF8 names (surrogateescape) survive. Write errors are never
-    # swallowed silently — callers fail closed.
+    """Append one recovery record and durably publish it before mutation."""
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8", errors="surrogateescape") as mf:
             mf.write(json.dumps(record, ensure_ascii=False) + "\n")
+            mf.flush()
+            os.fsync(mf.fileno())
+        _fsync_directory(path.parent)
         return True
     except OSError:
         return False
 
 
 def _sync_copy_file(src_p: Path, dest_p: Path) -> bool:
+    """Copy one recovery payload and fsync data + containing directory."""
     try:
-        # Never traverse symlinked ancestors and never follow an existing
-        # destination symlink: unlink it first so we replace, not write through.
         dest_p.parent.mkdir(parents=True, exist_ok=True)
         try:
             st_d = dest_p.lstat()
-            # If dest is a symlink (including dangling), unlink before copy.
             if stat.S_ISLNK(st_d.st_mode):
                 dest_p.unlink()
             elif stat.S_ISDIR(st_d.st_mode):
-                # Type transition file<->dir: caller must handle via recovery
-                # storage; refuse to copy a file over a directory here.
                 if not src_p.is_symlink() and src_p.is_file():
                     return False
         except FileNotFoundError:
@@ -3985,12 +4518,12 @@ def _sync_copy_file(src_p: Path, dest_p: Path) -> bool:
             target = os.readlink(src_p)
             with suppress(OSError):
                 dest_p.unlink(missing_ok=True)
-            # Use lexists-style check: lstat above already handled symlink.
             os.symlink(target, dest_p)
+            _fsync_directory(dest_p.parent)
         else:
-            # copy2 without follow would still open() a symlink dest; we
-            # unlinked it above, so this writes a fresh file.
             shutil.copy2(src_p, dest_p, follow_symlinks=False)
+            _fsync_regular_file(dest_p)
+            _fsync_directory(dest_p.parent)
         return True
     except OSError:
         return False
@@ -4006,18 +4539,23 @@ def _validate_script_syntax(path: Path) -> tuple[bool, str]:
     uses the file's actual shebang interpreter with extglob enabled, and handles
     scripts with embedded data tables gracefully. Templates are ignored.
     """
+    original = path
+    suffix = original.suffix.lower()
     try:
-        st = path.lstat()
+        st = original.lstat()
     except OSError:
         return False, "file missing"
     if stat.S_ISLNK(st.st_mode):
-        return True, ""
+        try:
+            path = original.resolve(strict=True)
+            st = path.stat()
+        except (OSError, RuntimeError) as e:
+            return False, f"broken/unresolvable symlink: {e}"
     if not stat.S_ISREG(st.st_mode):
         return False, "not a regular file"
-    name_lower = path.name.lower()
+    name_lower = original.name.lower()
     if ".template" in name_lower or name_lower.endswith(".template"):
         return True, ""
-    suffix = path.suffix.lower()
     if suffix == ".py":
         try:
             text = path.read_text(encoding="utf-8")
@@ -4061,118 +4599,140 @@ def _validate_script_syntax(path: Path) -> tuple[bool, str]:
             )
             return True, ""
         except (subprocess.SubprocessError, OSError) as e:
-            try:
-                content = path.read_text(encoding="utf-8", errors="ignore")
-                for delim in ("# # DATA # #", "__DATA__", "\nexit 0\n", "\nexit 0"):
-                    if delim in content:
-                        code_part = content.split(delim, 1)[0]
-                        sub_cmd = [interp]
-                        if interp == "bash":
-                            sub_cmd.extend(["-O", "extglob"])
-                        sub_cmd.extend(["-n"])
-                        res = subprocess.run(
-                            sub_cmd,
-                            input=code_part.encode("utf-8"),
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            timeout=30,
-                        )
-                        if res.returncode == 0:
-                            return True, ""
-            except Exception:
-                pass
+            # Whole-file validation only. A syntactically valid prefix before
+            # an exit/data marker is not evidence that the actual candidate is
+            # safe to execute.
             return False, f"{interp} syntax failed: {e}"
     return True, ""
 
 
-def last_good_dir() -> Path:
-    d = backups_dir() / "last_good"
-    try:
-        d.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-    return d
+
+@dataclass(slots=True)
+class ScriptGateResult:
+    fatal: bool = False
+    outcomes: dict[str, dict[str, str]] = field(default_factory=dict)
+
+    def __bool__(self) -> bool:
+        return not self.fatal
 
 
-def store_last_good_self() -> None:
-    """Keep a pristine copy of the updater every time a sync run completes."""
-    try:
-        candidate = last_good_dir()
-        self_copy = Path(__file__)
-        if not _validate_script_syntax(self_copy)[0]:
-            return
-        # Only store validated startup configuration, not merely syntax-valid
-        # bytes: import-check the candidate in an isolated compile plus TOML
-        # settings parse before publishing.
-        try:
-            text = self_copy.read_text(encoding="utf-8")
-            compile(text, str(self_copy), "exec", dont_inherit=True)
-        except (OSError, SyntaxError, ValueError):
-            return
-        ok1 = _sync_copy_file(self_copy, candidate / "update_dusky.py")
-        ok2 = _sync_copy_file(self_copy, candidate / "update_dusky.py.latest")
-        if not (ok1 and ok2):
-            log("WARN", "Could not store last-good updater copy (copy failed).")
-    except Exception:
-        log("WARN", "Could not store last-good updater copy.")
 
+class _PTYStreamReaderProtocol(asyncio.StreamReaderProtocol):
+    """Translate Linux terminal hangup to EOF before StreamReader sees it.
 
-def restore_last_good_self() -> str:
-    """Repair the running updater if it was corrupted by a bad sync.
+    Doing this at the protocol boundary preserves bytes already buffered when
+    the slave closes; StreamReader otherwise raises its stored exception before
+    returning that final output.
+    """
 
-    Returns a human-readable summary of what was (or wasn't) done."""
-    self_copy = Path(__file__)
-    ok, why = _validate_script_syntax(self_copy)
-    if ok:
-        return ""
-    saved = last_good_dir() / "update_dusky.py"
-    try:
-        st = saved.lstat()
-        if not stat.S_ISREG(st.st_mode):
-            return (f"Cannot self-heal: {self_copy.name} is invalid ({why}) and "
-                    f"last-good copy is not a regular file at {saved}.")
-    except OSError:
-        return (f"Cannot self-heal: {self_copy.name} is invalid ({why}) and no "
-                f"last-good copy exists at {saved}.")
-    ok_saved, why_saved = _validate_script_syntax(saved)
-    if not ok_saved:
-        return (f"Cannot self-heal: running copy invalid ({why}) and last-good "
-                f"copy also invalid ({why_saved}).")
-    if not _sync_copy_file(saved, self_copy):
-        return (f"Cannot self-heal: restore copy failed for {self_copy.name}.")
-    return f"Healed: restored {self_copy.name} from last-good copy."
+    def __init__(self, reader: asyncio.StreamReader, on_close):
+        super().__init__(reader)
+        self._on_close = on_close
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        # The transport closes its FD after this callback. Disable input first
+        # so a delayed response cannot write to that FD after it is reused.
+        self._on_close()
+        if isinstance(exc, OSError) and exc.errno == errno.EIO:
+            exc = None
+        super().connection_lost(exc)
 
 
 class GitEngine:
-    def __init__(self, app: App, profile: ProfileConfig):
+    def __init__(self, app: Any, profile: ProfileConfig):
         self.app = app
         self.profile = profile
         self.log = app.log_main  # type: ignore
-        self.git_cmd_base = ['git', f'--git-dir={GIT_DIR}', f'--work-tree={WORK_TREE}']
+        # All emitted paths and literal pathspecs are work-tree-root relative,
+        # regardless of the directory from which the updater was launched.
+        self.git_cmd_base = ['git', '-C', str(WORK_TREE), f'--git-dir={GIT_DIR}', f'--work-tree={WORK_TREE}']
         self._last_collision_count = 0
         self._last_collision_dir = ""
         backups_dir().mkdir(parents=True, exist_ok=True)
+        self._sync_txn_path = backups_dir() / ".dusky_sync_transaction.json"
+
+    _SYNC_TXN_STATES = {
+        "prepared", "collisions-durable", "snapshot-durable", "applying",
+        "reset-applied", "completed", "completed-recovery-retained",
+        "aborted-before-apply", "recovery-blocked",
+    }
+
+    def _load_sync_txn(self) -> dict[str, Any] | None:
+        try:
+            st = self._sync_txn_path.lstat()
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+                return None
+            payload = json.loads(self._sync_txn_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or payload.get("schema") not in {1, 2}:
+                return None
+            if payload.get("state") not in self._SYNC_TXN_STATES:
+                return None
+            if payload.get("schema") == 2:
+                if payload.get("work_tree") != str(WORK_TREE) or payload.get("git_dir") != str(GIT_DIR):
+                    return None
+            return payload
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def _write_sync_txn(self, state: str, **extra: Any) -> None:
+        """Durably publish a cumulative destructive-sync checkpoint.
+
+        Every state after ``prepared`` carries forward recovery locations and
+        capture metadata.  This is intentional: a journal that forgets its
+        payload pointers at ``applying`` cannot recover after a power loss.
+        """
+        if state not in self._SYNC_TXN_STATES:
+            raise ValueError(f"unknown sync transaction state: {state}")
+        if state == "prepared":
+            payload: dict[str, Any] = {}
+        else:
+            payload = self._load_sync_txn() or {}
+        payload.update({
+            "schema": 2,
+            "state": state,
+            "updated": now_iso(),
+            "updated_epoch": time.time(),
+            "run_id": str(getattr(self.app, "run_id", RUN_TIMESTAMP)),
+            "work_tree": str(WORK_TREE),
+            "git_dir": str(GIT_DIR),
+            "old_head": getattr(self, "_sync_old_head", payload.get("old_head", "")),
+            "target_oid": getattr(self, "_sync_target_oid", payload.get("target_oid", "")),
+            "collision_backup": self._last_collision_dir or str(payload.get("collision_backup", "")),
+        })
+        payload.update(extra)
+        parent = self._sync_txn_path.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".sync-txn-", dir=str(parent))
+        tmp_path = Path(tmp)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, sort_keys=True)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self._sync_txn_path)
+            _fsync_directory(parent)
+        finally:
+            with suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
+
+    def _finish_sync_txn(self, state: str = "completed", **extra: Any) -> None:
+        self._write_sync_txn(state, **extra)
 
     async def _run(self, *args: str, check: bool = True, task_idx: int = -1) -> tuple[int, str, str]:
-        cmd = self.git_cmd_base + list(args)
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=_git_env()
-        )
-        stdout, stderr = await proc.communicate()
-        out, err = stdout.decode('utf-8', errors='surrogateescape').strip(), stderr.decode('utf-8', errors='surrogateescape').strip()
-
+        rc, out, err = await self._run_raw(*args, timeout_sec=float(GLOBAL_CONFIG["git"]["command_timeout"]))
         if task_idx != -1 and err:
-            self.app.log_task(escape(err), task_idx)  # type: ignore
-
-        if proc.returncode != 0 and check:
-            msg = f"[bold {THEME['error']}]Git Architecture Error ({proc.returncode}):[/] {escape(err)}"
+            self.app.log_task(escape(err), task_idx)
+        if rc != 0 and check:
+            cmd = self.git_cmd_base + list(args)
+            msg = f"[bold {THEME['error']}]Git Architecture Error ({rc}):[/] {escape(err)}"
             self.log(msg)
             if task_idx != -1:
-                self.app.log_task(msg, task_idx)  # type: ignore
-            raise subprocess.CalledProcessError(proc.returncode, cmd, output=out, stderr=err)
-        return proc.returncode, out, err
+                self.app.log_task(msg, task_idx)
+            raise subprocess.CalledProcessError(rc, cmd, output=out, stderr=err)
+        return rc, out, err
 
-    async def _run_raw(self, *args: str, timeout_sec: int = 0) -> tuple[int, str, str]:
+    async def _run_raw(self, *args: str, timeout_sec: int | float | None = None) -> tuple[int, str, str]:
         cmd = self.git_cmd_base + list(args)
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -4183,9 +4743,10 @@ class GitEngine:
         except Exception as e:
             return 1, "", str(e)
         try:
-            if timeout_sec > 0:
+            effective_timeout = float(timeout_sec) if timeout_sec and timeout_sec > 0 else float(GLOBAL_CONFIG["git"]["command_timeout"])
+            if effective_timeout > 0:
                 try:
-                    async with asyncio.timeout(timeout_sec):
+                    async with asyncio.timeout(effective_timeout):
                         stdout, stderr = await proc.communicate()
                 except TimeoutError:
                     await _terminate_process_group(proc)
@@ -4194,7 +4755,7 @@ class GitEngine:
                 stdout, stderr = await proc.communicate()
 
             return (proc.returncode,
-                    stdout.decode('utf-8', errors='surrogateescape').strip(),
+                    stdout.decode('utf-8', errors='surrogateescape') if '-z' in args else stdout.decode('utf-8', errors='surrogateescape').strip(),
                     stderr.decode('utf-8', errors='surrogateescape').strip())
         except asyncio.CancelledError:
             await _terminate_process_group(proc)
@@ -4237,12 +4798,12 @@ class GitEngine:
     def _literal_pathspec(rel: str) -> str:
         # `--` alone does not disable pathspec magic; :(literal) matches the
         # exact path including glob chars, spaces, and non-UTF8 (surrogateescape).
-        return f":(literal){rel}"
+        return f":(top,literal){rel}"
 
     async def _reject_protected_incoming(self, commit_oid: str, idx: int) -> bool:
         """Reject incoming trees that contain paths overlapping updater repository or backup directories."""
         protected: list[str] = []
-        for d in (GIT_DIR, backups_dir(), logs_dir(), state_dir(), askpass_dir(), runtime_dir()):
+        for d in tuple(x for x in (GIT_DIR, backups_dir(), logs_dir(), state_dir(), askpass_dir(), runtime_dir(), supervisor_state_dir()) if x is not None):
             try:
                 rel = d.resolve().relative_to(WORK_TREE.resolve())
                 protected.append(str(rel))
@@ -4258,8 +4819,8 @@ class GitEngine:
             if not p:
                 continue
             for prot in protected:
-                if p == prot or p.startswith(prot + "/"):
-                    self._tlog(f"[bold {THEME['error']}]Incoming file '{escape(p)}' conflicts with protected storage '{escape(prot)}'[/]", idx, True)
+                if p == prot or p.startswith(prot + "/") or prot.startswith(p + "/"):
+                    self._tlog(f"[bold {THEME['error']}]Incoming path '{escape(p)}' conflicts with/contains protected storage '{escape(prot)}'[/]", idx, True)
                     return False
         return True
 
@@ -4271,173 +4832,96 @@ class GitEngine:
             if dest.exists() or dest.is_symlink():
                 dest = dest.with_name(f"{dest.name}_{int(time.time())}")
             shutil.move(str(src), str(dest))
+            if not _fsync_tree(dest):
+                return None
+            with suppress(OSError):
+                _fsync_directory(src.parent)
             return dest
         except Exception:
             return None
 
 
-    async def _gate_incoming_scripts(self, changed_paths: list[str], idx: int, local_head: str = "", target_oid: str = "") -> bool:
-        """Gate incoming added/modified regular scripts; fail closed.
+    async def _gate_incoming_scripts(self, changed_paths: list[str], idx: int, local_head: str = "", target_oid: str = "") -> ScriptGateResult:
+        """Validate exact post-sync script bytes and block execution structurally.
 
-        Preserves intentional upstream deletions (never recreates a path absent
-        from the new tree). Tree/type lookup failures propagate as gate
-        failure, never as empty-tree success. Git symlinks (mode 120000) are
-        skipped by policy: they are not regular scripts to compile. Returns
-        False when any incoming script is invalid and unrestorable, after
-        disabling its executable bit so later runs cannot execute it.
+        Invalid scripts remain at the upstream/local content selected by Git; the
+        gate never rewrites them to an older blob and never relies on chmod as a
+        safety boundary. Execution is prevented through app.blocked_scripts.
         """
-        ok_all = True
+        result = ScriptGateResult()
+        # Shell scripts can legitimately parse later sections only after
+        # changing parser options or stop before appended data. Let their real
+        # interpreter decide by default; updater activation is checked separately.
+        if not GLOBAL_CONFIG["execution"]["validate_subscript_syntax"]:
+            return result
         tree_ref = target_oid or "HEAD"
-        new_modes: dict[str, str] = {}
         try:
             rc_ls, ls_out, ls_err = await self._run_raw('ls-tree', '-r', '-z', tree_ref, '--')
         except asyncio.CancelledError:
             raise
         except Exception as e:
             self._tlog(f"[bold {THEME['error']}]Gate tree lookup failed: {escape(str(e))}[/]", idx, True)
-            return False
+            result.fatal = True
+            return result
         if rc_ls != 0:
             self._tlog(f"[bold {THEME['error']}]Gate tree lookup failed (rc={rc_ls}): {escape(ls_err)}[/]", idx, True)
-            return False
-        parts = ls_out.split('\0')
-        for rec in parts:
+            result.fatal = True
+            return result
+
+        modes: dict[str, str] = {}
+        for rec in ls_out.split('\0'):
             if not rec or '\t' not in rec:
                 continue
-            meta, pp = rec.split('\t', 1)
-            toks = meta.strip().split()
+            meta, rel = rec.split('\t', 1)
+            toks = meta.split()
             if len(toks) >= 3:
-                new_modes[pp] = toks[0]
+                modes[rel] = toks[0]
+
+        blocked = getattr(self.app, "blocked_scripts", None)
+        if not isinstance(blocked, dict):
+            blocked = {}
+            setattr(self.app, "blocked_scripts", blocked)
+        all_outcomes = getattr(self.app, "script_gate_outcomes", None)
+        if not isinstance(all_outcomes, dict):
+            all_outcomes = {}
+            setattr(self.app, "script_gate_outcomes", all_outcomes)
+
         for rel in sorted(set(changed_paths)):
             if not rel.endswith((".py", ".sh")):
                 continue
-            if rel not in new_modes:
+            mode = modes.get(rel)
+            if mode is None:
+                result.outcomes[rel] = {"state": "deleted", "reason": "absent from target tree"}
+                blocked.pop(rel, None)
                 continue
-            mode = new_modes.get(rel, "")
-            if mode == "120000":
+            if mode not in ("100644", "100755", "120000"):
+                reason = f"unsupported git mode {mode}"
+                result.outcomes[rel] = {"state": "blocked", "reason": reason}
+                blocked[rel] = reason
+                self._tlog(f"[bold {THEME['warning']}]Blocked script {escape(rel)}: {escape(reason)}[/]", idx, True)
                 continue
-            if mode not in ("100644", "100755"):
-                continue
+
             target = WORK_TREE / rel
-            try:
-                st_t = target.lstat()
-                if stat.S_ISLNK(st_t.st_mode):
-                    self._tlog(f"[bold {THEME['error']}]Worktree symlink replaces regular file for {escape(rel)}[/]", idx, True)
-                    ok_all = False
-                    continue
-            except FileNotFoundError:
-                pass
-            except OSError as e:
-                self._tlog(f"[bold {THEME['error']}]Cannot stat incoming script {escape(rel)}: {escape(str(e))}[/]", idx, True)
-                ok_all = False
-                continue
             ok, why = await asyncio.to_thread(_validate_script_syntax, target)
             if ok:
-                if mode == "100755":
-                    with suppress(OSError):
-                        st_curr = target.lstat()
-                        if not (st_curr.st_mode & 0o111):
-                            target.chmod(st_curr.st_mode | 0o755)
+                result.outcomes[rel] = {"state": "valid", "reason": ""}
+                blocked.pop(rel, None)
                 continue
-            if not local_head:
-                self._tlog(
-                    f"\n[bold {THEME['warning']}]Note:[/] incoming script {rel} (no previous local HEAD)\n"
-                    f"    {why} — left in place.",
-                    idx,
-                    True,
-                )
-                continue
-            # Resolve the fallback blob OID with a literal pathspec, then read
-            # bytes via cat-file (no `show rev:path`, which mishandles magic).
-            old_bytes = b""
-            rc_old = 1
-            rc_lo, old_oid_out, _ = await self._run_raw('ls-tree', local_head, '--', self._literal_pathspec(rel))
-            if rc_lo == 0 and old_oid_out.strip():
-                old_toks = old_oid_out.strip().split()
-                old_oid = old_toks[2] if len(old_toks) >= 3 else ""
-                if old_oid and len(old_oid) >= 40:
-                    rc_old, old_bytes = await self._run_raw_bytes("cat-file", "blob", old_oid, timeout_sec=30)
-            if rc_old == 0 and old_bytes:
-                try:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                except OSError as e:
-                    self._tlog(f"[bold {THEME['error']}]Cannot create safe parents for fallback of {escape(rel)}: {e}[/]", idx, True)
-                    ok_all = False
-                    continue
-                tmpf: Path | None = None
-                try:
-                    fd, tmp = tempfile.mkstemp(suffix=Path(rel).suffix, prefix=".gate.", dir=str(target.parent))
-                    os.close(fd)
-                    tmpf = Path(tmp)
-                    with suppress(OSError):
-                        tmpf.chmod(0o600)
-                    try:
-                        if stat.S_ISLNK(tmpf.lstat().st_mode):
-                            raise OSError("symlink race on gate temp")
-                    except FileNotFoundError:
-                        raise OSError("gate temp vanished")
-                    tmpf.write_bytes(old_bytes)
-                    ok_fb, why_fb = await asyncio.to_thread(_validate_script_syntax, tmpf)
-                except OSError as e:
-                    ok_fb, why_fb = False, str(e)
-                    tmpf = None
-                finally:
-                    with suppress(OSError):
-                        if tmpf is not None:
-                            tmpf.unlink(missing_ok=True)
-                if not ok_fb:
-                    self._tlog(f"[bold {THEME['warning']}]Note for {escape(rel)}: incoming version left in place[/]", idx, True)
-                    continue
-                try:
-                    try:
-                        st_now = target.lstat()
-                        if stat.S_ISLNK(st_now.st_mode):
-                            target.unlink()
-                    except FileNotFoundError:
-                        pass
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    fd2, tmp2 = tempfile.mkstemp(prefix=".gate.", dir=str(target.parent))
-                    os.close(fd2)
-                    tmp_dest = Path(tmp2)
-                    try:
-                        tmp_dest.write_bytes(old_bytes)
-                        try:
-                            rc_m, meta_out, _ = await self._run_raw('ls-tree', local_head, '--', self._literal_pathspec(rel))
-                            if rc_m == 0 and meta_out:
-                                mode_str = meta_out.strip().split()[0]
-                                if mode_str in ("100755", "100644"):
-                                    tmp_dest.chmod(int(mode_str[-3:], 8))
-                        except (OSError, asyncio.CancelledError):
-                            raise
-                        except Exception:
-                            pass
-                        os.replace(str(tmp_dest), str(target))
-                    except BaseException:
-                        with suppress(OSError):
-                            tmp_dest.unlink(missing_ok=True)
-                        raise
-                    self._tlog(
-                        f"\n[bold {THEME['warning']}]Invalid incoming update blocked:[/] {rel}\n"
-                        f"    Restored your last working version from your previous local commit.\n    Reason: {why}",
-                        idx,
-                        True,
-                    )
-                    continue
-                except OSError as e:
-                    self._tlog(f"[bold {THEME['error']}]Restore failed for {rel}: {e}[/]", idx, True)
-                    ok_all = False
-                    continue
-            with suppress(OSError):
-                st_curr = target.lstat()
-                target.chmod(st_curr.st_mode & ~0o111)
+
+            result.outcomes[rel] = {"state": "blocked", "reason": why}
+            blocked[rel] = why
             self._tlog(
-                f"\n[bold {THEME['error']}]BLOCKED:[/] broken incoming script {rel} (no valid previous HEAD)\n"
-                f"    Reason: {why} — disabled executable bit; review manually.",
-                idx,
-                True,
+                f"[bold {THEME['warning']}]BLOCKED TASK SCRIPT:[/] {escape(rel)}\n"
+                f"    Exact candidate failed syntax validation: {escape(why)}\n"
+                "    File content was not rewritten; any task resolving to this path will be skipped.",
+                idx, True,
             )
-            ok_all = False
-        # Always return True so a broken incoming script does not halt the entire Git pipeline
-        return True
+            if hasattr(self.app, "add_warning"):
+                self.app.add_warning("blocked-script", f"{rel}: {why}", path=rel)
+
+        all_outcomes.update(result.outcomes)
+        return result
+
     async def _unstage_managed_paths(self) -> bool:
         """
         Safeguards internal directories (backups, logs, state) from git tracking hazards.
@@ -4452,7 +4936,7 @@ class GitEngine:
         Fail-closed: returns False on any git failure so callers stop before reset.
         """
         paths = []
-        for d in (backups_dir(), logs_dir(), state_dir(), askpass_dir(), runtime_dir()):
+        for d in tuple(x for x in (backups_dir(), logs_dir(), state_dir(), askpass_dir(), runtime_dir(), supervisor_state_dir()) if x is not None):
             try:
                 rel = d.relative_to(WORK_TREE)
                 paths.append(str(rel))
@@ -4465,7 +4949,7 @@ class GitEngine:
         rc, raw_local, _ = await self._run_raw('rev-parse', '--verify', '-q', 'HEAD')
 
         if rc == 0 and raw_local.strip():
-            rc2, _, err2 = await self._run_raw('reset', '-q', 'HEAD', '--', *paths)
+            rc2, _, err2 = await self._run_raw('reset', '-q', 'HEAD', '--', *(self._literal_pathspec(p) for p in paths))
             if rc2 != 0:
                 self._tlog(f"[bold {THEME['error']}]Failed to unstage managed paths: {escape(err2)}[/]", -1, True)
                 return False
@@ -4476,7 +4960,7 @@ class GitEngine:
             # other rev-parse failure must fail closed.
             if rc != 0 and raw_local.strip():
                 return False
-            rc2, _, err2 = await self._run_raw('rm', '--cached', '-r', '--ignore-unmatch', '--quiet', '--', *paths)
+            rc2, _, err2 = await self._run_raw('rm', '--cached', '-r', '--ignore-unmatch', '--quiet', '--', *(self._literal_pathspec(p) for p in paths))
             if rc2 != 0:
                 self._tlog(f"[bold {THEME['error']}]Failed to unstage managed paths (unborn): {escape(err2)}[/]", -1, True)
                 return False
@@ -4496,7 +4980,7 @@ class GitEngine:
                             return str((Path(root) / f).relative_to(GIT_DIR))
         return 'none'
 
-    async def _run_git_dir_only(self, *args: str, timeout_sec: int = 0) -> tuple[int, str, str]:
+    async def _run_git_dir_only(self, *args: str, timeout_sec: int | float | None = None) -> tuple[int, str, str]:
         # Identity probes (bare check, git-dir resolution) must NOT pass
         # --work-tree: git reports a bare repo as non-bare when a worktree
         # override is present. Worktree operations keep using _run_raw.
@@ -4510,9 +4994,10 @@ class GitEngine:
         except Exception as e:
             return 1, "", str(e)
         try:
-            if timeout_sec > 0:
+            effective_timeout = float(timeout_sec) if timeout_sec and timeout_sec > 0 else float(GLOBAL_CONFIG["git"]["command_timeout"])
+            if effective_timeout > 0:
                 try:
-                    async with asyncio.timeout(timeout_sec):
+                    async with asyncio.timeout(effective_timeout):
                         stdout, stderr = await proc.communicate()
                 except TimeoutError:
                     await _terminate_process_group(proc)
@@ -4841,7 +5326,14 @@ class GitEngine:
             if rc2 != 0:
                 self._tlog(f"[bold {THEME['error']}]Failed to list tracked files: {escape(err2)}[/]", task_idx, True)
                 return False
-            for f in ls_files.split('\0'):
+            rc_head, head_files, head_err = await self._run_raw('ls-tree', '-r', '-z', '--name-only', 'HEAD')
+            if rc_head != 0:
+                self._tlog(f"[bold {THEME['error']}]Failed to list HEAD paths: {escape(head_err)}[/]", task_idx, True)
+                return False
+            # A staged deletion does not make recreated local content an
+            # unrelated collision. Leave it for the local-change snapshot so
+            # unchanged upstream content preserves the recreated work-tree file.
+            for f in (ls_files + '\0' + head_files).split('\0'):
                 if not f:
                     continue
                 tracked_exact[f] = 1
@@ -4910,25 +5402,31 @@ class GitEngine:
         # under .meta/ so a tracked INFO.txt/MOVED_PATHS.txt can never collide.
         meta_dir = backup_dir / ".meta"
         payload_root = backup_dir / "payload"
-        with suppress(Exception):
+        try:
             meta_dir.mkdir(parents=True, exist_ok=True)
             meta_dir.chmod(0o700)
             payload_root.mkdir(parents=True, exist_ok=True)
             payload_root.chmod(0o700)
-            (meta_dir / "INFO.txt").write_text(
-                f"Dusky work-tree collision backup\nCreated: {RUN_TIMESTAMP}\nRef: {ref}\nWork tree: {WORK_TREE}\n"
+            _fsync_directory(meta_dir)
+            _fsync_directory(payload_root)
+            _fsync_directory(backup_dir)
+            _atomic_write_text(
+                meta_dir / "INFO.txt",
+                f"Dusky work-tree collision backup\nCreated: {RUN_TIMESTAMP}\nRef: {ref}\nWork tree: {WORK_TREE}\n",
             )
-            (meta_dir / "INFO.txt").chmod(0o600)
-            (meta_dir / "STATUS").write_text("pending-collision\n", encoding="utf-8")
-            (meta_dir / "STATUS").chmod(0o600)
+            _atomic_write_text(meta_dir / "STATUS", "pending-collision\n")
+        except OSError as e:
+            self._tlog(f"[bold {THEME['error']}]Cannot durably initialize collision recovery metadata: {escape(str(e))}[/]", task_idx, True)
+            return False
 
         moved_log = meta_dir / "MOVED_PATHS.txt"
         journal_log = meta_dir / "JOURNAL.txt"
-        with suppress(Exception):
-            moved_log.write_text("")
-            moved_log.chmod(0o600)
-            journal_log.write_text("")
-            journal_log.chmod(0o600)
+        try:
+            _atomic_write_text(moved_log, "")
+            _atomic_write_text(journal_log, "")
+        except OSError as e:
+            self._tlog(f"[bold {THEME['error']}]Cannot durably initialize collision journals: {escape(str(e))}[/]", task_idx, True)
+            return False
 
         self._tlog(f"[bold {THEME['warning']}]{len(collision_roots)} work-tree collision(s) found. Backing up...[/]", task_idx, True)
         for coll_rel in collision_roots:
@@ -4943,6 +5441,11 @@ class GitEngine:
                     self._tlog(f"[bold {THEME['error']}]Failed to journal collision {escape(coll_rel)}[/]", task_idx, True)
                     return False
                 shutil.move(str(coll_src), str(coll_dest))
+                if not _fsync_tree(coll_dest):
+                    self._tlog(f"[bold {THEME['error']}]Collision payload could not be made durable: {escape(coll_rel)}[/]", task_idx, True)
+                    return False
+                with suppress(OSError):
+                    _fsync_directory(coll_src.parent)
                 self._tlog(f"[dim]  → Backed up collision: {escape(coll_rel)}[/dim]", task_idx)
                 if not _append_manifest_line(moved_log, {"path": coll_rel}):
                     self._tlog(f"[bold {THEME['error']}]Failed to record moved path {escape(coll_rel)}[/]", task_idx, True)
@@ -4951,50 +5454,108 @@ class GitEngine:
                 self._tlog(f"[bold {THEME['error']}]Failed to move collision {escape(coll_rel)}: {escape(str(e))}[/]", task_idx, True)
                 return False
 
+        if not await asyncio.to_thread(_fsync_tree, backup_dir):
+            self._tlog(f"[bold {THEME['error']}]Collision recovery tree could not be made fully durable; aborting.[/]", task_idx, True)
+            return False
         self._tlog(f"[bold {THEME['success']}]Collisions backed up → {backup_dir}[/]", task_idx, True)
         return True
 
-    async def _capture_tracked_changes(self) -> tuple[list, dict, dict, dict]:
-        # update-index --refresh returns nonzero when the worktree is dirty;
-        # that is expected and must NOT fail the capture. Any other transport
-        # failure is surfaced via diff-index below.
-        with suppress(Exception):
-            await self._run_raw('update-index', '-q', '--refresh')
-        rc, raw, err = await self._run_raw('diff-index', '--raw', '--no-renames', '-z', 'HEAD', '--')
-
-        paths: list = []
-        status_map: dict = {}
-        old_mode_map: dict = {}
-        old_oid_map: dict = {}
-
-        if rc != 0:
-            raise RuntimeError(f"diff-index HEAD failed (rc={rc}): {err}")
-        if not raw.strip():
-            return paths, status_map, old_mode_map, old_oid_map
-
-        records = raw.split('\0')
+    @staticmethod
+    def _parse_raw_diff(raw: str) -> list[tuple[str, str, str, str]]:
+        rows: list[tuple[str, str, str, str]] = []
+        recs = raw.split('\0')
         i = 0
-        while i + 1 < len(records):
-            meta = records[i].lstrip(':')
-            path = records[i + 1]
+        while i + 1 < len(recs):
+            meta = recs[i].lstrip(':')
+            path = recs[i + 1]
             i += 2
             if not meta or not path:
                 continue
             parts = meta.split()
             if len(parts) < 5:
                 continue
-            oldmode, _, oldoid, _, status = parts[0], parts[1], parts[2], parts[3], parts[4]
-            status = status.rstrip('0123456789')
-            paths.append(path)
+            oldmode, _newmode, oldoid, _newoid, status = parts[:5]
+            rows.append((path, status.rstrip('0123456789'), oldmode, oldoid))
+        return rows
+
+    async def _capture_tracked_changes(self) -> tuple[list, dict, dict, dict]:
+        """Capture HEAD→index and index→worktree independently, then union.
+
+        ``self._actual_staged_paths`` records only real HEAD/index deltas so
+        ordinary unstaged edits do not create false pending-staged recovery.
+        """
+        with suppress(Exception):
+            await self._run_raw('update-index', '-q', '--refresh')
+        rc_i, raw_i, err_i = await self._run_raw('diff-index', '--cached', '--raw', '--no-renames', '-z', 'HEAD', '--')
+        if rc_i != 0:
+            raise RuntimeError(f"diff-index --cached HEAD failed (rc={rc_i}): {err_i}")
+        rc_w, raw_w, err_w = await self._run_raw('diff-files', '--raw', '--no-renames', '-z', '--')
+        if rc_w != 0:
+            raise RuntimeError(f"diff-files failed (rc={rc_w}): {err_w}")
+
+        index_rows = self._parse_raw_diff(raw_i)
+        work_rows = self._parse_raw_diff(raw_w)
+        self._actual_staged_paths = {r[0] for r in index_rows}
+        union: list[str] = []
+        status_map: dict[str, str] = {}
+        old_mode_map: dict[str, str] = {}
+        old_oid_map: dict[str, str] = {}
+        for path, status, mode, oid in [*index_rows, *work_rows]:
+            if path not in status_map:
+                union.append(path)
             status_map[path] = status
-            old_mode_map[path] = oldmode
-            old_oid_map[path] = oldoid
+            if mode and mode.strip('0'):
+                old_mode_map.setdefault(path, mode)
+            if oid and oid.strip('0'):
+                old_oid_map.setdefault(path, oid)
+        # HEAD is the old upstream baseline for EVERY path. In particular,
+        # staged additions have no old blob, and a staged deletion can coexist
+        # with a recreated (now untracked) local file that must be backed up.
+        signatures: dict[str, tuple] = {}
+        for path in union:
+            rc_h, rec, err_h = await self._run_raw('ls-tree', '-z', 'HEAD', '--', self._literal_pathspec(path))
+            if rc_h != 0:
+                raise RuntimeError(f"Cannot capture HEAD metadata for {path}: {err_h}")
+            old_mode_map[path], old_oid_map[path] = "", ""
+            if rec:
+                if '\t' not in rec:
+                    raise RuntimeError(f"Malformed HEAD metadata for {path}")
+                toks = rec.split('\t', 1)[0].split()
+                if len(toks) < 3:
+                    raise RuntimeError(f"Malformed HEAD metadata for {path}")
+                old_mode_map[path], old_oid_map[path] = toks[0], toks[2]
+            src = WORK_TREE / path
+            try:
+                st = src.lstat()
+            except FileNotFoundError:
+                status_map[path] = "D"
+                signatures[path] = ("missing",)
+                continue
+            status_map[path] = "M" if old_oid_map[path] else "A"
+            if stat.S_ISLNK(st.st_mode):
+                content = os.readlink(src)
+            elif stat.S_ISREG(st.st_mode):
+                content = await asyncio.to_thread(file_checksum, src)
+                if not content:
+                    raise RuntimeError(f"Cannot read local content for {path}")
+            else:
+                content = None
+            signatures[path] = (st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns, content)
+        rc_index, index_bytes = await self._run_raw_bytes('ls-files', '--stage', '-z')
+        rc_head, head, err_head = await self._run_raw('rev-parse', '--verify', 'HEAD')
+        if rc_index != 0 or rc_head != 0:
+            raise RuntimeError(f"Cannot fingerprint index/HEAD before reset: {err_head}")
+        # Status/path equality alone misses edits to an already-modified file
+        # and changes to the new side of a staged blob.
+        self._capture_signature = (head, index_bytes, signatures)
+        return union, status_map, old_mode_map, old_oid_map
 
-        return paths, status_map, old_mode_map, old_oid_map
-
-    async def _backup_user_modifications(self, change_paths: list, change_status: dict, task_idx: int) -> Path | None:
+    async def _backup_user_modifications(self, change_paths: list, change_status: dict, task_idx: int,
+                                         change_old_mode: dict | None = None, change_old_oid: dict | None = None) -> Path | None:
         if not change_paths:
             return None
+        change_old_mode = change_old_mode or {}
+        change_old_oid = change_old_oid or {}
 
         backup_base = backups_dir()
         candidate_paths = [WORK_TREE / p for p in change_paths if change_status.get(p) != 'D']
@@ -5015,26 +5576,34 @@ class GitEngine:
         meta_dir = backup_dir / ".meta"
         payload_root = backup_dir / "payload"
         staged_root = meta_dir / "staged"
-        with suppress(Exception):
+        manifest = meta_dir / "MANIFEST.txt"
+        try:
             meta_dir.mkdir(parents=True, exist_ok=True)
             meta_dir.chmod(0o700)
             payload_root.mkdir(parents=True, exist_ok=True)
             payload_root.chmod(0o700)
             staged_root.mkdir(parents=True, exist_ok=True)
             staged_root.chmod(0o700)
-        manifest = meta_dir / "MANIFEST.txt"
-        try:
-            manifest.write_text("")
-            manifest.chmod(0o600)
-            (meta_dir / "STATUS").write_text("pending\n", encoding="utf-8")
-            (meta_dir / "STATUS").chmod(0o600)
-            (meta_dir / "INFO.txt").write_text(
+            _fsync_directory(staged_root)
+            _fsync_directory(meta_dir)
+            _fsync_directory(payload_root)
+            _fsync_directory(backup_dir)
+            _atomic_write_text(manifest, "")
+            _atomic_write_text(meta_dir / "STATUS", "pending\n")
+            _atomic_write_text(
+                meta_dir / "INFO.txt",
                 f"Dusky user-mods backup\nCreated: {RUN_TIMESTAMP}\nWork tree: {WORK_TREE}\n"
                 f"Staging is NOT restored automatically; staged blobs are preserved under .meta/staged/ for recovery.\n",
-                encoding="utf-8",
             )
-            (meta_dir / "INFO.txt").chmod(0o600)
-        except Exception:
+            capture_ctx = {
+                "old_head": getattr(self, "_sync_old_head", ""),
+                "target_oid": getattr(self, "_sync_target_oid", ""),
+                "created": now_iso(),
+                "created_epoch": time.time(),
+            }
+            _atomic_json_write(meta_dir / "CAPTURE.json", capture_ctx)
+        except Exception as e:
+            self._tlog(f"[bold {THEME['error']}]Cannot durably initialize local-change recovery metadata: {escape(str(e))}[/]", task_idx, True)
             return None
 
         for path in change_paths:
@@ -5043,12 +5612,13 @@ class GitEngine:
             # Capture staged/index content independently of the worktree diff,
             # including staged-only changes (worktree reverted to HEAD) and
             # files missing from the worktree. Fail closed on incomplete capture.
-            staged_ok = await self._capture_staged_blob(path, staged_root, manifest, task_idx)
-            if not staged_ok:
-                self._tlog(f"[bold {THEME['error']}]Staged capture failed for: {escape(path)}[/]", task_idx, True)
-                return None
+            if path in getattr(self, "_actual_staged_paths", set()):
+                staged_ok = await self._capture_staged_blob(path, staged_root, manifest, task_idx)
+                if not staged_ok:
+                    self._tlog(f"[bold {THEME['error']}]Staged capture failed for: {escape(path)}[/]", task_idx, True)
+                    return None
             if st == 'D' or not (src.exists() or src.is_symlink()):
-                if not _append_manifest_line(manifest, {"status": st, "has_copy": 0, "path": path}):
+                if not _append_manifest_line(manifest, {"status": st, "has_copy": 0, "path": path, "old_mode": change_old_mode.get(path, ""), "old_oid": change_old_oid.get(path, "")}):
                     self._tlog(f"[bold {THEME['error']}]Failed to write manifest for: {escape(path)}[/]", task_idx, True)
                     return None
                 continue
@@ -5057,10 +5627,13 @@ class GitEngine:
             if not ok:
                 self._tlog(f"[bold {THEME['error']}]Backup failed for: {escape(path)}[/]", task_idx, True)
                 return None
-            if not _append_manifest_line(manifest, {"status": st, "has_copy": 1, "path": path}):
+            if not _append_manifest_line(manifest, {"status": st, "has_copy": 1, "path": path, "old_mode": change_old_mode.get(path, ""), "old_oid": change_old_oid.get(path, "")}):
                 self._tlog(f"[bold {THEME['error']}]Failed to write manifest for: {escape(path)}[/]", task_idx, True)
                 return None
 
+        if not await asyncio.to_thread(_fsync_tree, backup_dir):
+            self._tlog(f"[bold {THEME['error']}]Local-change recovery tree could not be made fully durable; aborting.[/]", task_idx, True)
+            return None
         self._tlog(f"[bold {THEME['success']}]Backed up {len(change_paths)} tracked change(s) → {backup_dir}[/]", task_idx, True)
         return backup_dir
 
@@ -5113,10 +5686,13 @@ class GitEngine:
             sdest = staged_root / path
             sdest.parent.mkdir(parents=True, exist_ok=True)
             # Exclusive create: never overwrite silently, never follow symlinks.
-            fd = os.open(str(sdest), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            fd = os.open(str(sdest), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
             try:
                 with os.fdopen(fd, "wb") as f:
                     f.write(blob)
+                    f.flush()
+                    os.fsync(f.fileno())
+                _fsync_directory(sdest.parent)
             except BaseException:
                 with suppress(OSError):
                     os.close(fd)
@@ -5154,59 +5730,43 @@ class GitEngine:
 
         meta_dir = backup_dir / ".meta"
         payload_root = backup_dir / "payload"
-        with suppress(Exception):
+        try:
             meta_dir.mkdir(parents=True, exist_ok=True)
             meta_dir.chmod(0o700)
             payload_root.mkdir(parents=True, exist_ok=True)
             payload_root.chmod(0o700)
+            _fsync_directory(meta_dir)
+            _fsync_directory(payload_root)
+            _fsync_directory(backup_dir)
             _, head, _ = await self._run_raw('rev-parse', 'HEAD')
-            (meta_dir / "INFO.txt").write_text(f"Dusky full tracked-tree backup\nCreated: {RUN_TIMESTAMP}\nHEAD: {head.strip()}\n", encoding="utf-8")
-            (meta_dir / "INFO.txt").chmod(0o600)
-            (meta_dir / "STATUS").write_text("pending-full-snapshot\n", encoding="utf-8")
-            (meta_dir / "STATUS").chmod(0o600)
+            _atomic_write_text(meta_dir / "INFO.txt", f"Dusky full tracked-tree backup\nCreated: {RUN_TIMESTAMP}\nHEAD: {head.strip()}\n")
+            _atomic_write_text(meta_dir / "STATUS", "pending-full-snapshot\n")
+        except OSError as e:
+            self._tlog(f"[bold {THEME['error']}]Cannot durably initialize full-snapshot metadata: {escape(str(e))}[/]", task_idx, True)
+            return None
 
         def _sync_copy_tree(tracked_files, work_tree, b_dir):
             success_count = 0
             failed: list[str] = []
             for p in tracked_files:
-                s = work_tree / p
-                d = b_dir / p
-                if not (s.exists() or s.is_symlink()):
+                src = work_tree / p
+                dest = b_dir / p
+                if not (src.exists() or src.is_symlink()):
                     # Tracked but absent in worktree (e.g. staged deletion):
                     # record as expected-missing, not as copied.
                     continue
-                try:
-                    d.parent.mkdir(parents=True, exist_ok=True)
-                except OSError:
-                    failed.append(p)
-                    continue
-                try:
-                    if s.is_symlink():
-                        target = os.readlink(s)
-                        with suppress(OSError):
-                            d.unlink(missing_ok=True)
-                        os.symlink(target, d)
-                    else:
-                        # Unlink dest symlink first to avoid writing through.
-                        try:
-                            if d.is_symlink():
-                                d.unlink()
-                        except OSError:
-                            pass
-                        shutil.copy2(s, d, follow_symlinks=False)
+                if _sync_copy_file(src, dest):
                     success_count += 1
-                except OSError:
+                else:
                     failed.append(p)
             return success_count, failed
 
         copied, failed = await asyncio.to_thread(_sync_copy_tree, tracked, WORK_TREE, payload_root)
         # Record expected entries and verify; abort reset on any omission.
         try:
-            (meta_dir / "EXPECTED.txt").write_text(json.dumps(tracked, ensure_ascii=False) + "\n", encoding="utf-8", errors="surrogateescape")
-            (meta_dir / "EXPECTED.txt").chmod(0o600)
+            _atomic_write_text(meta_dir / "EXPECTED.txt", json.dumps(tracked, ensure_ascii=False) + "\n")
             if failed:
-                (meta_dir / "FAILED.txt").write_text(json.dumps(failed, ensure_ascii=False) + "\n", encoding="utf-8", errors="surrogateescape")
-                (meta_dir / "FAILED.txt").chmod(0o600)
+                _atomic_write_text(meta_dir / "FAILED.txt", json.dumps(failed, ensure_ascii=False) + "\n")
         except OSError:
             self._tlog(f"[bold {THEME['error']}]Failed to write snapshot manifest; aborting reset.[/]", task_idx, True)
             return None
@@ -5215,6 +5775,9 @@ class GitEngine:
             self._tlog(f"[bold {THEME['error']}]Full snapshot incomplete: {len(failed)} file(s) failed; aborting reset. See {meta_dir}/FAILED.txt[/]", task_idx, True)
             return None
 
+        if not await asyncio.to_thread(_fsync_tree, backup_dir):
+            self._tlog(f"[bold {THEME['error']}]Full tracked-tree recovery payload could not be made durable; aborting.[/]", task_idx, True)
+            return None
         self._tlog(f"[bold {THEME['success']}]Full tracked-tree backup: {backup_dir} ({copied} file(s))[/]", task_idx, True)
         return backup_dir
 
@@ -5235,23 +5798,407 @@ class GitEngine:
             return None
 
         backup_repo = backup_root / "repo.git"
+        proc: asyncio.subprocess.Process | None = None
         try:
-            proc = await asyncio.create_subprocess_exec('cp', '-a', '--reflink=auto', str(GIT_DIR), str(backup_repo))
-            await proc.wait()
-            if proc.returncode != 0:
-                self._tlog(f"[bold {THEME['error']}]Failed to copy Git history[/]", task_idx, True)
+            proc = await asyncio.create_subprocess_exec(
+                'cp', '-a', '--reflink=auto', str(GIT_DIR), str(backup_repo),
+                start_new_session=True, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                async with asyncio.timeout(float(GLOBAL_CONFIG["git"]["backup_timeout"])):
+                    _out, err = await proc.communicate()
+            except TimeoutError:
+                await _terminate_process_group(proc)
+                self._tlog(f"[bold {THEME['error']}]Git history backup timed out[/]", task_idx, True)
                 return None
+            if proc.returncode != 0:
+                self._tlog(f"[bold {THEME['error']}]Failed to copy Git history: {escape(err.decode('utf-8', errors='replace'))}[/]", task_idx, True)
+                return None
+        except asyncio.CancelledError:
+            if proc is not None:
+                with suppress(Exception):
+                    await _terminate_process_group(proc)
+            raise
         except Exception as e:
+            if proc is not None:
+                with suppress(Exception):
+                    await _terminate_process_group(proc)
             self._tlog(f"[bold {THEME['error']}]Exception copying git dir: {escape(str(e))}[/]", task_idx, True)
             return None
 
-        with suppress(Exception):
-            info = backup_root / "INFO.txt"
-            info.write_text(f"Dusky Git history backup\nCreated: {RUN_TIMESTAMP}\nSource: {GIT_DIR}\n")
-            info.chmod(0o600)
+        # A successful cp exit only proves bytes reached the page cache. Flush
+        # every copied regular file/directory before treating this mandatory
+        # destructive-sync backup as durable.
+        if not await asyncio.to_thread(_fsync_tree, backup_repo):
+            self._tlog(
+                f"[bold {THEME['error']}]Git history backup could not be made durable; aborting destructive sync.[/]",
+                task_idx, True,
+            )
+            return None
+        try:
+            _atomic_write_text(
+                backup_root / "INFO.txt",
+                f"Dusky Git history backup\nCreated: {RUN_TIMESTAMP}\nSource: {GIT_DIR}\n",
+            )
+        except OSError as e:
+            self._tlog(
+                f"[bold {THEME['error']}]Git history backup metadata durability failed: {escape(str(e))}[/]",
+                task_idx, True,
+            )
+            return None
 
         self._tlog(f"[bold {THEME['success']}]Git history preserved → {backup_root}[/]", task_idx, True)
         return backup_root
+
+    def _rollback_collision_backup(self, backup_dir: Path) -> tuple[int, int]:
+        restored = retained = 0
+        meta = backup_dir / ".meta"
+        paths: list[str] = []
+        seen: set[str] = set()
+        # JOURNAL is written+fsynced before each move, so it is authoritative
+        # for the crash window between rename/copy and MOVED_PATHS publication.
+        for source_name in ("JOURNAL.txt", "MOVED_PATHS.txt"):
+            source = meta / source_name
+            if not source.is_file():
+                continue
+            try:
+                lines = source.read_text(encoding="utf-8", errors="surrogateescape").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                rel = rec.get("src") if source_name == "JOURNAL.txt" else rec.get("path")
+                if isinstance(rel, str) and rel and rel not in seen:
+                    seen.add(rel)
+                    paths.append(rel)
+
+        for rel in reversed(paths):
+            src = backup_dir / "payload" / rel
+            dst = WORK_TREE / rel
+            if not (src.exists() or src.is_symlink()):
+                continue
+            if dst.exists() or dst.is_symlink():
+                retained += 1
+                continue
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dst))
+                if not _fsync_tree(dst):
+                    retained += 1
+                    continue
+                with suppress(OSError):
+                    _fsync_directory(src.parent)
+                restored += 1
+            except OSError:
+                retained += 1
+        # Whether restored or intentionally retained, this collision-move
+        # transaction is resolved. Retained payload remains available for
+        # manual recovery and is never auto-pruned.
+        try:
+            state = "completed-recovery-retained" if retained else "completed"
+            _atomic_write_text(meta / "STATUS", state + "\n")
+        except OSError:
+            retained += 1
+        return restored, retained
+
+    async def _recover_pending_sync_artifacts(self, task_idx: int) -> None:
+        """Recover/resolve the previous durable sync transaction before syncing.
+
+        ``applying`` is deliberately fail-closed: a crash while ``git reset`` or
+        checkout was in flight can leave HEAD/worktree/index partially updated.
+        Without proof that the destructive command returned successfully we do
+        not guess.  All recovery payloads are retained and a new sync is blocked.
+        ``reset-applied`` is the explicit safe checkpoint from which local-state
+        restoration can be resumed automatically.
+        """
+        base = backups_dir()
+        if not base.is_dir():
+            return
+
+        txn = await asyncio.to_thread(self._load_sync_txn)
+        txn_state = str(txn.get("state", "")) if txn else ""
+        terminal_states = {"completed", "completed-recovery-retained", "aborted-before-apply"}
+        if txn and txn_state == "recovery-blocked":
+            recovery = str(txn.get("local_backup") or txn.get("collision_backup") or base)
+            raise RuntimeError(
+                f"previous sync is recovery-blocked; inspect retained recovery data at {recovery} before another sync"
+            )
+        if txn and txn_state not in terminal_states:
+            self._sync_old_head = str(txn.get("old_head", ""))
+            self._sync_target_oid = str(txn.get("target_oid", ""))
+            self._last_collision_dir = str(txn.get("collision_backup", ""))
+
+        retained_any = False
+
+        # Resolve interrupted collision moves. JOURNAL.txt makes the crash
+        # window after a move but before MOVED_PATHS publication recoverable.
+        for d in sorted(base.glob("moved_aside_*")):
+            try:
+                status = (d / ".meta" / "STATUS").read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if status != "pending-collision":
+                continue
+            restored, retained = await asyncio.to_thread(self._rollback_collision_backup, d)
+            retained_any = retained_any or retained > 0
+            if restored or retained:
+                self._tlog(
+                    f"[bold {THEME['warning']}]Recovered interrupted collision transaction: "
+                    f"restored={restored}, retained={retained}, backup={escape(str(d))}[/]",
+                    task_idx, True,
+                )
+                if hasattr(self.app, "add_warning"):
+                    self.app.add_warning(
+                        "recovery",
+                        f"interrupted collision transaction: restored={restored}, retained={retained}",
+                        recovery=str(d),
+                    )
+
+        rc_h, head_out, _ = await self._run_raw('rev-parse', '--verify', '-q', 'HEAD')
+        head = head_out.strip() if rc_h == 0 else ""
+
+        # A pre-application checkpoint proves reset/checkout was never started.
+        # Local worktree/index state therefore remains authoritative; keep its
+        # captured backup as recovery evidence but do not copy it over newer
+        # editor changes.
+        if txn and txn_state in {"prepared", "collisions-durable", "snapshot-durable"}:
+            local_raw = txn.get("local_backup", "")
+            if isinstance(local_raw, str) and local_raw:
+                local_dir = Path(local_raw)
+                if local_dir.is_dir():
+                    try:
+                        status_file = local_dir / ".meta" / "STATUS"
+                        current = status_file.read_text(encoding="utf-8").strip() if status_file.is_file() else ""
+                        if current == "pending":
+                            _atomic_write_text(status_file, "completed-capture-retained\n")
+                            retained_any = True
+                    except OSError:
+                        retained_any = True
+            full_raw = txn.get("full_tracked_backup", "")
+            if isinstance(full_raw, str) and full_raw:
+                full_dir = Path(full_raw)
+                try:
+                    status_file = full_dir / ".meta" / "STATUS"
+                    if status_file.is_file() and status_file.read_text(encoding="utf-8").strip() == "pending-full-snapshot":
+                        _atomic_write_text(status_file, "completed-recovery-retained\n")
+                        retained_any = True
+                except OSError:
+                    retained_any = True
+            await asyncio.to_thread(
+                self._finish_sync_txn,
+                "aborted-before-apply",
+                recovered_from=txn_state,
+                recovery_retained=retained_any,
+            )
+            self._tlog(
+                f"[bold {THEME['warning']}]Recovered interrupted pre-apply sync ({escape(txn_state)}); destructive application had not begun.[/]",
+                task_idx, True,
+            )
+            if hasattr(self.app, "add_warning"):
+                self.app.add_warning("recovery", f"interrupted sync recovered before application ({txn_state})")
+            return
+
+        # Once reset/checkout has been launched, only the explicit post-command
+        # checkpoint proves the worktree/index update completed.  Guessing from
+        # HEAD alone is unsafe because reset can update HEAD before all files.
+        if txn and txn_state == "applying":
+            recovery = str(txn.get("local_backup") or txn.get("collision_backup") or txn.get("full_tracked_backup") or base)
+            await asyncio.to_thread(
+                self._finish_sync_txn,
+                "recovery-blocked",
+                recovered_from="applying",
+                observed_head=head,
+                recovery=str(recovery),
+            )
+            if hasattr(self.app, "add_warning"):
+                self.app.add_warning(
+                    "recovery",
+                    "sync was interrupted while destructive Git application was in flight; automatic overwrite is unsafe",
+                    recovery=recovery,
+                )
+            raise RuntimeError(
+                f"sync was interrupted during destructive Git application; automatic recovery is intentionally blocked. "
+                f"Recovery data: {recovery}"
+            )
+
+        def load_change_manifest(d: Path) -> tuple[list[str], dict[str, str], dict[str, str], dict[str, str]] | None:
+            paths: list[str] = []
+            status_map: dict[str, str] = {}
+            mode_map: dict[str, str] = {}
+            oid_map: dict[str, str] = {}
+            try:
+                lines = (d / ".meta" / "MANIFEST.txt").read_text(
+                    encoding="utf-8", errors="surrogateescape"
+                ).splitlines()
+                for line in lines:
+                    rec = json.loads(line)
+                    if not isinstance(rec, dict) or "status" not in rec:
+                        continue
+                    rel = rec.get("path")
+                    if not isinstance(rel, str) or not rel or rel in status_map:
+                        continue
+                    paths.append(rel)
+                    status_map[rel] = str(rec.get("status", "?"))
+                    mode_map[rel] = str(rec.get("old_mode", ""))
+                    oid_map[rel] = str(rec.get("old_oid", ""))
+            except (OSError, ValueError, TypeError):
+                return None
+            return paths, status_map, mode_map, oid_map
+
+        processed_local: set[Path] = set()
+        if txn and txn_state == "reset-applied":
+            target = str(txn.get("target_oid", ""))
+            if not target or head != target:
+                recovery = str(txn.get("local_backup") or txn.get("collision_backup") or base)
+                await asyncio.to_thread(
+                    self._finish_sync_txn,
+                    "recovery-blocked",
+                    recovered_from="reset-applied",
+                    observed_head=head,
+                    recovery=str(recovery),
+                )
+                raise RuntimeError(
+                    f"transaction says reset completed to {target or '<missing>'}, but HEAD is {head or '<missing>'}; "
+                    f"recovery retained at {recovery}"
+                )
+
+            local_raw = txn.get("local_backup", "")
+            captured = txn.get("captured_paths", [])
+            if isinstance(local_raw, str) and local_raw:
+                local_dir = Path(local_raw)
+                if not local_dir.is_dir():
+                    if isinstance(captured, list) and captured:
+                        await asyncio.to_thread(
+                            self._finish_sync_txn,
+                            "recovery-blocked",
+                            recovered_from="reset-applied",
+                            observed_head=head,
+                            recovery=local_raw,
+                        )
+                        raise RuntimeError(f"required local-change recovery bundle is missing: {local_raw}")
+                else:
+                    processed_local.add(local_dir)
+                    try:
+                        local_status = (local_dir / ".meta" / "STATUS").read_text(encoding="utf-8").strip()
+                    except OSError:
+                        local_status = ""
+                    if local_status in {"pending", "pending-restore"}:
+                        manifest_data = load_change_manifest(local_dir)
+                        if manifest_data is None:
+                            await asyncio.to_thread(
+                                self._finish_sync_txn,
+                                "recovery-blocked",
+                                recovery=str(local_dir),
+                                reason="manifest unreadable",
+                            )
+                            raise RuntimeError(f"local-change recovery manifest is unreadable: {local_dir}")
+                        paths, status_map, mode_map, oid_map = manifest_data
+                        ok = True
+                        if paths:
+                            ok = await self._restore_user_modifications(
+                                local_dir, paths, status_map, mode_map, oid_map, task_idx
+                            )
+                        if not ok:
+                            retained_any = True
+                        self._tlog(
+                            f"[bold {THEME['warning']}]Resumed interrupted local-change restoration from {escape(str(local_dir))}: "
+                            f"{'complete' if ok else 'recovery retained'}[/]",
+                            task_idx, True,
+                        )
+                        if hasattr(self.app, "add_warning"):
+                            self.app.add_warning(
+                                "recovery", "resumed interrupted local-change restoration", recovery=str(local_dir)
+                            )
+                    elif local_status not in {"completed", "completed-capture-retained"}:
+                        retained_any = True
+                        if hasattr(self.app, "add_warning"):
+                            self.app.add_warning(
+                                "recovery",
+                                f"local-change recovery still requires manual attention ({local_status or 'unknown'})",
+                                recovery=str(local_dir),
+                            )
+
+            full_raw = txn.get("full_tracked_backup", "")
+            if isinstance(full_raw, str) and full_raw:
+                full_dir = Path(full_raw)
+                if full_dir.is_dir():
+                    try:
+                        status_file = full_dir / ".meta" / "STATUS"
+                        if status_file.is_file() and status_file.read_text(encoding="utf-8").strip() == "pending-full-snapshot":
+                            _atomic_write_text(status_file, "completed-recovery-retained\n")
+                            retained_any = True
+                            if hasattr(self.app, "add_warning"):
+                                self.app.add_warning(
+                                    "recovery", "full tracked-tree snapshot retained after interrupted reset", recovery=str(full_dir)
+                                )
+                    except OSError:
+                        retained_any = True
+
+            await asyncio.to_thread(
+                self._finish_sync_txn,
+                "completed-recovery-retained" if retained_any else "completed",
+                recovered_from="reset-applied",
+                restore_ok=not retained_any,
+            )
+
+        # Backward-compatible recovery for standalone artifacts from an older
+        # run/journal. Only resume when HEAD proves the recorded target landed.
+        for d in sorted(base.glob("your_changes_*")):
+            if d in processed_local:
+                continue
+            try:
+                status = (d / ".meta" / "STATUS").read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if status in {"pending-staged", "pending-quarantine", "pending-upstream-conflict"}:
+                if hasattr(self.app, "add_warning"):
+                    self.app.add_warning(
+                        "recovery", f"manual recovery retained ({status})", recovery=str(d)
+                    )
+                continue
+            if status not in {"pending", "pending-restore"}:
+                continue
+            try:
+                ctx = json.loads((d / ".meta" / "CAPTURE.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(ctx, dict):
+                continue
+            target = str(ctx.get("target_oid", ""))
+            if not target or head != target:
+                continue
+            manifest_data = load_change_manifest(d)
+            if manifest_data is None:
+                continue
+            paths, status_map, mode_map, oid_map = manifest_data
+            if paths:
+                ok = await self._restore_user_modifications(d, paths, status_map, mode_map, oid_map, task_idx)
+                self._tlog(
+                    f"[bold {THEME['warning']}]Resumed interrupted local-change restoration from {escape(str(d))}: "
+                    f"{'complete' if ok else 'recovery retained'}[/]",
+                    task_idx, True,
+                )
+                if hasattr(self.app, "add_warning"):
+                    self.app.add_warning("recovery", "resumed interrupted local-change restoration", recovery=str(d))
+
+        # Full snapshots are intentionally manual recovery artifacts. Mark an
+        # interrupted capture as retained/resolved so it is visible but does not
+        # masquerade as an active transaction on every launch.
+        for d in sorted(base.glob("full_snapshot_*")):
+            try:
+                status_file = d / ".meta" / "STATUS"
+                if status_file.read_text(encoding="utf-8").strip() != "pending-full-snapshot":
+                    continue
+                _atomic_write_text(status_file, "completed-recovery-retained\n")
+                if hasattr(self.app, "add_warning"):
+                    self.app.add_warning("recovery", "full tracked-tree recovery snapshot retained", recovery=str(d))
+            except OSError:
+                continue
 
     async def _get_head_path_meta(self, path: str) -> tuple[str, str]:
         # Fail-closed: a git error must not masquerade as "absent upstream
@@ -5280,6 +6227,7 @@ class GitEngine:
         merge_dir: Path | None = None
         restore_count = merge_count = deletion_count = 0
         quarantined: list[str] = []
+        upstream_overrode_deletions: list[str] = []
         all_ok = True
 
         for path in change_paths:
@@ -5313,7 +6261,7 @@ class GitEngine:
                 elif old_oid_valid and same_meta:
                     action = "delete-safe"
                 else:
-                    action = "delete-restored"
+                    action = "delete-upstream-won"
             else:
                 has_copy = backup_src.exists() or backup_src.is_symlink()
                 if not has_copy:
@@ -5321,8 +6269,12 @@ class GitEngine:
                     all_ok = False
                     continue
                 if old_oid_valid:
-                    safe = same_meta or not new_oid
+                    # A tracked path removed upstream is an upstream change,
+                    # not a safe restoration target. Preserve the user's copy
+                    # in recovery while leaving the active path deleted.
+                    safe = same_meta
                 else:
+                    # Genuine local addition absent from both upstream trees.
                     safe = not new_oid
                 action = "restore" if safe else "merge"
 
@@ -5357,9 +6309,18 @@ class GitEngine:
                     self._tlog(f"[bold {THEME['error']}]Failed to re-apply deletion {escape(path)}: {escape(str(e))}[/]", task_idx, True)
                     all_ok = False
 
-            elif action == "delete-restored":
-                restore_count += 1
-                self._tlog(f"[dim]  → Restored: {escape(path)} (accepting upstream's new version over local deletion)[/dim]", task_idx)
+            elif action == "delete-upstream-won":
+                # Upstream changed/reintroduced the path, so upstream wins at
+                # the active pathname.  The user's prior state was a deletion;
+                # retain that fact in recovery metadata instead of claiming a
+                # successful byte restoration and deleting the backup.
+                deletion_count += 1
+                upstream_overrode_deletions.append(path)
+                all_ok = False
+                self._tlog(
+                    f"[dim]  → Upstream version accepted for {escape(path)}; your prior local deletion is retained in recovery metadata[/dim]",
+                    task_idx,
+                )
 
             elif action == "merge":
                 if not merge_dir:
@@ -5376,6 +6337,10 @@ class GitEngine:
                     ok = await asyncio.to_thread(_sync_copy_file, backup_src, mdest)
                     if ok:
                         merge_count += 1
+                        # Upstream won at the active path, but the user's
+                        # displaced version still requires manual recovery.
+                        # This is not a fully restored transaction.
+                        all_ok = False
                         self._tlog(f"[dim]  → Upstream changed: {escape(path)} (your version saved for merge)[/dim]", task_idx)
                     else:
                         self._tlog(f"[bold {THEME['error']}]Failed to save merge copy: {escape(path)}[/]", task_idx, True)
@@ -5413,6 +6378,7 @@ class GitEngine:
                             except FileNotFoundError:
                                 pass
                             os.replace(str(tmp_file), str(target))
+                            _fsync_directory(target.parent)
                         except BaseException:
                             with suppress(OSError):
                                 tmp_file.unlink(missing_ok=True)
@@ -5448,6 +6414,8 @@ class GitEngine:
                                 except OSError as e:
                                     raise OSError(f"cannot read payload: {e}")
                                 f.write(data)
+                                f.flush()
+                                os.fsync(f.fileno())
                             # Preserve permissions and supported metadata before
                             # replacement. copystat copies mode+times without
                             # following symlinks; chmod ensures the executable
@@ -5475,6 +6443,7 @@ class GitEngine:
                             except FileNotFoundError:
                                 pass
                             os.replace(str(tmp_file), str(target))
+                            _fsync_directory(target.parent)
                             # Verify content/type/mode after replacement before
                             # this path counts as restored.
                             try:
@@ -5584,31 +6553,39 @@ class GitEngine:
                 f"staging is NOT auto-restored. Review: {escape(', '.join(staged_left[:10]))}[/]",
                 task_idx, True,
             )
+        if upstream_overrode_deletions:
+            self._tlog(
+                f"[bold {THEME['warning']}]Upstream overrode {len(upstream_overrode_deletions)} local deletion(s); deletion intent retained in recovery metadata.[/]",
+                task_idx, True,
+            )
         try:
             meta_dir = backup_dir / ".meta"
-            with suppress(OSError):
-                meta_dir.mkdir(parents=True, exist_ok=True)
-            (meta_dir / "RESTORE_RESULT.txt").write_text(
-                f"all_ok={all_ok}\nrestored={restore_count}\nmerged={merge_count}\ndeleted={deletion_count}\nstaged_left={len(staged_left)}\nbackup={backup_dir}\n"
-                + "".join(f"quarantined={q}\n" for q in quarantined),
-                encoding="utf-8",
+            meta_dir.mkdir(parents=True, exist_ok=True)
+            result_text = (
+                f"all_ok={all_ok}\nrestored={restore_count}\nmerged={merge_count}\ndeleted={deletion_count}\n"
+                f"staged_left={len(staged_left)}\nupstream_overrode_local_deletions={len(upstream_overrode_deletions)}\nbackup={backup_dir}\n"
+                + "".join(f"quarantined={q}\n" for q in quarantined)
+                + "".join(f"upstream_overrode_deletion={q}\n" for q in upstream_overrode_deletions)
             )
+            _atomic_write_text(meta_dir / "RESTORE_RESULT.txt", result_text)
             if all_ok:
-                (meta_dir / "STATUS").write_text("completed\n", encoding="utf-8")
+                _atomic_write_text(meta_dir / "STATUS", "completed\n")
             else:
                 if quarantined:
                     status_val = "pending-quarantine"
                 elif staged_left:
                     status_val = "pending-staged"
+                elif upstream_overrode_deletions:
+                    status_val = "pending-upstream-conflict"
                 else:
                     status_val = "pending-restore"
-                with suppress(OSError):
-                    (meta_dir / "STATUS").write_text(status_val + "\n", encoding="utf-8")
+                _atomic_write_text(meta_dir / "STATUS", status_val + "\n")
         except OSError:
             all_ok = False
 
-        if all_ok:
-            shutil.rmtree(str(backup_dir), ignore_errors=True)
+        # Keep the completed payload until retention pruning. Deleting it here
+        # leaves a crash window before execute_phase commits the transaction:
+        # recovery then sees reset-applied but cannot find its required backup.
 
         return all_ok
 
@@ -5640,17 +6617,18 @@ class GitEngine:
         restore_ok: bool | None = None
 
         try:
-            # Self-heal gate: if a previous sync corrupted the updater itself,
-            # repair from the last-good copy before doing anything else.
-            self_heal_note = restore_last_good_self()
-            if self_heal_note:
-                self.log(f"[bold {THEME['warning']}][SELF-HEAL][/] {self_heal_note}")
+            # Candidate-independent rollback is owned by update_dusky_supervisor.py.
+            # Never attempt in-process self-heal here: this process cannot
+            # recover from a candidate that fails before Python reaches main().
 
             # Task 0: Bare Repo Validation
             idx = 0
             self.app.update_task_state(idx, "running")  # type: ignore
             self._tlog(f"[bold {THEME['accent']}]>>> PROCESS INITIATED:[/] Bare Repository Validation\n", idx)
 
+            # Recovery is always resolved before inspecting/fetching a new
+            # repository state, including interrupted clone/unborn branches.
+            await self._recover_pending_sync_artifacts(idx)
             repo_state = await self._get_repo_state(idx)
 
             if repo_state == 'absent':
@@ -5663,15 +6641,21 @@ class GitEngine:
                 rc_head, head_oid, head_err = await self._run_raw('rev-parse', '--verify', 'HEAD^{commit}')
                 if rc_head != 0 or not head_oid.strip():
                     raise RuntimeError(f"Cannot resolve cloned HEAD: {head_err}")
+                self._sync_old_head = ""
+                self._sync_target_oid = head_oid.strip()
+                await asyncio.to_thread(self._write_sync_txn, "prepared", branch=self.profile.branch, initialization="clone")
                 if not await self._reject_protected_incoming(head_oid.strip(), idx):
                     raise RuntimeError("Cloned tree overlaps protected storage; refusing checkout.")
                 if not await self._backup_worktree_collisions('HEAD', honor_tracked=False, task_idx=idx):
                     raise RuntimeError("Collision backup failed during initial checkout.")
+                await asyncio.to_thread(self._write_sync_txn, "collisions-durable")
+                await asyncio.to_thread(self._write_sync_txn, "applying")
 
                 rc, _, err = await self._run_raw('checkout')
                 if rc != 0:
                     self._tlog(f"[bold {THEME['error']}]Checkout failed: {escape(err)}[/]", idx, True)
                     raise RuntimeError("Work-tree checkout failed.")
+                await asyncio.to_thread(self._write_sync_txn, "reset-applied", initialization="clone")
 
                 # Validate clone content too; it previously returned before the gate.
                 rc_ls, ls_clone, ls_err = await self._run_raw('ls-tree', '-r', '-z', '--name-only', 'HEAD')
@@ -5683,11 +6667,12 @@ class GitEngine:
                         raise RuntimeError("Cloned script gate failed; quarantined invalid scripts.")
 
                 meta.update(status="cloned")
-                self.app.git_summary = meta
+                self.app.git_summary.update(meta)
                 self._tlog(f"[bold {THEME['success']}]Repository cloned and checked out successfully.[/]", idx, True)
                 self.app.update_task_state(idx, "success")  # type: ignore
                 for i in range(1, 5):
                     self.app.update_task_state(i, "skipped")  # type: ignore
+                await asyncio.to_thread(self._finish_sync_txn, "completed", initialization="clone")
                 return True
 
             elif repo_state == 'invalid':
@@ -5696,7 +6681,7 @@ class GitEngine:
             self._tlog(f"[bold {THEME['success']}]Bare repository integrity verified.[/]", idx)
             self.app.update_task_state(idx, "success")  # type: ignore
             if self.app.run_logger:
-                self.app.run_logger.close_task(self.app.tasks[idx], idx, "completed", 0, 0.0)
+                self.app._safe_close_task_log(self.app.tasks[idx], idx, "completed", 0, 0.0)
 
             # Task 1: Fetch Upstream & Diff
             idx = 1
@@ -5709,9 +6694,9 @@ class GitEngine:
                 self._tlog(f"[bold {THEME['error']}]Git {op} is in progress. Resolve it manually first.[/]", idx, True)
                 raise RuntimeError(f"Git {op} in progress.")
 
-            # Purge internal managed paths from the index to prevent backup loops and data loss
-            if not await self._unstage_managed_paths():
-                raise RuntimeError("Failed to unstage managed paths.")
+            # Managed-path index cleanup is deferred until after local/index
+            # state has been captured durably; doing it here would destroy
+            # staged evidence before backup.
 
             fetch_source = await self._get_fetch_source()
             self._tlog(f"[dim]Fetching from {escape(fetch_source)}...[/dim]", idx)
@@ -5741,6 +6726,9 @@ class GitEngine:
                 raise RuntimeError(f"Upstream OID is not a commit: {target_oid}")
             remote_head = target_oid
             UPSTREAM_OID = target_oid
+            self._sync_old_head = local_head
+            self._sync_target_oid = UPSTREAM_OID
+            await asyncio.to_thread(self._write_sync_txn, "prepared", branch=self.profile.branch)
 
             if not local_head:
                 self._tlog(f"[bold {THEME['warning']}]Local repository has no commits yet. Initializing from upstream...[/]", idx, True)
@@ -5751,10 +6739,13 @@ class GitEngine:
                     raise RuntimeError("Incoming tree overlaps protected storage; refusing reset.")
                 if not await self._backup_worktree_collisions(UPSTREAM_OID, honor_tracked=False, task_idx=idx):
                     raise RuntimeError("Collision backup failed during unborn init.")
+                await asyncio.to_thread(self._write_sync_txn, "collisions-durable", initialization="unborn")
+                await asyncio.to_thread(self._write_sync_txn, "applying", initialization="unborn")
                 rc2, _, err2 = await self._run_raw('reset', '--hard', UPSTREAM_OID)
                 if rc2 != 0:
                     self._tlog(f"[bold {THEME['error']}]Failed to init unborn repo: {escape(err2)}[/]", idx, True)
                     raise RuntimeError("Reset of unborn repo failed.")
+                await asyncio.to_thread(self._write_sync_txn, "reset-applied", initialization="unborn")
                 await self._ensure_repo_defaults()
                 rc_ls2, ls_unborn, ls_err2 = await self._run_raw('ls-tree', '-r', '-z', '--name-only', UPSTREAM_OID)
                 if rc_ls2 != 0:
@@ -5767,14 +6758,13 @@ class GitEngine:
                 self.app.update_task_state(idx, "success")  # type: ignore
                 for i in range(2, 5):
                     self.app.update_task_state(i, "skipped")  # type: ignore
+                await asyncio.to_thread(self._finish_sync_txn, "completed", initialization="unborn")
                 return True
 
             if local_head == remote_head:
                 op_eq = self._detect_git_operation_state()
                 if op_eq != 'none':
                     raise RuntimeError(f"Git {op_eq} in progress.")
-                if not await self._unstage_managed_paths():
-                    raise RuntimeError("Failed to unstage managed paths.")
                 change_paths, change_status, change_old_mode, change_old_oid = await self._capture_tracked_changes()
 
                 rc_ls_eq, ls_tree_eq, ls_err_eq = await self._run_raw('ls-tree', '-r', '-z', '--name-only', remote_head)
@@ -5787,20 +6777,29 @@ class GitEngine:
                         if not await self._gate_incoming_scripts(tracked_scripts_eq, idx, "", remote_head):
                             raise RuntimeError("Script gate failed: invalid syntax in repository scripts.")
                     meta.update(status="up_to_date", before_head=local_head, after_head=remote_head)
-                    self.app.git_summary = meta
+                    self.app.git_summary.update(meta)
                     self._tlog(f"[bold {THEME['success']}]Repository synchronization perfect. Origin matched.[/]", idx, True)
                     await self._ensure_repo_defaults()
                     self.app.update_task_state(idx, "success")  # type: ignore
                     if self.app.run_logger:
-                        self.app.run_logger.close_task(self.app.tasks[idx], idx, "completed", 0, 0.0)
+                        self.app._safe_close_task_log(self.app.tasks[idx], idx, "completed", 0, 0.0)
                     for i in range(2, 5):
                         self.app.update_task_state(i, "skipped")  # type: ignore
                         if self.app.run_logger:
-                            self.app.run_logger.close_task(self.app.tasks[i], i, "skipped", 0, 0.0)
+                            self.app._safe_close_task_log(self.app.tasks[i], i, "skipped", 0, 0.0)
+                    await asyncio.to_thread(self._finish_sync_txn, "completed", equal_head=True)
                     return True
                 meta.update(status="up_to_date_with_mods", before_head=local_head, after_head=remote_head, local_mods=len(change_paths))
-                self.app.git_summary = meta
-                self._tlog(f"[bold {THEME['accent']}]Origin matched, but work-tree has {len(change_paths)} tracked change(s). Processing...[/]", idx, True)
+                self.app.git_summary.update(meta)
+                self._tlog(f"[bold {THEME['accent']}]Origin matched; preserving {len(change_paths)} local/index change(s) in place (no reset).[/]", idx, True)
+                if tracked_scripts_eq:
+                    await self._gate_incoming_scripts(tracked_scripts_eq, idx, "", remote_head)
+                await self._ensure_repo_defaults()
+                self.app.update_task_state(idx, "success")
+                for i in range(2, 5):
+                    self.app.update_task_state(i, "skipped")
+                await asyncio.to_thread(self._finish_sync_txn, "completed", equal_head=True, local_changes=len(change_paths))
+                return True
 
             rc, commit_count_raw, _ = await self._run_raw('rev-list', '--count', f'{local_head}..{remote_head}')
             commit_count = commit_count_raw.strip() or "?"
@@ -5873,6 +6872,7 @@ class GitEngine:
                     collisions=self._last_collision_count,
                     collision_backup=self._last_collision_dir,
                 )
+                await asyncio.to_thread(self._write_sync_txn, "collisions-durable")
                 self.app.update_task_state(idx, "success")  # type: ignore
 
                 # Task 3: Snapshot
@@ -5887,21 +6887,39 @@ class GitEngine:
                 op_u = self._detect_git_operation_state()
                 if op_u != 'none':
                     raise RuntimeError(f"Git {op_u} in progress.")
-                if not await self._unstage_managed_paths():
-                    raise RuntimeError("Failed to unstage managed paths.")
                 change_paths, change_status, change_old_mode, change_old_oid = await self._capture_tracked_changes()
                 if change_paths:
-                    your_changes_backup = await self._backup_user_modifications(change_paths, change_status, idx)
+                    captured_signature = self._capture_signature
+                    your_changes_backup = await self._backup_user_modifications(change_paths, change_status, idx, change_old_mode, change_old_oid)
                     if your_changes_backup is None:
                         raise RuntimeError("User modifications backup failed.")
                 else:
+                    captured_signature = self._capture_signature
                     self._tlog(f"[bold {THEME['success']}]No local tracked modifications found. Snapshot skipped.[/]", idx)
                 meta.update(
                     full_tracked_backup=str(full_snapshot_dir),
                     local_mods=len(change_paths),
                     local_mods_backup=str(your_changes_backup) if your_changes_backup else "",
                 )
+                await asyncio.to_thread(
+                    self._write_sync_txn, "snapshot-durable",
+                    local_backup=str(your_changes_backup) if your_changes_backup else "",
+                    full_tracked_backup=str(full_snapshot_dir),
+                    captured_paths=change_paths, captured_status=change_status,
+                    captured_old_mode=change_old_mode, captured_old_oid=change_old_oid,
+                    captured_staged_paths=sorted(getattr(self, "_actual_staged_paths", set())),
+                )
 
+                # Revalidate immediately before destructive application. If
+                # an editor or another Git process changed captured inputs,
+                # stop rather than overwriting state that was never backed up.
+                fresh_paths, fresh_status, fresh_modes, fresh_oids = await self._capture_tracked_changes()
+                if self._capture_signature != captured_signature or (fresh_paths, fresh_status, fresh_modes, fresh_oids) != (change_paths, change_status, change_old_mode, change_old_oid):
+                    raise RuntimeError("Local/index state changed after snapshot; refusing reset. Re-run to recapture.")
+                # Now that staged/index state is durable, internal updater
+                # storage may be removed from the index before reset.
+                if not await self._unstage_managed_paths():
+                    raise RuntimeError("Failed to unstage managed paths after capture.")
                 self.app.update_task_state(idx, "success")  # type: ignore
 
                 # Task 4: Apply Bare Updates (Reset)
@@ -5909,10 +6927,12 @@ class GitEngine:
                 self.app.update_task_state(idx, "running")  # type: ignore
                 self._tlog(f"[bold {THEME['accent']}]>>> PROCESS INITIATED:[/] Apply Bare Updates (Reset)\n", idx)
 
+                await asyncio.to_thread(self._write_sync_txn, "applying")
                 rc_reset, _, err_reset = await self._run_raw('reset', '--hard', UPSTREAM_OID)
                 if rc_reset != 0:
                     self._tlog(f"[bold {THEME['error']}]Reset failed: {escape(err_reset)}[/]", idx, True)
                     raise RuntimeError(f"Reset failed (rc={rc_reset}).")
+                await asyncio.to_thread(self._write_sync_txn, "reset-applied")
 
                 rc_ls_unr, ls_unr, _ = await self._run_raw('ls-tree', '-r', '-z', '--name-only', UPSTREAM_OID)
                 tracked_scripts_unr = [f for f in ls_unr.split('\0') if f and f.endswith(('.py', '.sh'))]
@@ -5940,8 +6960,9 @@ class GitEngine:
                     after_head=remote_head,
                     local_mods_restored=restore_ok,
                 )
-                self.app.git_summary = meta
+                self.app.git_summary.update(meta)
                 self.app.update_task_state(idx, "success")  # type: ignore
+                await asyncio.to_thread(self._finish_sync_txn, "completed", restore_ok=restore_ok, unrelated=True)
                 return True
 
             elif mb_rc != 0:
@@ -5959,7 +6980,7 @@ class GitEngine:
 
             self.app.update_task_state(idx, "success")  # type: ignore
             if self.app.run_logger:
-                self.app.run_logger.close_task(self.app.tasks[idx], idx, "completed", 0, 0.0)
+                self.app._safe_close_task_log(self.app.tasks[idx], idx, "completed", 0, 0.0)
 
             # Task 2: Forensic Collision Backup
             idx = 2
@@ -5974,9 +6995,10 @@ class GitEngine:
                 collisions=self._last_collision_count,
                 collision_backup=self._last_collision_dir,
             )
+            await asyncio.to_thread(self._write_sync_txn, "collisions-durable")
             self.app.update_task_state(idx, "success")  # type: ignore
             if self.app.run_logger:
-                self.app.run_logger.close_task(self.app.tasks[idx], idx, "completed", 0, 0.0)
+                self.app._safe_close_task_log(self.app.tasks[idx], idx, "completed", 0, 0.0)
 
             # Task 3: Snapshot
             idx = 3
@@ -5986,11 +7008,10 @@ class GitEngine:
             op3 = self._detect_git_operation_state()
             if op3 != 'none':
                 raise RuntimeError(f"Git {op3} in progress.")
-            if not await self._unstage_managed_paths():
-                raise RuntimeError("Failed to unstage managed paths.")
             change_paths, change_status, change_old_mode, change_old_oid = await self._capture_tracked_changes()
+            captured_signature = self._capture_signature
             if change_paths:
-                your_changes_backup = await self._backup_user_modifications(change_paths, change_status, idx)
+                your_changes_backup = await self._backup_user_modifications(change_paths, change_status, idx, change_old_mode, change_old_oid)
                 if your_changes_backup is None:
                     raise RuntimeError("User modifications backup failed.")
             else:
@@ -5999,21 +7020,35 @@ class GitEngine:
                 local_mods=len(change_paths),
                 local_mods_backup=str(your_changes_backup) if your_changes_backup else "",
             )
+            await asyncio.to_thread(
+                self._write_sync_txn, "snapshot-durable",
+                local_backup=str(your_changes_backup) if your_changes_backup else "",
+                captured_paths=change_paths, captured_status=change_status,
+                captured_old_mode=change_old_mode, captured_old_oid=change_old_oid,
+                captured_staged_paths=sorted(getattr(self, "_actual_staged_paths", set())),
+            )
 
+            fresh_paths, fresh_status, fresh_modes, fresh_oids = await self._capture_tracked_changes()
+            if self._capture_signature != captured_signature or (fresh_paths, fresh_status, fresh_modes, fresh_oids) != (change_paths, change_status, change_old_mode, change_old_oid):
+                raise RuntimeError("Local/index state changed after snapshot; refusing reset. Re-run to recapture.")
+            if not await self._unstage_managed_paths():
+                raise RuntimeError("Failed to unstage managed paths after capture.")
             self.app.update_task_state(idx, "success")  # type: ignore
             if self.app.run_logger:
-                self.app.run_logger.close_task(self.app.tasks[idx], idx, "completed", 0, 0.0)
+                self.app._safe_close_task_log(self.app.tasks[idx], idx, "completed", 0, 0.0)
 
-# Task 4: Apply Reset
+            # Task 4: Apply Reset
             idx = 4
             self.app.update_task_state(idx, "running")  # type: ignore
             self._tlog(f"[bold {THEME['accent']}]>>> PROCESS INITIATED:[/] Apply Bare Updates (Reset)\n", idx)
 
+            await asyncio.to_thread(self._write_sync_txn, "applying")
             rc_reset, _, err_reset = await self._run_raw('reset', '--hard', UPSTREAM_OID)
             if rc_reset != 0:
                 self._tlog(f"[bold {THEME['error']}]Reset failed: {escape(err_reset)}[/]", idx, True)
                 raise RuntimeError(f"Reset failed (rc={rc_reset}).")
 
+            await asyncio.to_thread(self._write_sync_txn, "reset-applied")
             self._tlog(f"[bold {THEME['success']}]Bare Repository reset applied and synchronized.[/]", idx, True)
 
             rc_ls_t4, ls_t4, _ = await self._run_raw('ls-tree', '-r', '-z', '--name-only', UPSTREAM_OID)
@@ -6045,15 +7080,24 @@ class GitEngine:
                 after_head=remote_head,
                 local_mods_restored=restore_ok,
             )
-            self.app.git_summary = meta
+            self.app.git_summary.update(meta)
             self.app.update_task_state(idx, "success")  # type: ignore
             if self.app.run_logger:
-                self.app.run_logger.close_task(self.app.tasks[idx], idx, "completed", 0, 0.0)
+                self.app._safe_close_task_log(self.app.tasks[idx], idx, "completed", 0, 0.0)
+            await asyncio.to_thread(self._finish_sync_txn, "completed", restore_ok=restore_ok)
             return True
 
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                await self._recover_pending_sync_artifacts(0)
+            raise
         except Exception as e:
             err_msg = f"[bold {THEME['error']}][FATAL][/] Git Sync Failure: {escape(str(e))}"
             self.log(err_msg)
+            if hasattr(self.app, "add_warning"):
+                self.app.add_warning("sync", str(e))
+            with suppress(Exception):
+                await self._recover_pending_sync_artifacts(0)
             for i in range(5):
                 st = self.app.tasks[i].status  # type: ignore
                 if st == "running":
@@ -6564,9 +7608,16 @@ if _HAS_UI:
             self.current_pty_master: int | None = None
             self.active_child_pid: int | None = None
             self.active_child_group: bool = False
+            # Shared-group interactive child (same session/process group as
+            # the updater by design): cancellation must signal it by PID,
+            # never via killpg(), which would hit our own group.
+            self._interactive_proc: subprocess.Popen | None = None
+            self._interactive_cancel: threading.Event | None = None
             self._prompt_buffer: str = ""
             self._prompt_counts: dict[str, int] = {}
             self._prompt_last: dict[str, float] = {}
+            self._prompt_retry_task: asyncio.Task | None = None
+            self._prompt_wait_task: asyncio.Task | None = None
             # Buffered async PTY input: single ordered byte-bounded buffer +
             # one writer task preserves order/partial writes without
             # busy-polling or per-keystroke tasks. Explicit bound + overload
@@ -6588,6 +7639,13 @@ if _HAS_UI:
             self.run_logger: RunLogger | None = None
             self.once_store: OnceStore | None = None
             self.missing_scripts: list[str] = []
+            self.run_warnings: list[dict[str, str]] = []
+            self.blocked_scripts: dict[str, str] = {}
+            self.script_gate_outcomes: dict[str, dict[str, str]] = {}
+            for _w in CONFIG_WARNINGS:
+                self.run_warnings.append({"kind": "configuration", "message": _w, "task": "", "path": "", "recovery": ""})
+            for _w in self.profile.diagnostics:
+                self.run_warnings.append({"kind": "profile", "message": _w, "task": "", "path": str(self.profile.filepath), "recovery": ""})
             try:
                 self.sidebar_width: int = max(15, min(80, int(GLOBAL_CONFIG.get("ui", {}).get("sidebar_width", 35))))
             except (TypeError, ValueError):
@@ -6677,11 +7735,25 @@ if _HAS_UI:
             self.progress = self.query_one("#main_progress", ProgressBar)
 
             self.sleep_inhibitor = SleepInhibitor(enabled=True)
-            self.state_store = StateStore(self.profile)
-            self.run_logger = RunLogger(self.profile, self.run_id)
-            self.once_store = OnceStore()
+            try:
+                self.state_store = StateStore(self.profile)
+            except Exception as e:
+                self.state_store = None
+                self.add_warning("persistence", f"StateStore unavailable: {e}")
+            try:
+                self.run_logger = RunLogger(self.profile, self.run_id)
+                self.run_logger.warning_source = self.run_warnings
+                self.run_logger.git_summary_source = self.git_summary
+            except Exception as e:
+                self.run_logger = None
+                self.add_warning("logging", f"RunLogger unavailable: {e}")
+            try:
+                self.once_store = OnceStore()
+            except Exception as e:
+                self.once_store = None
+                self.add_warning("persistence", f"OnceStore unavailable: {e}")
 
-            stored_durations = self.state_store.durations()
+            stored_durations = self.state_store.durations() if self.state_store else {}
             for t in self.tasks:
                 if t.state_key in stored_durations and stored_durations[t.state_key] > 0:
                     t.estimated_duration = stored_durations[t.state_key]
@@ -6707,6 +7779,21 @@ if _HAS_UI:
                     )
                 )
 
+            # This is the candidate health boundary used by the independent
+            # supervisor. Reaching it proves imports/config/profile parsing,
+            # dependency/bootstrap checks, Textual app construction+mount,
+            # storage/log initialization, and UI queries all succeeded. It is
+            # still before Git mutation or any user child task.
+            await asyncio.to_thread(_supervisor_health_checkpoint, self.profile)
+            if not OPT_DRY_RUN:
+                # Retention pruning is destructive housekeeping. Run it only
+                # after the candidate has crossed the independent startup-health
+                # boundary so a broken replacement cannot delete old recovery/log
+                # data before it is known to start successfully.
+                try:
+                    await asyncio.to_thread(auto_prune)
+                except Exception as e:
+                    self.add_warning("logging", f"optional retention pruning failed: {e}")
             self.run_worker(self.execute_pipeline(), exclusive=True, thread=False)
 
         def on_unmount(self) -> None:
@@ -6744,57 +7831,129 @@ if _HAS_UI:
                 pass
             return text
 
+        def add_warning(self, kind: str, message: str, *, task: str = "", path: str = "", recovery: str = "") -> None:
+            rec = {"kind": str(kind), "message": str(message), "task": str(task), "path": str(path), "recovery": str(recovery)}
+            if rec not in self.run_warnings:
+                self.run_warnings.append(rec)
+
+        async def _safe_state_mark(
+            self, task: DuskyTask, status: str, *, exit_code: int | None = None,
+            note: str = "", duration: float = 0.0,
+        ) -> bool:
+            if self.state_store is None or OPT_DRY_RUN:
+                return True
+            try:
+                await asyncio.to_thread(
+                    self.state_store.mark, task, status, exit_code=exit_code,
+                    note=note, duration=duration,
+                )
+                return True
+            except Exception as e:
+                self.add_warning(
+                    "persistence", f"state write failed after task outcome was determined: {e}",
+                    task=task.name,
+                )
+                return False
+
+        async def _safe_once_check(self, task: DuskyTask) -> Literal["run", "skip", "notify_sealed", "error"]:
+            if self.once_store is None:
+                return "error"
+            try:
+                return await asyncio.to_thread(self.once_store.check_marker_status, task, self.profile.name)
+            except Exception as e:
+                self.add_warning(
+                    "persistence", f"once-state read failed; task skipped to avoid an unsafe rerun: {e}",
+                    task=task.name,
+                )
+                return "error"
+
+        async def _safe_once_sealed_notified(self, task: DuskyTask) -> bool:
+            if self.once_store is None or OPT_DRY_RUN:
+                return True
+            try:
+                await asyncio.to_thread(self.once_store.mark_sealed_notified, task, self.profile.name)
+                return True
+            except Exception as e:
+                self.add_warning("persistence", f"once sealed-notification write failed: {e}", task=task.name)
+                return False
+
+        async def _safe_once_mark_success(self, task: DuskyTask, *, exit_code: int) -> bool:
+            if self.once_store is None or OPT_DRY_RUN:
+                return True
+            try:
+                await asyncio.to_thread(
+                    self.once_store.mark_success, task, self.profile.name,
+                    exit_code=exit_code, run_id=getattr(self, "run_id", ""),
+                )
+                return True
+            except Exception as e:
+                # The child already succeeded. Preserve that truth and retain a
+                # warning; a persistence failure must never rewrite execution
+                # history as a child-process failure.
+                self.add_warning("persistence", f"once-state success write failed: {e}", task=task.name)
+                return False
+
+        def _safe_close_task_log(self, task: DuskyTask, index: int, status: str, exit_code: int, duration: float) -> None:
+            if self.run_logger is None:
+                return
+            try:
+                self.run_logger.close_task(task, index, status, exit_code, duration)
+            except Exception as e:
+                self.add_warning("logging", f"task log finalization failed: {e}", task=task.name)
+
+        def _append_log_line(self, key: int | str, line: str) -> None:
+            max_lines = int(GLOBAL_CONFIG["ui"]["max_log_lines"])
+            max_bytes = int(GLOBAL_CONFIG["execution"]["log_max_bytes"])
+            max_line_bytes = int(GLOBAL_CONFIG["execution"]["log_max_line_bytes"])
+            encoded = line.encode("utf-8", errors="replace")
+            if len(encoded) > max_line_bytes:
+                encoded = encoded[:max_line_bytes]
+                line = encoded.decode("utf-8", errors="ignore") + " …[truncated]"
+            dq = self._log_lines.setdefault(key, deque())
+            self._log_bytes = getattr(self, "_log_bytes", {})
+            while len(dq) >= max_lines and dq:
+                old = dq.popleft()
+                self._log_bytes[key] = max(0, self._log_bytes.get(key, 0) - len(old.encode("utf-8", errors="replace")))
+            dq.append(line)
+            self._log_bytes[key] = self._log_bytes.get(key, 0) + len(line.encode("utf-8", errors="replace"))
+            while self._log_bytes.get(key, 0) > max_bytes and len(dq) > 1:
+                old = dq.popleft()
+                self._log_bytes[key] = max(0, self._log_bytes[key] - len(old.encode("utf-8", errors="replace")))
+
         def log_main(self, message: Any) -> None:
             with suppress(Exception):
                 self.query_one("#log-main", RichLog).write(message)
             plain = self._canonical_plain(message)
-            max_lines = GLOBAL_CONFIG.get("ui", {}).get("max_log_lines", 6000)
-            max_bytes = max_lines * 512
-            if "main" not in self._log_lines:
-                self._log_lines["main"] = deque(maxlen=max_lines)
-                self._log_bytes = getattr(self, "_log_bytes", {})
-                self._log_bytes["main"] = 0
             for line in plain.splitlines() or [""]:
-                # Bound backlog by lines (deque maxlen) and bytes: drop oldest
-                # first so multiline diff objects cannot grow unbounded.
-                self._log_lines["main"].append(line)
-                self._log_bytes["main"] = self._log_bytes.get("main", 0) + len(line)
-                while self._log_bytes.get("main", 0) > max_bytes and len(self._log_lines["main"]) > 1:
-                    dropped = self._log_lines["main"].popleft()
-                    self._log_bytes["main"] -= len(dropped)
-
+                self._append_log_line("main", line)
             if self.run_logger and self.run_logger.enabled:
-                for line in plain.splitlines():
-                    if line.strip():
-                        self.run_logger.system(line)
-
-            if LOG_FILE and GLOBAL_CONFIG.get("logging", {}).get("enabled", True):
+                try:
+                    for line in plain.splitlines():
+                        if line.strip():
+                            self.run_logger.system(line)
+                except OSError as e:
+                    self.add_warning("logging", f"main run log write failed: {e}")
+                    self.run_logger.enabled = False
+            if LOG_FILE and GLOBAL_CONFIG["logging"]["enabled"]:
                 timestamp = datetime.now().strftime("%H:%M:%S")
-                with suppress(OSError):
+                try:
                     with open(LOG_FILE, "a", encoding="utf-8") as f:
                         for line in plain.splitlines():
                             f.write(f"[{timestamp}] [MAIN   ] {line}\n")
+                except OSError as e:
+                    self.add_warning("logging", f"legacy log write failed: {e}", path=str(LOG_FILE))
 
         def log_task(self, message: Any, index: int) -> None:
             with suppress(Exception):
                 self.query_one(f"#log-task-{index}", RichLog).write(message)
             plain = self._canonical_plain(message)
-            max_lines = GLOBAL_CONFIG.get("ui", {}).get("max_log_lines", 6000)
-            max_bytes = max_lines * 512
-            self._log_bytes = getattr(self, "_log_bytes", {})
-            if index not in self._log_lines:
-                self._log_lines[index] = deque(maxlen=max_lines)
-                self._log_bytes[index] = 0
             for line in plain.splitlines() or [""]:
-                self._log_lines[index].append(line)
-                self._log_bytes[index] = self._log_bytes.get(index, 0) + len(line)
-                while self._log_bytes.get(index, 0) > max_bytes and len(self._log_lines[index]) > 1:
-                    dropped = self._log_lines[index].popleft()
-                    self._log_bytes[index] -= len(dropped)
-
+                self._append_log_line(index, line)
             if self.run_logger and self.run_logger.enabled and 0 <= index < len(self.tasks):
-                task = self.tasks[index]
-                self.run_logger.write_task(task, index, plain)
+                try:
+                    self.run_logger.write_task(self.tasks[index], index, plain)
+                except OSError as e:
+                    self.add_warning("logging", f"task log write failed: {e}", task=self.tasks[index].name)
 
         def _restore_handoff(self, handoff: Path | None) -> bool:
             # Single-use bound handoff from the pre-restart process. Applies
@@ -6808,16 +7967,21 @@ if _HAS_UI:
             if payload is None:
                 return False
             self.git_summary.update(payload["git_summary"])
+            for warning in payload.get("warnings", []):
+                if isinstance(warning, dict):
+                    rec = {k: str(warning.get(k, "")) for k in ("kind", "message", "task", "path", "recovery")}
+                    if rec not in self.run_warnings:
+                        self.run_warnings.append(rec)
+            os.environ["DUSKY_RESTART_GENERATION"] = str(payload.get("restart_generation", 0))
             outcome_to_close = {"success": "completed", "skipped": "skipped", "failed": "failed"}
             outcome_to_code = {"success": 0, "skipped": 0, "failed": 1}
             for i, saved in enumerate(payload["git_tasks"]):
                 status = saved.get("status", "skipped")
                 code = saved.get("exit_code", outcome_to_code.get(status, 1))
                 self.update_task_state(i, status)
-                if self.run_logger:
-                    self.run_logger.close_task(
-                        self.tasks[i], i, outcome_to_close.get(status, "skipped"), code, 0.0
-                    )
+                self._safe_close_task_log(
+                    self.tasks[i], i, outcome_to_close.get(status, "skipped"), code, 0.0
+                )
             summary = payload["git_summary"]
             diff = summary.get("diff") or ""
             commits = summary.get("commits", "?")
@@ -6896,6 +8060,10 @@ if _HAS_UI:
 
         def update_task_state(self, index: int, new_status: str) -> None:
             task = self.tasks[index]
+            if task.mode == "GIT":
+                task.outcome = "completed" if new_status == "success" else new_status
+                if new_status in ("success", "skipped", "failed"):
+                    task.exit_code = 1 if new_status == "failed" else 0
             old_status = task.status
             terminal = ("success", "failed", "skipped")
             # Idempotent progress: repeated terminal transitions advance once.
@@ -7076,82 +8244,135 @@ if _HAS_UI:
                 except Exception:
                     break
 
-        def _maybe_respond_prompt(self, text: str) -> None:
-            if not hasattr(self, 'current_pty_master') or self.current_pty_master is None:
+        async def _retry_prompt_after(self, delay: float) -> None:
+            try:
+                await asyncio.sleep(max(0.0, delay))
+                # Allow processing to schedule the next cooldown immediately.
+                self._prompt_retry_task = None
+                self._maybe_respond_prompt("")
+            except asyncio.CancelledError:
+                raise
+            finally:
+                if self._prompt_retry_task is asyncio.current_task():
+                    self._prompt_retry_task = None
+
+        def _schedule_prompt_retry(self, delay: float) -> None:
+            task = self._prompt_retry_task
+            if task is None or task.done():
+                self._prompt_retry_task = asyncio.create_task(self._retry_prompt_after(delay))
+
+        async def _prompt_wait_notice(self, delay: float, snapshot: str, task_index: int) -> None:
+            try:
+                await asyncio.sleep(max(1.0, delay))
+                if self.current_pty_master is None:
+                    return
+                tail = self._prompt_buffer.strip()
+                if not tail or not tail.endswith(snapshot):
+                    return
+                task_name = self.tasks[task_index].name if 0 <= task_index < len(self.tasks) else ""
+                task_timeout = (
+                    self.tasks[task_index].timeout
+                    if 0 <= task_index < len(self.tasks) else None
+                )
+                self.add_warning(
+                    "prompt",
+                    f"interactive prompt remained unresolved for {delay:.0f}s; "
+                    f"task execution remains bounded by {task_timeout:.0f}s"
+                    if task_timeout else
+                    f"interactive prompt remained unresolved for {delay:.0f}s",
+                    task=task_name,
+                )
+                self.log_main(
+                    f"[bold {THEME['warning']}][WARN][/] Unresolved prompt still waiting after {delay:.0f}s; "
+                    "manual input may be required. The task-level timeout remains in force."
+                )
+            except asyncio.CancelledError:
+                raise
+            finally:
+                self._prompt_wait_task = None
+
+        def _cancel_prompt_wait_notice(self) -> None:
+            task = self._prompt_wait_task
+            if task is not None and not task.done():
+                task.cancel()
+            self._prompt_wait_task = None
+
+        def _schedule_prompt_wait_notice(self, tail: str) -> None:
+            task = self._prompt_wait_task
+            if task is not None and not task.done():
                 return
+            delay = float(GLOBAL_CONFIG["execution"]["prompt_wait_timeout"])
+            snapshot = tail[-300:]
+            idx = int(getattr(self, "_prompt_task_index", 0) or 0)
+            self._prompt_wait_task = asyncio.create_task(
+                self._prompt_wait_notice(delay, snapshot, idx)
+            )
 
-            self._prompt_buffer = (getattr(self, "_prompt_buffer", "") + text)[-4096:]
-            tail = ANSI_STRIP_REGEX.sub("", self._prompt_buffer)
-
-            if not hasattr(self, '_prompt_counts'):
-                self._prompt_counts = {}
-                self._prompt_last = {}
-
-            for name, pattern, kind in PROMPT_RULES:
-                m = pattern.search(tail)
-                if not m:
-                    continue
-
+        def _maybe_respond_prompt(self, text: str) -> None:
+            if self.current_pty_master is None:
+                return
+            # Keep the prompt buffer ANSI-free so regex match offsets map
+            # exactly to the consumed buffer. This avoids accidentally
+            # discarding part of a following prompt when escape sequences
+            # precede a match.
+            clean_text = ANSI_STRIP_REGEX.sub("", text)
+            self._prompt_buffer = (self._prompt_buffer + clean_text)[-8192:]
+            cooldown = float(GLOBAL_CONFIG["prompts"]["cooldown"])
+            for _ in range(8):
+                tail = self._prompt_buffer
+                chosen = None
+                for name, pattern, kind in PROMPT_RULES:
+                    m = pattern.search(tail)
+                    if m is not None:
+                        chosen = (name, m, kind)
+                        break
+                if chosen is None:
+                    break
+                name, m, kind = chosen
                 count = self._prompt_counts.get(name, 0)
                 max_count = 5 if name == "sudo_password" else 500
                 if count >= max_count:
+                    # Consume this already-exhausted prompt so it cannot starve
+                    # later prompts in the same read.
+                    self._prompt_buffer = self._prompt_buffer[min(len(self._prompt_buffer), m.end()):]
                     continue
-
                 now = time.monotonic()
-                last = self._prompt_last.get(name, 0.0)
-                cooldown = GLOBAL_CONFIG.get("prompts", {}).get("cooldown", 0.35)
-                if now - last < cooldown:
-                    continue
-
-                # Show the matched prompt without requiring a newline: the
-                # line buffer hides short prompts until completion, so surface
-                # the matched line here. Never log secrets.
-                matched_line = tail[m.start():].splitlines()
-                shown = matched_line[0][-200:] if matched_line and matched_line[0].strip() else f"[{name}]"
+                remaining = cooldown - (now - self._prompt_last.get(name, 0.0))
+                if remaining > 0:
+                    self._schedule_prompt_retry(remaining)
+                    break
+                matched = tail[m.start():m.end()].strip().splitlines()
+                shown = (matched[-1] if matched else f"[{name}]")[-200:]
+                response: bytes | None = None
                 if kind == "password":
-                    _prompts_cfg = GLOBAL_CONFIG.get("prompts", {})
-                    if not isinstance(_prompts_cfg, dict):
-                        _prompts_cfg = {}
-                    allow_autofeed = _prompts_cfg.get("allow_insecure_password_autofeed", False)
-
-                    if allow_autofeed and SudoEngine._password:
-                        self.log_task(f"[dim]Auto-answered password prompt (autofeed enabled)[/dim]", getattr(self, '_prompt_task_index', 0))
+                    allow = bool(GLOBAL_CONFIG["prompts"]["allow_insecure_password_autofeed"])
+                    if allow and SudoEngine._password:
                         response = SudoEngine._password.encode("utf-8") + b"\r"
+                        self.log_task("[dim]Auto-answered password prompt (autofeed enabled)[/dim]", getattr(self, '_prompt_task_index', 0))
                     else:
-                        if allow_autofeed:
-                            self.log_main("[FATAL] Password prompt detected (autofeed enabled), but no cached password is available.")
-                        else:
-                            self.log_main(f"[WARN] Password prompt ignored. To enable auto-feeding, set allow_insecure_password_autofeed = true in [prompts].")
-                        self._prompt_counts[name] = count + 1
-                        self._prompt_last[name] = now
-                        self._prompt_buffer = ""
-                        break
+                        self.add_warning("prompt", "password prompt could not be auto-answered", task=getattr(self.tasks[getattr(self, '_prompt_task_index', 0)], 'name', ''))
                 elif kind == "yes":
-                    self.log_task(f"[dim]Auto-answered prompt [{escape(name)}]: {escape(shown)}[/]", getattr(self, '_prompt_task_index', 0))
                     response = b"y\r"
-                else:
-                    response = b"\r"
-
-                # Buffered async write: ordered, no busy-spin, no drops.
-                self._queue_pty_write(response)
-
+                elif kind == "no":
+                    response = b"n\r"
+                if response is not None:
+                    self._cancel_prompt_wait_notice()
+                    self.log_task(f"[dim]Auto-answered prompt [{escape(name)}]: {escape(shown)}[/]", getattr(self, '_prompt_task_index', 0))
+                    self._queue_pty_write(response)
                 self._prompt_counts[name] = count + 1
                 self._prompt_last[name] = now
-                self._prompt_buffer = ""
-                break
+                # Consume only the matched prompt; preserve any following prompt
+                # already received in the same PTY read.
+                self._prompt_buffer = self._prompt_buffer[min(len(self._prompt_buffer), m.end()):]
+
+            tail = self._prompt_buffer.strip()
+            if tail and tail[-1:] in ("?", ":", "$", "#", ">", "]"):
+                last_line = tail.splitlines()[-1][-300:]
+                redacted = re.sub(r"(?i)(password|passwd|passphrase|secret|token)[^\n]*", r"\1: [redacted]", last_line)
+                self.log_main(f"[WARN] Unresolved interactive prompt (no auto-answer rule yet): {redacted[-200:]}")
+                self._schedule_prompt_wait_notice(tail)
             else:
-                # No rule matched. Log unresolved prompts clearly for diagnostics
-                # without ever exposing secrets: redact password-like content and
-                # truncate. Only log when the tail resembles an interactive prompt.
-                try:
-                    stripped = tail.strip()
-                    if stripped and stripped[-1] in ("?", ":", "$", "#", ">", "]"):
-                        last_line = stripped.splitlines()[-1] if stripped.splitlines() else stripped
-                        if len(last_line) <= 300:
-                            redacted = re.sub(r"(?i)(password|passwd|passphrase|secret|token)[^\n]*", r"\1: [redacted]", last_line)
-                            self.log_main(f"[WARN] Unresolved interactive prompt (no auto-answer rule): {redacted[-200:]}")
-                except Exception:
-                    pass
+                self._cancel_prompt_wait_notice()
 
         @staticmethod
         def _set_pty_size(fd: int) -> None:
@@ -7181,8 +8402,6 @@ if _HAS_UI:
             self._prompt_buffer = ""
             self._prompt_counts = {}
             self._prompt_last = {}
-            os.set_blocking(master_fd, False)
-            self._set_pty_size(slave_fd)
             # Buffered input + single writer task: ordered byte-bounded FIFO,
             # one task per PTY (no per-keystroke tasks). Prevent prior-command
             # input leaking into the next command by resetting the buffer.
@@ -7193,9 +8412,9 @@ if _HAS_UI:
                 self._pty_write_event = asyncio.Event()
                 self._pty_write_queue = None  # legacy, unused
                 self._pty_write_fd = master_fd
-                self._pty_writer_task = asyncio.create_task(
-                    self._pty_writer_loop(master_fd)
-                )
+                # Writer starts only after the child has spawned successfully;
+                # this prevents leaked writer tasks on spawn/setup failure.
+                self._pty_writer_task = None
             except RuntimeError:
                 self._pty_write_pending = deque()
                 self._pty_write_bytes = 0
@@ -7264,6 +8483,11 @@ if _HAS_UI:
                 self._pty_write_queue = None
                 self._pty_writer_task = None
                 self._pty_write_fd = None
+                retry_task = getattr(self, "_prompt_retry_task", None)
+                if retry_task is not None and not retry_task.done():
+                    retry_task.cancel()
+                self._prompt_retry_task = None
+                self._cancel_prompt_wait_notice()
                 if transport is not None:
                     with suppress(Exception):
                         transport.close()
@@ -7286,29 +8510,29 @@ if _HAS_UI:
                 return code == 0, code
 
             try:
+                os.set_blocking(master_fd, False)
+                self._set_pty_size(slave_fd)
+                spawn_cmd = cmd
+                spawn_kwargs: dict[str, Any] = {"cwd": str(WORK_TREE)}
+                setsid_bin = shutil.which("setsid")
+                if setsid_bin:
+                    # util-linux setsid --ctty makes the PTY slave (stdin) the
+                    # controlling terminal without unsafe preexec_fn hooks.
+                    spawn_cmd = [setsid_bin, "--ctty", "--wait", "--", *cmd]
+                else:
+                    spawn_kwargs["start_new_session"] = True
+                    self.add_warning("pty", "setsid --ctty unavailable; /dev/tty access is unsupported for inline PTY tasks")
                 proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdin=slave_fd,
-                    stdout=slave_fd,
-                    stderr=slave_fd,
-                    close_fds=True,
-                    start_new_session=True,
-                    cwd=str(WORK_TREE)
+                    *spawn_cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                    close_fds=True, **spawn_kwargs
                 )
+                self._pty_writer_task = asyncio.create_task(self._pty_writer_loop(master_fd))
             except asyncio.CancelledError:
-                with suppress(OSError):
-                    os.close(master_fd)
-                with suppress(OSError):
-                    os.close(slave_fd)
-                self.current_pty_master = None
+                await _shutdown(None)
                 raise
             except Exception as e:
                 self.log_main(f"[FATAL] PTY spawn failed: {e}")
-                with suppress(OSError):
-                    os.close(master_fd)
-                with suppress(OSError):
-                    os.close(slave_fd)
-                self.current_pty_master = None
+                await _shutdown(None)
                 return False, None
 
             with suppress(OSError):
@@ -7321,14 +8545,30 @@ if _HAS_UI:
             try:
                 loop = asyncio.get_running_loop()
                 reader = asyncio.StreamReader(limit=1024 * 1024)
-                protocol = asyncio.StreamReaderProtocol(reader)
+                pty_writer = self._pty_writer_task
+
+                def terminal_closed() -> None:
+                    if self._pty_writer_task is not pty_writer:
+                        return  # Delayed close callback from a previous task.
+                    self.current_pty_master = None
+                    writer = self._pty_writer_task
+                    if writer is not None and not writer.done():
+                        writer.cancel()
+                    retry = getattr(self, "_prompt_retry_task", None)
+                    if retry is not None and not retry.done():
+                        retry.cancel()
+                    self._cancel_prompt_wait_notice()
+                    self._pty_write_pending.clear()
+                    self._pty_write_bytes = 0
+
+                protocol = _PTYStreamReaderProtocol(reader, terminal_closed)
 
                 file_obj = os.fdopen(master_fd, "rb", buffering=0)
                 master_fd = -1
 
                 transport, _ = await loop.connect_read_pipe(lambda: protocol, file_obj)
 
-                async def read_loop() -> None:
+                async def consume_output() -> None:
                     nonlocal line_buffer
 
                     while True:
@@ -7336,7 +8576,13 @@ if _HAS_UI:
                             chunk = await reader.read(4096)
                         except asyncio.CancelledError:
                             raise
-                        except Exception:
+                        except OSError as e:
+                            # Linux PTY masters report EIO when the last slave
+                            # closes. This is EOF, not the child's exit status.
+                            # In particular, never kill a successful child just
+                            # because its terminal closed before wait() completed.
+                            if e.errno != errno.EIO:
+                                raise
                             chunk = b""
 
                         if not chunk:
@@ -7400,6 +8646,20 @@ if _HAS_UI:
 
                                 self.log_task(Text.from_ansi(line), task_index)
 
+                async def read_loop() -> None:
+                    try:
+                        await consume_output()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        self.add_warning("pty", f"output reader failed: {e}", task=self.tasks[task_index].name)
+                        # Also cover decoding/rendering/prompt errors: never
+                        # leave a child blocked behind an abandoned reader.
+                        # Keep cleanup owned and awaited, not a detached task
+                        # that could later signal a reused process group.
+                        await _terminate_process_group(proc)
+                        raise
+
                 read_task = asyncio.create_task(read_loop())
 
                 try:
@@ -7451,7 +8711,163 @@ if _HAS_UI:
                 self.log_main("[WARN] UI suspend unavailable; running interactive task inline.")
                 yield
 
-        async def _execute_task(self, index: int) -> str:
+        @staticmethod
+        def _interactive_tree_pids(root_pid: int) -> list[int]:
+            """Return root PID plus all live descendant PIDs (BFS over /proc).
+
+            Pure snapshot, no signaling. Used instead of process-group
+            signaling because the interactive child intentionally shares the
+            updater's session/process group, where killpg() is unsafe.
+            """
+            try:
+                children: dict[int, list[int]] = {}
+                for entry in os.listdir("/proc"):
+                    if not entry.isdigit():
+                        continue
+                    pid = int(entry)
+                    try:
+                        with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as f:
+                            ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+                    except (OSError, ValueError, IndexError):
+                        continue
+                    children.setdefault(ppid, []).append(pid)
+                seen = {root_pid}
+                order = [root_pid]
+                queue = [root_pid]
+                while queue:
+                    current = queue.pop(0)
+                    for child in children.get(current, []):
+                        if child not in seen:
+                            seen.add(child)
+                            order.append(child)
+                            queue.append(child)
+                return order
+            except Exception:
+                return [root_pid]
+
+        @staticmethod
+        def _interactive_proc_start(pid: int) -> str:
+            """Process start time (stat field 22) or '' when unreadable."""
+            try:
+                with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as f:
+                    return f.read().rsplit(")", 1)[1].split()[19]
+            except (OSError, ValueError, IndexError):
+                return ""
+
+        @staticmethod
+        def _interactive_proc_state(pid: int) -> str:
+            """Single-letter process state or '' when unreadable."""
+            try:
+                with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as f:
+                    return f.read().rsplit(")", 1)[1].split()[0]
+            except (OSError, ValueError, IndexError):
+                return ""
+
+        @classmethod
+        def _interactive_terminate_tree(cls, root_pid: int) -> None:
+            """TERM, then KILL, a PID tree by identity; never killpg().
+
+            Each PID is verified against its recorded start time before every
+            signal so recycled PIDs are never touched. Zombie (Z) entries are
+            treated as terminated. Best-effort: all errors suppressed.
+            """
+            try:
+                members = {pid: cls._interactive_proc_start(pid) for pid in cls._interactive_tree_pids(root_pid)}
+            except Exception:
+                return
+
+            def _signal_all(sig: int) -> None:
+                for pid, start in members.items():
+                    if not start:
+                        continue
+                    try:
+                        if cls._interactive_proc_start(pid) != start:
+                            continue
+                        os.kill(pid, sig)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        pass
+
+            def _all_gone() -> bool:
+                for pid, start in members.items():
+                    if not start:
+                        continue
+                    try:
+                        current = cls._interactive_proc_start(pid)
+                    except Exception:
+                        continue
+                    if current and current == start and cls._interactive_proc_state(pid) != "Z":
+                        return False
+                return True
+
+            _signal_all(signal.SIGTERM)
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if _all_gone():
+                    break
+                time.sleep(0.1)
+            if not _all_gone():
+                _signal_all(signal.SIGKILL)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if _all_gone():
+                        break
+                    time.sleep(0.1)
+
+        @classmethod
+        def _interactive_wait_worker(
+            cls,
+            proc: subprocess.Popen,
+            timeout_s: float | None,
+            cancel_event: threading.Event,
+        ) -> tuple[int | None, str]:
+            """Blocking wait in a helper thread; the asyncio loop stays live.
+
+            Returns (rc, disposition) with disposition "done", "timeout", or
+            "cancelled". Timeout/cancellation terminate the PID tree (never
+            killpg) and reap the direct child before returning.
+            """
+            deadline = time.monotonic() + timeout_s if timeout_s and timeout_s > 0 else None
+            while True:
+                try:
+                    return proc.wait(timeout=0.2), "done"
+                except subprocess.TimeoutExpired:
+                    pass
+                except Exception:
+                    return (proc.returncode if proc.returncode is not None else 1), "done"
+                if cancel_event.is_set():
+                    with suppress(Exception):
+                        cls._interactive_terminate_tree(proc.pid)
+                    with suppress(Exception):
+                        proc.wait(timeout=5.0)
+                    return None, "cancelled"
+                if deadline is not None and time.monotonic() >= deadline:
+                    with suppress(Exception):
+                        cls._interactive_terminate_tree(proc.pid)
+                    with suppress(Exception):
+                        proc.wait(timeout=5.0)
+                    return 124, "timeout"
+
+        def _request_interactive_cancel(self) -> None:
+            """Signal a shared-group interactive child by PID (never killpg).
+
+            Sets the worker's cancel event and best-effort TERMs the direct
+            child; the helper thread performs tree cleanup and reaping.
+            """
+            try:
+                event = getattr(self, "_interactive_cancel", None)
+                if event is not None:
+                    event.set()
+            except Exception:
+                pass
+            try:
+                proc = getattr(self, "_interactive_proc", None)
+                if proc is not None and proc.poll() is None:
+                    with suppress(ProcessLookupError, PermissionError, OSError):
+                        os.kill(proc.pid, signal.SIGTERM)
+            except Exception:
+                pass
+
+        async def _execute_task_inner(self, index: int) -> str:
             task = self.tasks[index]
 
             if task.condition:
@@ -7462,28 +8878,30 @@ if _HAS_UI:
                     task.reason = f"condition false: {task.condition}"
                     return "deferred"
 
-            if task.once and self.once_store:
-                once_status = await asyncio.to_thread(self.once_store.check_marker_status, task, self.profile.name)
+            if task.once:
+                once_status = await self._safe_once_check(task)
+                if once_status == "error":
+                    self.add_warning("persistence", "once-state unavailable; once task skipped to avoid unsafe rerun", task=task.name)
+                    await self._finalize_task(index, "skipped", "once-state unavailable", 1)
+                    return "skipped"
                 if once_status == "notify_sealed":
                     msg = f"[bold {THEME['warning']}][WARN][/] Run-once:sealed script modified since last run; not re-run: {escape(task.name)}"
                     self.log_main(msg)
                     self.log_task(msg, index)
                     desktop_notify("Dusky Update", f"Sealed script modified: {task.name}", urgency="normal")
                     if not OPT_DRY_RUN:
-                        await asyncio.to_thread(self.once_store.mark_sealed_notified, task, self.profile.name)
+                        await self._safe_once_sealed_notified(task)
                     self.update_task_state(index, "skipped")
                     task.outcome = "skipped"
                     task.reason = "once:sealed modified since last run"
-                    if self.state_store and not OPT_DRY_RUN:
-                        await asyncio.to_thread(self.state_store.mark, task, "skipped", note="Run-once:sealed modified")
+                    await self._safe_state_mark(task, "skipped", note="Run-once:sealed modified")
                     return "skipped"
                 elif once_status == "skip":
                     self.log_main(f"[dim]Run-once marker valid. Skipping: {escape(task.name)}[/dim]")
                     self.update_task_state(index, "skipped")
                     task.outcome = "skipped"
                     task.reason = "once marker valid"
-                    if self.state_store and not OPT_DRY_RUN:
-                        await asyncio.to_thread(self.state_store.mark, task, "skipped", note="Run-once marker valid")
+                    await self._safe_state_mark(task, "skipped", note="Run-once marker valid")
                     return "skipped"
 
             self.update_task_state(index, "running")
@@ -7498,10 +8916,8 @@ if _HAS_UI:
                 self.log_main(err)
                 self.log_task(err, index)
                 self.update_task_state(index, "skipped")
-                if self.state_store and not OPT_DRY_RUN:
-                    await asyncio.to_thread(self.state_store.mark, task, "skipped", note="Script missing or unresolvable")
-                if self.run_logger:
-                    self.run_logger.close_task(task, index, "skipped", 1, 0.0)
+                await self._safe_state_mark(task, "skipped", note="Script missing or unresolvable")
+                self._safe_close_task_log(task, index, "skipped", 1, 0.0)
                 task.outcome = "skipped"
                 task.reason = "script missing or unresolvable"
                 task.exit_code = 1
@@ -7509,6 +8925,31 @@ if _HAS_UI:
                 return "skipped"
 
             resolved_path = task.resolved_path
+            try:
+                rel_resolved = str(resolved_path.relative_to(WORK_TREE))
+            except ValueError:
+                rel_resolved = str(resolved_path)
+            if GLOBAL_CONFIG["execution"]["validate_subscript_syntax"] and rel_resolved in self.blocked_scripts:
+                reason = self.blocked_scripts[rel_resolved]
+                self.add_warning("blocked-script", reason, task=task.name, path=rel_resolved)
+                await self._finalize_task(index, "skipped", f"blocked script: {reason}", 1)
+                return "skipped"
+            if task.mode == 'S' and not self.has_sudo:
+                reason = "sudo credentials unavailable; privileged task skipped"
+                self.add_warning("sudo", reason, task=task.name)
+                await self._finalize_task(index, "skipped", reason, 1)
+                return "skipped"
+            if task.timeout is None or not math.isfinite(float(task.timeout)) or float(task.timeout) <= 0:
+                if task.timeout is not None:
+                    self.add_warning(
+                        "configuration", "non-positive/non-finite task timeout replaced with bounded default",
+                        task=task.name,
+                    )
+                task.timeout = float(
+                    GLOBAL_CONFIG["execution"][
+                        "interactive_task_timeout" if task.interactive else "default_task_timeout"
+                    ]
+                )
 
             interpreter = task.interpreter or []
             exec_cmd = interpreter + [str(resolved_path)] + task.args
@@ -7529,19 +8970,14 @@ if _HAS_UI:
                     self.log_main(f"[dim]Suspending UI abstraction... Passing raw terminal control...[/]")
                     self.log_task(f"[dim]Interactive flag detected. Console control delegated to user.[/]", index)
 
-                    # Foreground-terminal execution with explicit cancellable
-                    # process ownership under public App.suspend(). Uses
-                    # process_group=0 (new pgid, SAME session) so the child
-                    # retains the controlling terminal (/dev/tty works);
-                    # start_new_session would detach into a new session with
-                    # no controlling terminal (ENXIO). Foreground ownership
-                    # via tcsetpgrp gives the child terminal control with
-                    # signal delivery (Ctrl+C reaches child), restored
-                    # afterwards. Cancellation terminates the owned group,
-                    # timeout kills the group (descendants included) and maps
-                    # to 124, actual attempts recorded, descendants always
-                    # reaped (even on success) with strict ownership (no
-                    # recycled-pgid signaling).
+                    # Ordinary synchronous POSIX terminal inheritance under
+                    # public App.suspend(): the child keeps stdin/stdout/stderr
+                    # and the updater's existing session/process group
+                    # unchanged (no new group, no stop-before-exec barrier, no
+                    # foreground juggling). Only the blocking wait runs off the
+                    # asyncio thread so heartbeat/timeout/cancellation stay
+                    # live. Cleanup signals by PID/tree identity, never killpg,
+                    # because the group is shared with the updater itself.
                     max_attempts = (task.retry + 1) if task.retry > 0 else 1
                     rc = 1
                     task.attempts = 0
@@ -7550,106 +8986,60 @@ if _HAS_UI:
                             break
                         task.attempts = attempt
                         with self._suspend_ui():
-                            proc: asyncio.subprocess.Process | None = None
+                            proc: subprocess.Popen | None = None
+                            cancel_event = threading.Event()
                             try:
-                                proc = await asyncio.create_subprocess_exec(
-                                    *exec_cmd,
+                                proc = subprocess.Popen(
+                                    exec_cmd,
                                     cwd=str(WORK_TREE),
-                                    process_group=0,
+                                    stdin=None,
+                                    stdout=None,
+                                    stderr=None,
+                                    close_fds=True,
+                                    restore_signals=True,
+                                    start_new_session=False,
                                 )
                             except OSError as e:
                                 self.log_task(f"[bold {THEME['error']}]Interactive spawn failed: {escape(str(e))}[/]", index)
                                 rc = 1
                                 break
                             self.active_child_pid = proc.pid
-                            self.active_child_group = True
-                            # Foreground terminal ownership for this attempt.
-                            tty_fd: int | None = None
-                            parent_pgid: int | None = None
-                            orig_fg: int | None = None
-                            old_ttou = None
-                            old_ttin = None
-                            child_pgid = proc.pid
+                            self.active_child_group = False
+                            self._interactive_proc = proc
+                            self._interactive_cancel = cancel_event
                             try:
+                                timeout_s = float(task.timeout) if task.timeout else None
+                                worker_task = asyncio.create_task(
+                                    asyncio.to_thread(
+                                        self._interactive_wait_worker,
+                                        proc,
+                                        timeout_s,
+                                        cancel_event,
+                                    ),
+                                    name=f"interactive-wait-{proc.pid}",
+                                )
                                 try:
-                                    parent_pgid = os.getpgrp()
-                                except OSError:
-                                    parent_pgid = None
-                            except Exception:
-                                parent_pgid = None
-                            try:
-                                tty_fd = os.open("/dev/tty", os.O_RDWR)
-                            except OSError:
-                                tty_fd = None
-                            if tty_fd is not None:
-                                try:
-                                    orig_fg = os.tcgetpgrp(tty_fd)
-                                except OSError:
-                                    orig_fg = None
-                                # Ignore job-control stop signals while we
-                                # manipulate foreground (avoid self-stop).
-                                try:
-                                    old_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
-                                except (OSError, ValueError):
-                                    old_ttou = None
-                                try:
-                                    old_ttin = signal.signal(signal.SIGTTIN, signal.SIG_IGN)
-                                except (OSError, ValueError):
-                                    old_ttin = None
-                                with suppress(OSError):
-                                    os.tcsetpgrp(tty_fd, child_pgid)
-                            try:
-                                timeout = task.timeout if task.timeout else None
-                                rc = await wait_for_process(proc, timeout=timeout)
-                            except (TimeoutError, asyncio.TimeoutError):
-                                with suppress(Exception):
-                                    await _terminate_process_group(proc)
-                                rc = 124
-                                self.log_task(f"[bold {THEME['warning']}]Interactive task timed out.[/]", index)
+                                    rc, disposition = await asyncio.shield(worker_task)
+                                except asyncio.CancelledError:
+                                    cancel_event.set()
+                                    with suppress(Exception):
+                                        rc, disposition = await worker_task
+                                    raise
+                                if disposition == "cancelled":
+                                    raise asyncio.CancelledError
+                                if disposition == "timeout":
+                                    rc = 124
+                                    self.log_task(f"[bold {THEME['warning']}]Interactive task timed out.[/]", index)
                             except asyncio.CancelledError:
-                                with suppress(Exception):
-                                    await _terminate_process_group(proc)
                                 raise
                             except Exception as e:
-                                with suppress(Exception):
-                                    await _terminate_process_group(proc)
                                 self.log_task(f"[bold {THEME['error']}]Interactive execution failed: {escape(str(e))}[/]", index)
                                 rc = 1
                             finally:
-                                # Restore foreground to parent/orig before
-                                # descendant cleanup so signals route sanely.
-                                if tty_fd is not None:
-                                    try:
-                                        restore_to = orig_fg if orig_fg is not None else parent_pgid
-                                        if restore_to is not None:
-                                            with suppress(OSError):
-                                                os.tcsetpgrp(tty_fd, restore_to)
-                                    except Exception:
-                                        pass
-                                    # Restore signal handlers.
-                                    try:
-                                        if old_ttou is not None:
-                                            signal.signal(signal.SIGTTOU, old_ttou)
-                                    except (OSError, ValueError):
-                                        pass
-                                    try:
-                                        if old_ttin is not None:
-                                            signal.signal(signal.SIGTTIN, old_ttin)
-                                    except (OSError, ValueError):
-                                        pass
-                                    with suppress(OSError):
-                                        os.close(tty_fd)
-                                # Always ensure descendants are gone, even on
-                                # success (forked same-group children may
-                                # outlive the leader). Strict ownership inside
-                                # _terminate avoids recycled-pgid signaling;
-                                # no-op when no owned member remains.
-                                if proc is not None:
-                                    with suppress(Exception):
-                                        await _terminate_process_group(proc)
-                                # Reap is done by wait/terminate; clear tracking.
                                 self.active_child_pid = None
                                 self.active_child_group = False
+                                self._interactive_proc = None
+                                self._interactive_cancel = None
                         if rc == 0 or self.abort_flag:
                             break
                         if attempt < max_attempts:
@@ -7689,12 +9079,10 @@ if _HAS_UI:
                     task.outcome = "completed"
                     task.reason = "dry-run" if OPT_DRY_RUN else ""
                     self.update_task_state(index, "success")
-                    if self.state_store and not OPT_DRY_RUN:
-                        await asyncio.to_thread(self.state_store.mark, task, "completed", exit_code=0, duration=duration)
-                    if task.once and self.once_store and not OPT_DRY_RUN:
-                        await asyncio.to_thread(self.once_store.mark_success, task, self.profile.name, exit_code=0, run_id=getattr(self, "run_id", ""))
-                    if self.run_logger:
-                        self.run_logger.close_task(task, index, "completed", 0, duration)
+                    await self._safe_state_mark(task, "completed", exit_code=0, duration=duration)
+                    if task.once:
+                        await self._safe_once_mark_success(task, exit_code=0)
+                    self._safe_close_task_log(task, index, "completed", 0, duration)
                     self.log_main(f"[bold {THEME['success']}][OK][/] Process Complete ({duration:.2f}s).")
                     self.log_task(f"\n[bold {THEME['success']}]>>> EXECUTION SUCCESSFUL ({duration:.2f}s)[/]", index)
                     return "completed"
@@ -7703,10 +9091,8 @@ if _HAS_UI:
                         task.outcome = "skipped"
                         task.reason = f"ignored failure (exit {rc})"
                         self.update_task_state(index, "skipped")
-                        if self.state_store and not OPT_DRY_RUN:
-                            await asyncio.to_thread(self.state_store.mark, task, "skipped", exit_code=rc, duration=duration)
-                        if self.run_logger:
-                            self.run_logger.close_task(task, index, "skipped", rc, duration)
+                        await self._safe_state_mark(task, "skipped", exit_code=rc, duration=duration)
+                        self._safe_close_task_log(task, index, "skipped", rc, duration)
                         self.log_main(f"[bold {THEME['warning']}][WARN][/] Process failure (Code {rc}) suppressed by manifest.")
                         self.log_task(f"\n[bold {THEME['warning']}]>>> EXECUTION FAILED / SUPPRESSED (Code {rc})[/]", index)
                         return "skipped"
@@ -7714,10 +9100,8 @@ if _HAS_UI:
                         task.outcome = "failed"
                         task.reason = "aborted" if self.abort_flag and OPT_STOP_ON_FAIL else f"exit {rc}"
                         self.update_task_state(index, "failed")
-                        if self.state_store and not OPT_DRY_RUN:
-                            await asyncio.to_thread(self.state_store.mark, task, "failed", exit_code=rc, duration=duration)
-                        if self.run_logger:
-                            self.run_logger.close_task(task, index, "failed", rc, duration)
+                        await self._safe_state_mark(task, "failed", exit_code=rc, duration=duration)
+                        self._safe_close_task_log(task, index, "failed", rc, duration)
                         if OPT_STOP_ON_FAIL:
                             self.log_main(f"[bold {THEME['error']}][FATAL][/] Process aborted execution sequence (Code {rc}).")
                             self.log_task(f"\n[bold {THEME['error']}]>>> FATAL EXECUTION FAILURE (Code {rc})[/]", index)
@@ -7736,10 +9120,8 @@ if _HAS_UI:
                 task.reason = f"internal exception: {e}"
                 task.exit_code = 1
                 self.update_task_state(index, "failed")
-                if self.state_store and not OPT_DRY_RUN:
-                    await asyncio.to_thread(self.state_store.mark, task, "failed", exit_code=1, note=str(e), duration=duration)
-                if self.run_logger:
-                    self.run_logger.close_task(task, index, "failed", 1, duration)
+                await self._safe_state_mark(task, "failed", exit_code=1, note=str(e), duration=duration)
+                self._safe_close_task_log(task, index, "failed", 1, duration)
                 if OPT_STOP_ON_FAIL:
                     self.abort_flag = True
                 return "failed"
@@ -7774,10 +9156,10 @@ if _HAS_UI:
                 v_title = "DRY-RUN"
             elif verdict in _verdict_map:
                 v_color, v_title = _verdict_map[verdict]
-                if (missing_count > 0 or fail_count > 0) and v_title in ("SUCCESS", "SYNC COMPLETE"):
+                if (missing_count > 0 or fail_count > 0 or bool(self.run_warnings)) and v_title in ("SUCCESS", "SYNC COMPLETE"):
                     v_color = THEME['warning']
                     v_title = "WARNINGS"
-            elif missing_count > 0 or fail_count > 0:
+            elif missing_count > 0 or fail_count > 0 or self.run_warnings:
                 v_color = THEME['warning']
                 v_title = "WARNINGS"
             else:
@@ -7963,11 +9345,9 @@ if _HAS_UI:
 
             if skipped_tasks:
                 lines.append(f" [bold {THEME['warning']}]- SKIPPED SCRIPTS ({len(skipped_tasks)}):[/]")
-                for t in skipped_tasks[:12]:
+                for t in skipped_tasks:
                     reason = t.reason or ("condition false" if t.condition else ("once marker valid" if t.once else ("missing script" if t.path_state == "missing" else "ignored failure")))
                     lines.append(f"   • [{t.mode}] {escape(t.name)} [dim]({escape(reason)})[/dim]")
-                if len(skipped_tasks) > 12:
-                    lines.append(f"   • ... and {len(skipped_tasks) - 12} more skipped script(s).")
             else:
                 lines.append(f" [dim]- SKIPPED SCRIPTS  : None[/dim]")
 
@@ -7987,7 +9367,38 @@ if _HAS_UI:
                 f"{rule}",
             ])
 
+            if self.run_warnings:
+                lines.extend(["", f" {S('report')} WARNINGS ({len(self.run_warnings)})"] )
+                for w in self.run_warnings:
+                    detail = w.get("message", "")
+                    where = w.get("task") or w.get("path") or ""
+                    recovery = w.get("recovery") or ""
+                    suffix = f" [{where}]" if where else ""
+                    if recovery:
+                        suffix += f" recovery={recovery}"
+                    lines.append(f"   - {w.get('kind', 'warning')}: {escape(detail)}{escape(suffix)}")
+
             return "\n".join(lines)
+
+        async def _execute_task(self, index: int) -> str:
+            """Isolate the complete lifecycle of one user task.
+
+            Resolution, condition evaluation, execution, and persistence are
+            recoverable per-task boundaries. Cancellation is deliberately not
+            converted into failure.
+            """
+            try:
+                return await self._execute_task_inner(index)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                task = self.tasks[index]
+                self.add_warning("task", f"recoverable lifecycle exception: {e}", task=task.name)
+                with suppress(Exception):
+                    self.log_main(f"[bold {THEME['error']}][ERROR][/] {escape(task.name)}: {escape(str(e))}")
+                with suppress(Exception):
+                    await self._finalize_task(index, "failed", f"task lifecycle exception: {e}", 1)
+                return "failed"
 
         async def _finalize_task(self, index: int, status: str, reason: str, exit_code: int | None = None) -> None:
             # Finalize every unexecuted task with an accurate abort reason so
@@ -7999,12 +9410,14 @@ if _HAS_UI:
             if exit_code is not None:
                 task.exit_code = exit_code
             self.update_task_state(index, task.outcome)
-            if self.state_store and not OPT_DRY_RUN and index >= 5:
-                await asyncio.to_thread(self.state_store.mark, task, task.outcome,
-                                        exit_code=task.exit_code, note=reason, duration=0.0)
-            if self.run_logger:
-                code = task.exit_code if task.exit_code is not None else (0 if task.outcome != "failed" else 1)
-                self.run_logger.close_task(task, index, "completed" if task.outcome == "success" else task.outcome, code, 0.0)
+            if index >= 5:
+                await self._safe_state_mark(
+                    task, task.outcome, exit_code=task.exit_code, note=reason, duration=0.0
+                )
+            code = task.exit_code if task.exit_code is not None else (0 if task.outcome != "failed" else 1)
+            self._safe_close_task_log(
+                task, index, "completed" if task.outcome == "success" else task.outcome, code, 0.0
+            )
 
         def _outcome_counts(self) -> dict[str, int]:
             counts = {"success": 0, "failed": 0, "skipped": 0, "missing": 0}
@@ -8059,8 +9472,8 @@ if _HAS_UI:
             self._self_hash_before = _file_digest_or_none(SCRIPT_PATH)
             prof_fp = getattr(self.profile, "filepath", None) if getattr(self, "profile", None) else None
             self._profile_hash_before = _file_digest_or_none(prof_fp) if prof_fp else None
-            cfg_p = global_config_path()
-            self._config_hash_before = _file_digest_or_none(cfg_p) if cfg_p else None
+            cfg_p = global_config_context_path()
+            self._config_hash_before = _file_digest_or_none(cfg_p)
 
             handoff_ok = False
             if OPT_POST_SELF_UPDATE:
@@ -8119,7 +9532,8 @@ if _HAS_UI:
                             "danger",
                         )
                         return
-                    store_last_good_self()
+                    # The independent supervisor publishes a bundle as known-good
+                    # only after the restarted candidate reaches its health checkpoint.
                 self.phase_durations["phase1_git"] = time.monotonic() - p1_start
             else:
                 self.log_main(f"\n[bold {THEME['accent']}]═══ Phase 1: Git Architecture Reconciliation (SKIPPED) ═══[/]\n")
@@ -8127,7 +9541,15 @@ if _HAS_UI:
                     self.update_task_state(index, "skipped")
                 self.phase_durations["phase1_git"] = 0.0
 
-            if OPT_SYNC_ONLY:
+            # Validate/restart a changed updater bundle before honoring
+            # --sync-only completion. A successful synchronization that changed
+            # the worker/profile/settings is not complete until the candidate
+            # reaches the supervisor-backed startup health checkpoint.
+            reexec_outcome = self._maybe_reexec_after_sync()
+            if reexec_outcome == "restart":
+                return
+
+            if OPT_SYNC_ONLY and reexec_outcome != "invalid":
                 msg = "SYNC SIMULATED." if OPT_DRY_RUN else "SYNC COMPLETE."
                 self.log_main(f"\n[bold {THEME['success']}]{msg} (--sync-only specified)[/]")
                 for index in range(5, len(self.tasks)):
@@ -8165,9 +9587,6 @@ if _HAS_UI:
                 )
                 return
 
-            reexec_outcome = self._maybe_reexec_after_sync()
-            if reexec_outcome == "restart":
-                return
             if reexec_outcome == "invalid":
                 # Invalid updated code/profile/settings: halt, never execute
                 # stale plan. Finalize all user tails as failed, preserve
@@ -8380,12 +9799,14 @@ if _HAS_UI:
                             elif OPT_DRY_RUN:
                                 desktop_notify("Dusky Update", "Dry-run completed successfully", urgency="normal")
                                 AudioNotifier.play("info")
-                            elif self.missing_scripts or fail_count > 0:
+                            elif self.missing_scripts or fail_count > 0 or self.run_warnings:
                                 details = []
                                 if fail_count > 0:
                                     details.append(f"{fail_count} script(s) failed")
                                 if self.missing_scripts:
                                     details.append(f"{missing_count} script(s) missing")
+                                if self.run_warnings:
+                                    details.append(f"{len(self.run_warnings)} warning(s)")
                                 desktop_notify("Dusky Update", ", ".join(details), urgency="normal")
                                 AudioNotifier.play("info")
                             else:
@@ -8405,8 +9826,8 @@ if _HAS_UI:
                                 dialog_title, dialog_level = "UPDATE ABORTED", "danger"
                             elif OPT_DRY_RUN:
                                 dialog_title, dialog_level = "DRY-RUN COMPLETE", "success"
-                            elif self.missing_scripts or fail_count > 0:
-                                dialog_title, dialog_level = "dusky updated", "warning"
+                            elif self.missing_scripts or fail_count > 0 or self.run_warnings:
+                                dialog_title, dialog_level = "dusky updated with warnings", "warning"
                             else:
                                 dialog_title, dialog_level = "dusky updated", "success"
 
@@ -8426,7 +9847,11 @@ if _HAS_UI:
                 # interactive, and normal execution; shutdown stays bounded
                 # and stores/logs close later in on_unmount after workers.
                 pid = getattr(self, "active_child_pid", None)
-                if pid is not None:
+                if pid is not None and not getattr(self, "active_child_group", False) and getattr(self, "_interactive_proc", None) is not None:
+                    # Shared-group interactive child shares our process group:
+                    # signal by PID only, never killpg (that would hit us too).
+                    self._request_interactive_cancel()
+                elif pid is not None:
                     try:
                         if _pg_has_owned_member(pid):
                             with suppress(ProcessLookupError, PermissionError, OSError):
@@ -8516,7 +9941,11 @@ if _HAS_UI:
                 # finalize all pending (including Git tasks 0-4 when still
                 # pending), write report, exit 130. Stores close in on_unmount.
                 pid = getattr(self, "active_child_pid", None)
-                if pid is not None:
+                if pid is not None and not getattr(self, "active_child_group", False) and getattr(self, "_interactive_proc", None) is not None:
+                    # Shared-group interactive child shares our process group:
+                    # signal by PID only, never killpg (that would hit us too).
+                    self._request_interactive_cancel()
+                elif pid is not None:
                     try:
                         if _pg_has_owned_member(pid):
                             with suppress(ProcessLookupError, PermissionError, OSError):
@@ -8880,6 +10309,7 @@ if _HAS_UI:
                         return
                     data = self._pty_key_bytes(event)
                     if data:
+                        self._cancel_prompt_wait_notice()
                         self._queue_pty_write(data)
                         event.stop()
                     return
@@ -8909,6 +10339,7 @@ if _HAS_UI:
 
                 data = self._pty_key_bytes(event)
                 if data:
+                    self._cancel_prompt_wait_notice()
                     self._queue_pty_write(data)
                     event.stop()
 
@@ -8948,8 +10379,11 @@ if _HAS_UI:
             # Best-effort child shutdown so quit does not orphan live
             # children: TERM the process group, then exit. The pipeline's
             # cancellation path does bounded TERM→KILL, reaps, and finalizes.
+            # A shared-group interactive child is signaled by PID only.
             pid = getattr(self, "active_child_pid", None)
-            if pid is not None:
+            if pid is not None and not getattr(self, "active_child_group", False) and getattr(self, "_interactive_proc", None) is not None:
+                self._request_interactive_cancel()
+            elif pid is not None:
                 try:
                     if _pg_has_owned_member(pid):
                         with suppress(ProcessLookupError, PermissionError, OSError):
@@ -8974,8 +10408,9 @@ if _HAS_UI:
             # Validates incoming files BEFORE restarting; invalid code/profile/
             # settings (including deletion and invalid types) halt task
             # execution. No password bytes cross exec. No private driver calls.
-            if OPT_POST_SELF_UPDATE or OPT_DRY_RUN or OPT_SYNC_ONLY:
+            if OPT_DRY_RUN:
                 return "unchanged"
+            generation = int(os.environ.get("DUSKY_RESTART_GENERATION", "0") or 0)
             before = getattr(self, "_self_hash_before", None)
             after = _file_digest_or_none(SCRIPT_PATH)
 
@@ -8983,9 +10418,9 @@ if _HAS_UI:
             prof_before = getattr(self, "_profile_hash_before", None)
             prof_after = _file_digest_or_none(prof_filepath) if prof_filepath else None
 
-            cfg_p = global_config_path()
+            cfg_p = global_config_context_path()
             cfg_before = getattr(self, "_config_hash_before", None)
-            cfg_after = _file_digest_or_none(cfg_p) if cfg_p else None
+            cfg_after = _file_digest_or_none(cfg_p)
 
             script_changed = before != after
             profile_changed = prof_before != prof_after
@@ -8993,6 +10428,9 @@ if _HAS_UI:
 
             if not script_changed and not profile_changed and not config_changed:
                 return "unchanged"
+            if generation >= 3:
+                self.add_warning("restart", "self-update restart limit reached; refusing another candidate restart")
+                return "invalid"
             # Validate the updated files BEFORE restarting: broken/deleted/
             # mistyped profile or settings must halt, not exec into stale plan.
             # Uses strict profile/manifest validation; invalid task strings,
@@ -9024,7 +10462,7 @@ if _HAS_UI:
                         raise ValueError(f"new profile manifest invalid: {e}")
                 if config_changed:
                     # Deletion is invalid (missing settings cannot restart).
-                    if cfg_p is None or cfg_after is None:
+                    if cfg_after is None:
                         raise ValueError("updated settings missing after sync (deleted)")
                     try:
                         fresh_cfg = tomllib.loads(Path(cfg_p).read_bytes().decode("utf-8"))
@@ -9035,6 +10473,15 @@ if _HAS_UI:
                         raise ValueError("; ".join(cfg_errs[:3]))
             except (OSError, ValueError, tomllib.TOMLDecodeError) as e:
                 self.log_main(f"[bold {THEME['error']}][updater][/] Restart aborted: updated files failed validation ({escape(str(e))}); halting (stale plan will NOT execute).")
+                return "invalid"
+            if _supervisor_rejected_candidate_matches(SCRIPT_PATH, prof_filepath, cfg_p):
+                self.add_warning(
+                    "restart",
+                    "the independent supervisor previously rejected this exact bundle; refusing to restart it again during the rejection window",
+                )
+                self.log_main(
+                    f"[bold {THEME['error']}][updater][/] Restart aborted: this exact candidate bundle was previously rejected by the supervisor."
+                )
                 return "invalid"
             if script_changed:
                 self.log_main("[updater] Script updated during sync — restarting with the new version.")
@@ -9050,7 +10497,9 @@ if _HAS_UI:
             sudo_mode = SudoEngine.mode_name()
             askpass = str(SudoEngine._askpass_path) if SudoEngine._askpass_path else ""
             sudoers = str(SudoEngine._sudoers_path) if getattr(SudoEngine, "_sudoers_path", None) else ""
+            previous_generation = int(os.environ.get("DUSKY_RESTART_GENERATION", "0") or 0)
             payload = {
+                "schema": 3,
                 "run_id": getattr(self, "run_id", RUN_TIMESTAMP),
                 "git_dir": str(GIT_DIR),
                 "work_tree": str(WORK_TREE),
@@ -9060,10 +10509,13 @@ if _HAS_UI:
                 "profile_name": self.profile.name,
                 "git_tasks": git_tasks,
                 "git_summary": self.git_summary if isinstance(getattr(self, "git_summary", None), dict) else {},
+                "warnings": list(self.run_warnings),
+                "restart_generation": previous_generation + 1,
                 "sudo": {"mode": sudo_mode if sudo_mode in ("password", "nopasswd") else "none",
                          "askpass_path": askpass,
                          "sudoers_path": sudoers},
                 "created": now_iso(),
+                "created_epoch": time.time(),
             }
             handoff = restart_handoff_path(payload["run_id"])
             # A stale handoff from our own run (same run_id) may linger after
@@ -9110,17 +10562,180 @@ if _HAS_UI:
                     self.query_one("#log_switcher", ContentSwitcher).current = "log-report"
 
 
+
+def _atomic_json_write(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    tmp_p = Path(tmp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_p, path)
+        dfd = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except BaseException:
+        with suppress(OSError):
+            tmp_p.unlink(missing_ok=True)
+        raise
+
+
+def _supervisor_rejected_candidate_matches(
+    script: Path, profile: Path | None, settings: Path | None,
+) -> bool:
+    """Return True when the supervisor recently rejected this exact bundle.
+
+    The independent supervisor records the candidate identity before rollback.
+    Rejection is deliberately bounded: an identical bundle may be retried after
+    the record expires, while any changed script/profile/settings digest is
+    eligible immediately. Direct-Python launches have no supervisor state and
+    are unaffected.
+    """
+    state_raw = os.environ.get("DUSKY_SUPERVISOR_STATE_DIR")
+    if not state_raw:
+        return False
+    rejected = Path(state_raw) / "rejected_candidate.json"
+    try:
+        st = rejected.lstat()
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            return False
+        data = json.loads(rejected.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("schema") != 1:
+            return False
+        expires = float(data.get("expires_epoch", 0.0))
+        if not math.isfinite(expires) or time.time() > expires:
+            return False
+        files = data.get("files")
+        if not isinstance(files, list) or not files:
+            return False
+        def supervisor_digest(path: Path) -> str:
+            try:
+                st_path = path.lstat()
+                if not stat.S_ISREG(st_path.st_mode):
+                    return ""
+            except OSError:
+                return ""
+            return file_checksum(path)
+
+        current: dict[str, tuple[str, str]] = {
+            "script": (str(script), supervisor_digest(script)),
+        }
+        if profile is not None:
+            current["profile"] = (str(profile), supervisor_digest(profile))
+        if settings is not None:
+            current["settings"] = (str(settings), supervisor_digest(settings))
+        seen: set[str] = set()
+        for rec in files:
+            if not isinstance(rec, dict):
+                return False
+            kind = rec.get("kind")
+            installed = rec.get("installed")
+            digest_value = rec.get("digest")
+            if kind not in current or kind in seen:
+                return False
+            if (installed, digest_value) != current[kind]:
+                return False
+            seen.add(kind)
+        # A settings-free bundle is valid; otherwise every currently supervised
+        # member must be represented in the rejected identity.
+        return seen == set(current)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def _supervisor_health_checkpoint(profile: ProfileConfig) -> None:
+    """Publish a startup-health checkpoint after the mounted application is viable.
+
+    The caller invokes this after configuration/profile parsing, dependency
+    loading, Textual application construction/mount, and state/log setup, but
+    before Git mutation or child-task execution. Direct ``python update_dusky.py``
+    remains supported, but cannot provide
+    candidate-independent rollback because the candidate is its own recovery
+    process. The supervisor sets DUSKY_SUPERVISOR_CONTROL_DIR.
+    """
+    if OPT_DRY_RUN:
+        return
+    control_raw = os.environ.get("DUSKY_SUPERVISOR_CONTROL_DIR")
+    if not control_raw:
+        return
+    fatal_cfg = [w for w in CONFIG_WARNINGS if "failed to parse settings" in w or "settings root" in w]
+    if fatal_cfg:
+        raise RuntimeError("supervisor health rejected malformed settings: " + "; ".join(fatal_cfg))
+    control = Path(control_raw)
+    launch_id = uuid.uuid4().hex
+    settings = global_config_context_path()
+    payload = {
+        "schema": 1,
+        "launch_id": launch_id,
+        "pid": os.getpid(),
+        "script": str(SCRIPT_PATH),
+        "script_digest": _file_digest_or_none(SCRIPT_PATH),
+        "profile": str(profile.filepath),
+        "profile_digest": _file_digest_or_none(profile.filepath),
+        "settings": str(settings),
+        "settings_digest": _file_digest_or_none(settings),
+        "work_tree": str(WORK_TREE),
+        "git_dir": str(GIT_DIR),
+        "timestamp": time.time(),
+    }
+    health = control / "health.json"
+    ack = control / f"ack_{launch_id}"
+    _atomic_json_write(health, payload)
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        if ack.is_file():
+            with suppress(OSError):
+                ack.unlink(missing_ok=True)
+            return
+        time.sleep(0.05)
+    raise RuntimeError("supervisor did not acknowledge durable known-good snapshot")
+
+def _close_inherited_lock_fd(raw_fd: str | None) -> None:
+    """Close an exec-inherited lock descriptor when its handoff is rejected."""
+    if not raw_fd:
+        return
+    try:
+        fd = int(raw_fd)
+        if fd >= 0 and fd != globals().get("_LOCK_FD"):
+            os.close(fd)
+    except (TypeError, ValueError, OSError):
+        pass
+
+
 def _adopt_inherited_lock(info: dict) -> bool:
     global _LOCK_FD
     if not isinstance(info, dict):
         return False
     try:
-        fd = int(info.get("fd", -1))
-        if fd < 0:
+        old_fd = int(info.get("fd", -1))
+        if old_fd < 0:
             return False
-        os.fstat(fd)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _LOCK_FD = fd
+        st = os.fstat(old_fd)
+        if int(info.get("ino", -1)) != st.st_ino or int(info.get("dev", -1)) != st.st_dev:
+            return False
+        fcntl.flock(old_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        previous_path = str(info.get("path", ""))
+        effective = lock_path()
+        if previous_path and Path(previous_path) != effective:
+            # Hold the inherited lock until the new configured lock is
+            # acquired, then hand ownership over with no unlocked window.
+            fd2 = os.open(str(effective), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+            try:
+                fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                os.ftruncate(fd2, 0)
+                os.write(fd2, f"{os.getpid()}\n".encode())
+            except BaseException:
+                os.close(fd2)
+                raise
+            _LOCK_FD = fd2
+            with suppress(OSError):
+                os.close(old_fd)
+        else:
+            _LOCK_FD = old_fd
         atexit.register(_cleanup_lock)
         return True
     except (TypeError, ValueError, OSError):
@@ -9136,15 +10751,32 @@ def _adopt_handoff_sudo(payload: dict | Path | None) -> bool:
     mode = sudo.get("mode")
     if mode == "password":
         ap = sudo.get("askpass_path", "")
-        if ap and Path(ap).is_file():
-            SudoEngine._askpass_path = Path(ap)
-            SudoEngine._password = None
+        try:
+            cand = Path(ap)
+            st = cand.lstat()
+            rt = runtime_dir(ensure=False).resolve()
+            valid = stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) == 0o700
+            valid = valid and (rt == cand.resolve() or rt in cand.resolve().parents)
+        except (OSError, RuntimeError):
+            valid = False
+        if valid:
+            SudoEngine._askpass_path = cand
             SudoEngine._mode = "password"
-            os.environ["SUDO_ASKPASS"] = str(ap)
+            os.environ["SUDO_ASKPASS"] = str(cand)
+            # Rehydrate the configured prompt-autofeed secret from the owned
+            # askpass helper instead of losing functionality across exec.
+            try:
+                got = subprocess.run([str(cand)], capture_output=True, text=True, timeout=3, check=True)
+                SudoEngine._password = got.stdout.rstrip("\r\n")
+            except Exception:
+                SudoEngine._password = None
+            sp = sudo.get("sudoers_path", "")
+            if isinstance(sp, str) and sp:
+                SudoEngine._sudoers_path = Path(sp)
             if not SudoEngine._registered_atexit:
                 atexit.register(SudoEngine.cleanup)
                 SudoEngine._registered_atexit = True
-            return True
+            return SudoEngine.refresh_sync()
     elif mode == "nopasswd":
         return SudoEngine.detect_nopasswd()
     return False
@@ -9153,27 +10785,33 @@ if __name__ == "__main__":
     try:
         args = _early_info_dispatch()
 
-        setup_runtime_dir()
         inherited_lock: dict | None = None
         _early_handoff: dict | None = None
-        if OPT_POST_SELF_UPDATE and OPT_HANDOFF is not None:
-            try:
-                _early_handoff = validate_restart_handoff(OPT_HANDOFF, load_profile(OPT_PROFILE_NAME))
-            except SystemExit:
-                raise
-            except Exception:
-                _early_handoff = None
-            if _early_handoff is not None and isinstance(_early_handoff.get("lock"), dict):
-                inherited_lock = _early_handoff["lock"]
         adopted_lock = False
-        if inherited_lock is not None and _adopt_inherited_lock(inherited_lock):
-            adopted_lock = True
-        elif not acquire_lock():
-            sys.exit(1)
-
         adopted_sudo = False
-        if OPT_POST_SELF_UPDATE and _early_handoff is not None:
-            adopted_sudo = _adopt_handoff_sudo(_early_handoff)
+        inherited_lock_fd_env = os.environ.pop("DUSKY_INHERITED_LOCK_FD", None)
+        if not OPT_DRY_RUN:
+            setup_runtime_dir()
+            if OPT_POST_SELF_UPDATE and OPT_HANDOFF is not None:
+                try:
+                    _early_handoff = validate_restart_handoff(OPT_HANDOFF, load_profile(OPT_PROFILE_NAME))
+                except SystemExit:
+                    raise
+                except Exception:
+                    _early_handoff = None
+                if _early_handoff is not None and isinstance(_early_handoff.get("lock"), dict):
+                    inherited_lock = _early_handoff["lock"]
+            if inherited_lock is not None and _adopt_inherited_lock(inherited_lock):
+                adopted_lock = True
+            else:
+                # A malformed/stale handoff must not leave the old exec-inherited
+                # flock descriptor open, otherwise reacquiring the same lock via
+                # a new open file description self-conflicts on Linux.
+                _close_inherited_lock_fd(inherited_lock_fd_env)
+                if not acquire_lock():
+                    sys.exit(1)
+            if OPT_POST_SELF_UPDATE and _early_handoff is not None:
+                adopted_sudo = _adopt_handoff_sudo(_early_handoff)
 
         SUDO_ALREADY_ACQUIRED = bootstrap_dependencies()
 
@@ -9195,14 +10833,15 @@ if __name__ == "__main__":
         elif not OPT_SYNC_ONLY:
             if not has_sudo and any(t.mode == 'S' for t in tasks):
                 if not SudoEngine.preflight(cli_password=getattr(args, 'sudo_password', None)):
-                    sys.exit(1)
-                has_sudo = True
+                    if SudoEngine._last_cancelled:
+                        sys.exit(130)
+                    sys.stderr.write("\033[1;33m[WARN]\033[0m Sudo unavailable; privileged tasks will be skipped while user tasks continue.\n")
+                    has_sudo = False
+                else:
+                    has_sudo = True
 
         setup_storage_roots()
         setup_logging()
-
-        if not OPT_DRY_RUN:
-            auto_prune()
 
         if not OPT_SYNC_ONLY:
             if not resolve_and_validate_manifest(profile, tasks):
@@ -9235,8 +10874,11 @@ if __name__ == "__main__":
                 cleaned_args.append(a)
             cleaned_args += ["--handoff", str(handoff)]
             try:
+                if _LOCK_FD is not None:
+                    os.environ["DUSKY_INHERITED_LOCK_FD"] = str(_LOCK_FD)
                 os.execv(sys.executable, [sys.executable, str(SCRIPT_PATH), "--post-self-update", *cleaned_args])
             except OSError as e:
+                os.environ.pop("DUSKY_INHERITED_LOCK_FD", None)
                 sys.stderr.write(f"\033[1;31m[FATAL]\033[0m Restart exec failed ({e}); update already applied, re-run manually.\n")
                 with suppress(OSError):
                     Path(handoff).unlink(missing_ok=True)

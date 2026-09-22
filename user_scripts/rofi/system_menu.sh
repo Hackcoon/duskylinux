@@ -573,7 +573,7 @@ show_system_menu() {
 
         case "$choice" in
             '  Dusky Updater')
-                run_term_hold "update_dusky" bash -c "'$SCRIPTS_DIR/update_dusky/python/update_dusky.py'"
+                run_term_hold "update_dusky" bash -c "'$SCRIPTS_DIR/update_dusky/python/update_dusky_supervisor.py'"
                 ;;
             '  Arch Updater')
                 run_term_hold "arch_update" bash -c "paru -Syu"
