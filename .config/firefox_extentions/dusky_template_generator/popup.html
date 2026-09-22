@@ -7,7 +7,7 @@
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body {
-    width: 460px; margin: 0; padding: 12px;
+    width: 470px; margin: 0; padding: 12px;
     background: #191614; color: #f5ebe0;
     font: 13px/1.45 system-ui, sans-serif;
   }
@@ -16,12 +16,14 @@
   #domain { font: 12px ui-monospace, monospace; color: #d4a359; }
   #path { margin: 0 0 8px; font: 10.5px ui-monospace, monospace; color: #8f857a;
           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #path b { color: #e6c280; font-weight: 600; }
   textarea {
     width: 100%; height: 300px; resize: vertical;
     font: 11.5px/1.5 ui-monospace, monospace; color: #f5ebe0;
     background: #0f0d0c; border: 1px solid #3d342c; border-radius: 8px; padding: 8px;
-    tab-size: 4;
+    tab-size: 4; white-space: pre; overflow: auto;
   }
+  textarea::placeholder { color: #8f857a; }
   textarea:focus-visible { outline: 2px solid #e6c280; outline-offset: 1px; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 8px; }
   button {
@@ -33,15 +35,18 @@
   button:hover:not(:disabled) { border-color: #d4a359; }
   button:disabled { opacity: .4; cursor: default; }
   button:focus-visible { outline: 2px solid #e6c280; outline-offset: 1px; }
-  button b { font-weight: 700; }
-  button small { color: #8f857a; font-size: 10.5px; }
+  button .t { font-weight: 700; }
+  button .s { color: #8f857a; font-size: 10.5px; }
   .attention { border-color: #e6c280; }
+  .danger { border-color: #b8545e; }
   .on { background: #e6c280; color: #191614; border-color: #e6c280; }
-  .on small { color: #4a3a1e; }
+  .on .s { color: #4a3a1e; }
   .wide { grid-column: 1 / -1; }
-  .status { min-height: 1.3em; margin: 8px 0 0; font-size: 11.5px; color: #c4b8aa; }
+  .status { min-height: 2.6em; margin: 8px 0 0; font-size: 11.5px; color: #c4b8aa; }
   .status.ok { color: #81c784; } .status.err { color: #e57373; }
   .status.warn { color: #e6c280; } .status.busy { color: #d4a359; }
+  kbd { font: 10.5px ui-monospace, monospace; background: #0f0d0c;
+        border: 1px solid #3d342c; border-radius: 4px; padding: 0 4px; }
 </style>
 </head>
 <body>
@@ -52,13 +57,14 @@
   <p id="path"></p>
   <textarea id="css" spellcheck="false" aria-label="Template CSS"></textarea>
   <div class="grid">
-    <button id="auto"><b>⚡ Auto-map</b><small>scan this site's colour tokens</small></button>
-    <button id="pick"><b>🎯 Pick elements</b><small>click things on the page, assign a role</small></button>
-    <button id="save" class="wide"><b>💾 Saved</b></button>
-    <button id="copy"><b>📋 Copy</b></button>
-    <button id="delete"><b>🗑 Delete</b></button>
+    <button id="auto"><b class="t">⚡ Auto-map</b><small class="s">scan this site's colour tokens</small></button>
+    <button id="pick"><b class="t">🎯 Pick elements</b><small class="s">click things on the page, assign a role</small></button>
+    <button id="save" class="wide"><b class="t">💾 Saved</b><small class="s">no unsaved changes</small></button>
+    <button id="copy"><b class="t">📋 Copy</b><small class="s">whole template</small></button>
+    <button id="reload"><b class="t">↻ Reload</b><small class="s">re-read from disk</small></button>
+    <button id="delete" class="wide danger"><b class="t">🗑 Delete</b><small class="s">remove this file from disk</small></button>
   </div>
   <p class="status" id="status" role="status" aria-live="polite"></p>
-  <script src="popup.js"></script>
+  <script src="popup.js" type="module"></script>
 </body>
 </html>

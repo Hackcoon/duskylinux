@@ -1,13 +1,39 @@
 /*
- * Dusky Template Generator — content.js (Production Fixed Edition)
- * Gecko 156+ only. Zero legacy fallbacks.
+ * Dusky Template Generator — content.js (Gecko 156+)
+ *
+ * Two jobs, one file:
+ *   1. scan()  — colour-token scanner behind the popup's Auto-map button;
+ *   2. picker  — an in-page, closed-shadow-DOM element picker that owns the
+ *                "picks" region of $XDG_CONFIG_HOME/dusky_sites/<domain>.css.
+ *
+ * CASCADE CONTRACT (v4 — this is what makes previews and themes reliable):
+ *   All injected CSS lives in ONE constructable stylesheet adopted by the
+ *   document, structured as
+ *       @layer dusky.preview, dusky.live;
+ *   CSS Cascade 5 reverses layer order for !important declarations: the
+ *   EARLIEST layer wins, and layered !important beats unlayered !important.
+ *   Therefore  preview  ≻  live  ≻  the site's own !important rules,
+ *   independently of specificity, source order, and anything the page does to
+ *   <head>. Hover preview is consequently identical in pick and edit mode.
+ *
+ * Reliability contract:
+ *   · nothing is written unless the picks region was read first (hydrated);
+ *   · every write carries base_rev; a conflict re-reads, merges (local wins
+ *     per key) and retries with backoff;
+ *   · writes are serialised and coalesced by generation — a burst is one write.
+ *
+ * Rule identity (unchanged wire protocol): one rule per line, trailed by a
+ * "dusky key=<strict-urlencoded-key> | <meta>" CSS comment. Key shapes:
+ *   sel\u001F<selector>\u001F<group>   group: bg|text|border|fill|display|custom:<props>
+ *   var\u001F<scope>\u001F<--name>
+ *   raw\u001F<css>                     hand-written line we could not parse
  */
 "use strict";
 (() => {
   if (globalThis.__duskyTemplateGenerator) return;
   globalThis.__duskyTemplateGenerator = true;
 
-  /* ── Material 3 palette contract ─────────────────────────────────────── */
+  /* ══ Material 3 palette contract ════════════════════════════════════ */
   const TOKENS = [
     ["background", "Background (Page canvas)"],
     ["on_background", "On background"],
@@ -47,77 +73,101 @@
     ["error_container", "Error container"],
   ];
   const TOKEN_NAMES = new Set(TOKENS.map(([t]) => t));
-  const OWNED = new Set([...TOKEN_NAMES].map((t) => "--" + t));
-  const NOISE_RE = /^--(tw|fa|dusky|darkreader|wp--|chakra-emotion|mui-)/i;
-  // Filters out both bare vendor noise AND Matugen's live-injected palette (_rgb, on_, inverse_, etc.)
-  const MATUGEN_INJECTED_RE = /^--(on_|inverse_|surface|primary|secondary|tertiary|outline|error|background|scrim|shadow|source_color|surface_tint)/i;
-  const skipVar = (name) => OWNED.has(name) || NOISE_RE.test(name) || (name.includes("_") && MATUGEN_INJECTED_RE.test(name));
+
+  /* Everything Matugen itself injects. Exact names only: a prefix regex also
+   * swallows real site tokens such as --error_bg, --surface_alt, --primary_hover. */
+  const PALETTE_OWNED = new Set([
+    ...TOKEN_NAMES,
+    "error_container", "on_error_container", "inverse_primary",
+    "on_primary_fixed", "on_primary_fixed_variant",
+    "secondary_fixed", "on_secondary_fixed",
+    "tertiary_fixed", "tertiary_fixed_dim", "on_tertiary_fixed", "on_tertiary_fixed_variant",
+    "scrim", "shadow", "source_color", "surface_tint",
+  ]);
+  const PALETTE_SUFFIX = /_(rgb|rgba|hex|hsl|raw|strip)$/;
+  /* Framework internals that are never site design tokens. --mui-* and --wp--*
+   * are deliberately NOT here: those are mappable palettes. */
+  const NOISE_RE = /^--(tw-|fa-|dusky|darkreader|chakra-emotion)/i;
+
+  const skipVar = (name) => {
+    if (typeof name !== "string" || !name.startsWith("--")) return true;
+    if (NOISE_RE.test(name)) return true;
+    return PALETTE_OWNED.has(name.slice(2).toLowerCase().replace(PALETTE_SUFFIX, ""));
+  };
 
   const paletteLoaded = () =>
     getComputedStyle(document.documentElement).getPropertyValue("--surface").trim() !== "";
 
-  /* ── Perceptual colour engine (Color Guard Fixed) ────────────────────── */
+  /* ══ Shadow host + closed root (also hosts the colour probe) ═════════ */
+  const hostEl = document.createElement("dusky-picker");
+  for (const [p, v] of Object.entries({
+    all: "initial", display: "block", position: "fixed", top: "0", left: "0",
+    width: "0", height: "0", overflow: "visible", "z-index": "2147483647",
+    "pointer-events": "none", isolation: "isolate",
+  })) hostEl.style.setProperty(p, v, "important");
+  const root = hostEl.attachShadow({ mode: "closed" });
+
+  /* ══ Perceptual colour engine ═══════════════════════════════════════ */
+  /* The probe lives in a detached element inside the closed root: the page can
+   * neither see it nor style it, and it never triggers layout. */
   let colorProbe = null;
-  function getProbe() {
-    if (!colorProbe || !colorProbe.isConnected) {
-      colorProbe = document.createElement("span");
-      colorProbe.style.cssText =
-        "display:none !important;position:fixed !important;visibility:hidden !important;";
-      (document.head || document.documentElement).append(colorProbe);
-    }
-    return colorProbe;
-  }
-  function dropProbe() {
-    colorProbe?.remove();
-    colorProbe = null;
-  }
+  const getProbe = () => (colorProbe ??= document.createElement("span"));
+  const dropProbe = () => { colorProbe = null; };
 
   const RGB_OUT = /^(?:rgb|rgba)\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,/\s]+([\d.%]+))?\s*\)$/i;
-  const IS_COLOR_SYNTAX = /^(#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$|(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color|color-mix|light-dark)\()/i;
+  const IS_COLOR_SYNTAX =
+    /^(#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$|(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color|color-mix|light-dark)\()/i;
   const HSL_TRIPLET = /^(-?[\d.]+)(?:deg)?\s+([\d.]+)%\s+([\d.]+)%$/;
   const RGB_TRIPLET = /^(\d{1,3})[,\s]+(\d{1,3})[,\s]+(\d{1,3})$/;
+  const KEYWORDISH = /^(inherit|initial|unset|revert|revert-layer|transparent|currentcolor|none)$/i;
 
   function parseCssColor(raw) {
     if (typeof raw !== "string") return null;
     const v = raw.trim();
-    if (!v) return null;
-    if (/^(inherit|initial|unset|revert|revert-layer|transparent|currentcolor|none)$/i.test(v)) return null;
+    if (!v || KEYWORDISH.test(v)) return null;
 
     const hsl = v.match(HSL_TRIPLET);
-    const rgbTriplet = !hsl && v.match(RGB_TRIPLET);
-
-    if (rgbTriplet) {
-      const [, r, g, b] = rgbTriplet.map(Number);
-      if (r <= 255 && g <= 255 && b <= 255) return { r, g, b, a: 1, shape: "rgb-triplet" };
-      return null;
+    const triplet = !hsl && v.match(RGB_TRIPLET);
+    if (triplet) {
+      const [, r, g, b] = triplet.map(Number);
+      return r <= 255 && g <= 255 && b <= 255 ? { r, g, b, a: 1, shape: "rgb-triplet" } : null;
     }
-
-    /* Guard: Reject non-colors immediately so font/spacing variables never leak through */
-    const isLikelyColor = hsl || IS_COLOR_SYNTAX.test(v) || CSS.supports("color", v);
-    if (!isLikelyColor) return null;
+    /* Reject non-colours early so font/spacing variables never leak through. */
+    if (!(hsl || IS_COLOR_SYNTAX.test(v) || CSS.supports("color", v))) return null;
 
     const probe = getProbe();
     probe.style.color = "";
     probe.style.color = hsl ? `hsl(${v})` : v;
+    if (!probe.style.color) return null;                /* the parser refused it */
 
-    /* If the browser rejected the property, probe.style.color remains empty */
-    if (!probe.style.color) return null;
-
-    const comp = getComputedStyle(probe).color;
-    const match = comp && RGB_OUT.exec(comp);
+    /* Detached elements have no computed style, so resolve through the CSSOM:
+     * style.color is already serialised by the parser into a canonical form. */
+    const serialised = probe.style.color;
+    const match = RGB_OUT.exec(serialised) ?? RGB_OUT.exec(resolveViaRoot(serialised));
     if (!match) return null;
-    const [, rStr, gStr, bStr, aStr] = match;
-    const alpha = aStr === undefined ? 1 : (aStr.endsWith("%") ? parseFloat(aStr) / 100 : parseFloat(aStr));
+    const [, rs, gs, bs, as] = match;
+    const alpha = as === undefined ? 1 : (as.endsWith("%") ? parseFloat(as) / 100 : parseFloat(as));
     return {
-      r: Math.round(+rStr),
-      g: Math.round(+gStr),
-      b: Math.round(+bStr),
-      a: alpha,
+      r: Math.round(+rs), g: Math.round(+gs), b: Math.round(+bs), a: alpha,
       shape: hsl ? "hsl-triplet" : "color",
     };
   }
 
-  const srgb = (c) => (c /= 255, c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+  /* Canonicalise exotic colour syntaxes (oklch, color-mix, light-dark) to rgb()
+   * using a one-shot computed-value round trip on the shadow root's own node. */
+  let resolver = null;
+  function resolveViaRoot(value) {
+    if (!resolver?.isConnected) {
+      resolver = document.createElement("i");
+      resolver.style.cssText = "display:none!important";
+      root.append(resolver);
+    }
+    resolver.style.color = "";
+    resolver.style.color = value;
+    return getComputedStyle(resolver).color ?? "";
+  }
+
+  const srgb = (c) => ((c /= 255), c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
   const luminance = (r, g, b) => 0.2126 * srgb(r) + 0.7152 * srgb(g) + 0.0722 * srgb(b);
 
   function chromaHue(r, g, b) {
@@ -134,7 +184,42 @@
     return { chroma: d, hue: h };
   }
 
-  /* ── Framework signature table ───────────────────────────────────────── */
+  /* ══ Framework signature table ══════════════════════════════════════ */
+  const SHADCN = {
+    "--background": "background", "--foreground": "on_background",
+    "--card": "surface_container", "--card-foreground": "on_surface",
+    "--popover": "surface_container_high", "--popover-foreground": "on_surface",
+    "--primary": "primary", "--primary-foreground": "on_primary",
+    "--secondary": "secondary_container", "--secondary-foreground": "on_secondary_container",
+    "--muted": "surface_container_low", "--muted-foreground": "on_surface_variant",
+    "--accent": "surface_container_high", "--accent-foreground": "on_surface",
+    "--destructive": "error", "--destructive-foreground": "on_error",
+    "--border": "outline_variant", "--input": "outline", "--ring": "primary",
+    "--sidebar": "surface_container", "--sidebar-background": "surface_container",
+    "--sidebar-foreground": "on_surface", "--sidebar-primary": "primary",
+    "--sidebar-accent": "surface_container_high", "--sidebar-border": "outline_variant",
+    "--sidebar-ring": "primary",
+  };
+
+  const MATERIAL = {
+    "primary": "primary", "on-primary": "on_primary",
+    "primary-container": "primary_container", "on-primary-container": "on_primary_container",
+    "secondary": "secondary", "on-secondary": "on_secondary",
+    "secondary-container": "secondary_container", "on-secondary-container": "on_secondary_container",
+    "tertiary": "tertiary", "on-tertiary": "on_tertiary",
+    "surface": "surface", "surface-bright": "surface_bright", "surface-dim": "surface_dim",
+    "surface-container": "surface_container", "surface-container-high": "surface_container_high",
+    "surface-container-highest": "surface_container_highest",
+    "surface-container-low": "surface_container_low",
+    "surface-container-lowest": "surface_container_lowest",
+    "on-surface": "on_surface", "on-surface-variant": "on_surface_variant",
+    "outline": "outline", "outline-variant": "outline_variant",
+    "error": "error", "on-error": "on_error",
+    "background-default": "background", "background-paper": "surface_container",
+    "text-primary": "on_surface", "text-secondary": "on_surface_variant",
+    "divider": "outline_variant",
+  };
+
   function matchKnownFramework(name) {
     const n = name.toLowerCase();
 
@@ -156,62 +241,33 @@
       if (n.includes("10-percent-layer")) return "surface_variant";
     }
 
-    /* Google Material / Gemini */
-    if (n.startsWith("--gem-sys-color--") || n.startsWith("--mat-") || n.startsWith("--bard-color-")) {
-      const tail = n.replace(/^--(gem-sys-color--|mat-|bard-color-)/, "");
-      const map = {
-        "primary": "primary", "on-primary": "on_primary",
-        "primary-container": "primary_container", "on-primary-container": "on_primary_container",
-        "secondary": "secondary", "on-secondary": "on_secondary",
-        "secondary-container": "secondary_container", "on-secondary-container": "on_secondary_container",
-        "tertiary": "tertiary", "on-tertiary": "on_tertiary",
-        "surface": "surface", "surface-bright": "surface_bright", "surface-dim": "surface_dim",
-        "surface-container": "surface_container", "surface-container-high": "surface_container_high",
-        "surface-container-highest": "surface_container_highest",
-        "surface-container-low": "surface_container_low",
-        "surface-container-lowest": "surface_container_lowest",
-        "on-surface": "on_surface", "on-surface-variant": "on_surface_variant",
-        "outline": "outline", "outline-variant": "outline_variant",
-        "error": "error", "on-error": "on_error",
-      };
-      if (map[tail]) return map[tail];
+    /* Google Material / Gemini / MUI */
+    if (n.startsWith("--gem-sys-color--") || n.startsWith("--mat-") ||
+        n.startsWith("--bard-color-") || n.startsWith("--mui-palette-")) {
+      const tail = n.replace(/^--(gem-sys-color--|mat-|bard-color-|mui-palette-)/, "").replaceAll("-main", "");
+      if (MATERIAL[tail]) return MATERIAL[tail];
       if (tail.includes("app-text-color")) return "on_surface";
       if (tail.includes("background-color")) return "surface";
     }
 
     /* Tailwind v4 / shadcn / Radix */
-    const shadcn = {
-      "--background": "background", "--foreground": "on_background",
-      "--card": "surface_container", "--card-foreground": "on_surface",
-      "--popover": "surface_container_high", "--popover-foreground": "on_surface",
-      "--primary": "primary", "--primary-foreground": "on_primary",
-      "--secondary": "secondary_container", "--secondary-foreground": "on_secondary_container",
-      "--muted": "surface_container_low", "--muted-foreground": "on_surface_variant",
-      "--accent": "surface_container_high", "--accent-foreground": "on_surface",
-      "--destructive": "error", "--destructive-foreground": "on_error",
-      "--border": "outline_variant", "--input": "outline", "--ring": "primary",
-      "--sidebar": "surface_container", "--sidebar-background": "surface_container",
-      "--sidebar-foreground": "on_surface", "--sidebar-primary": "primary",
-      "--sidebar-accent": "surface_container_high", "--sidebar-border": "outline_variant",
-      "--sidebar-ring": "primary",
-    };
-    if (shadcn[n]) return shadcn[n];
+    if (SHADCN[n]) return SHADCN[n];
 
     /* Discord */
     if (n.startsWith("--neutral-")) {
-      const num = Number.parseInt(n.slice(10), 10);
-      if (Number.isFinite(num)) {
-        if (num >= 90) return "surface";
-        if (num >= 84) return "surface_container_low";
-        if (num >= 78) return "surface_container";
-        if (num >= 70) return "surface_container_high";
-        if (num <= 10) return "on_surface";
-        if (num <= 30) return "on_surface_variant";
+      const step = Number.parseInt(n.slice(10), 10);
+      if (Number.isFinite(step)) {
+        if (step >= 90) return "surface";
+        if (step >= 84) return "surface_container_low";
+        if (step >= 78) return "surface_container";
+        if (step >= 70) return "surface_container_high";
+        if (step <= 10) return "on_surface";
+        if (step <= 30) return "on_surface_variant";
       }
     }
-    if (n.startsWith("--blurple-") || n.startsWith("--brand-") || n === "--blue-new-37") {
-      if (n === "--brand-560") return "on_primary_container";
-      if (n === "--brand-10a" || n.includes("highlight")) return "inverse_on_surface";
+    if (n.startsWith("--brand-") || n.startsWith("--blurple-")) {
+      if (n.includes("560")) return "on_primary_container";
+      if (n.includes("10a") || n.includes("highlight")) return "inverse_on_surface";
       if (n.includes("60")) return "secondary_container";
       if (n.includes("50") || n.includes("65")) return "primary_container";
       return "primary";
@@ -220,33 +276,32 @@
     /* Instagram */
     if (n.startsWith("--ig-")) {
       if (n.includes("primary-background")) return "surface";
-      if (n.includes("primary-text") || n.includes("primary-icon")) return "on_surface";
       if (n.includes("elevated-background")) return "surface_container_low";
       if (n.includes("separator")) return "outline_variant";
+      if (n.includes("-text") || n.includes("-icon")) return "on_surface";
     }
 
     /* Chess.com */
-    if (n.startsWith("--color-gray-") || n.startsWith("--color-green-")) {
-      if (n.includes("gray-800")) return "surface";
-      if (n.includes("gray-700")) return "surface_container";
-      if (n.includes("gray-600")) return "surface_container_high";
-      if (n.includes("gray-500")) return "surface_container_highest";
-      if (n.includes("gray-400")) return "surface_bright";
-      if (n.includes("green-300")) return "primary";
-      if (n.includes("green-200")) return "primary_fixed";
-      if (n.includes("green-400") || n.includes("green-500")) return "primary_container";
+    if (n.startsWith("--color-gray-") || n.startsWith("--gray-")) {
+      const step = Number.parseInt(n.replace(/\D+/g, ""), 10);
+      if (step >= 800) return "surface";
+      if (step >= 700) return "surface_container";
+      if (step >= 600) return "surface_container_high";
+      if (step >= 500) return "surface_container_highest";
+      if (step >= 400) return "surface_bright";
     }
+    if (n.includes("green-200")) return "primary_fixed";
+    if (n.includes("green-300")) return "primary";
+    if (n.includes("green-400") || n.includes("green-500")) return "primary_container";
     if (n.includes("neutrals-white")) return "on_surface";
 
     /* Telegram */
-    if (n.startsWith("--theme-") || n.startsWith("--color-")) {
-      if (n.includes("chat-hover") || n.includes("background-selected")) return "surface_container_high";
-      if (n.includes("chat-active") || n.includes("background-own")) return "primary_container";
-      if (n.includes("background-secondary")) return "surface_container_lowest";
-      if (n.includes("background-compact-menu") || n.includes("action-message-bg")) return "surface_container_low";
-      if (n.includes("theme-background-color") || n === "--color-background") return "surface";
-      if (n.includes("color-text")) return "on_surface_variant";
-    }
+    if (n.includes("chat-hover")) return "surface_container_high";
+    if (n.includes("chat-active")) return "primary_container";
+    if (n.includes("bg-color-secondary")) return "surface_container_lowest";
+    if (n.includes("compact-menu")) return "surface_container_low";
+    if (n === "--theme-background-color" || n.includes("theme-bg")) return "surface";
+    if (n === "--color-text" || n.includes("color-text-secondary")) return "on_surface_variant";
 
     /* Monkeytype */
     if (n === "--bg-color") return "surface";
@@ -276,34 +331,20 @@
       return "tertiary";
     }
 
-    if (lum <= 0.02) {
-      if (/(body|canvas|bg-base|root|background|black)/.test(n)) return "background";
-      return "surface_container_lowest";
-    }
-    if (lum <= 0.06) {
-      if (/(input|field|inset|sunken|deep)/.test(n)) return "surface_container_low";
-      return "surface";
-    }
-    if (lum <= 0.12) {
-      if (/(card|panel|box|container|sidebar|nav)/.test(n)) return "surface_container";
-      return "surface_container_low";
-    }
-    if (lum <= 0.22) {
-      if (/(modal|dialog|popover|dropdown|menu|toast|elevated)/.test(n)) return "surface_container_high";
-      return "surface_container";
-    }
-    if (lum <= 0.38) {
-      if (/(hover|active|bright)/.test(n)) return "surface_bright";
-      return "surface_container_highest";
-    }
-    if (lum >= 0.70) {
-      if (/(muted|secondary|dim|subtle|caption|hint|disabled|placeholder)/.test(n)) return "on_surface_variant";
-      return "on_surface";
-    }
+    if (lum <= 0.02) return /(body|canvas|bg-base|root|background|black)/.test(n)
+      ? "background" : "surface_container_lowest";
+    if (lum <= 0.06) return /(input|field|inset|sunken|deep)/.test(n) ? "surface_container_low" : "surface";
+    if (lum <= 0.12) return /(card|panel|box|container|sidebar|nav)/.test(n)
+      ? "surface_container" : "surface_container_low";
+    if (lum <= 0.22) return /(modal|dialog|popover|dropdown|menu|toast|elevated)/.test(n)
+      ? "surface_container_high" : "surface_container";
+    if (lum <= 0.38) return /(hover|active|bright)/.test(n) ? "surface_bright" : "surface_container_highest";
+    if (lum >= 0.70) return /(muted|secondary|dim|subtle|caption|hint|disabled|placeholder)/.test(n)
+      ? "on_surface_variant" : "on_surface";
     return "on_surface_variant";
   }
 
-  /* ── Stylesheet traversal ────────────────────────────────────────────── */
+  /* ══ Stylesheet traversal ═══════════════════════════════════════════ */
   function walkRules(list, onStyleRule) {
     for (const rule of list) {
       if (rule.styleSheet) {
@@ -318,6 +359,8 @@
   }
 
   let customPropIndex = null;
+  let indexWatermark = -1;
+
   function buildCustomPropIndex() {
     const index = [];
     for (const sheet of document.styleSheets) {
@@ -331,24 +374,35 @@
     }
     return index;
   }
-  const propIndex = () => (customPropIndex ??= buildCustomPropIndex());
+
+  /* Invalidate when the document gains or loses a stylesheet (SPA chunks). */
+  function propIndex() {
+    if (customPropIndex === null || indexWatermark !== document.styleSheets.length) {
+      customPropIndex = buildCustomPropIndex();
+      indexWatermark = document.styleSheets.length;
+    }
+    return customPropIndex;
+  }
+  const dropIndex = () => { customPropIndex = null; indexWatermark = -1; };
+
+  /* Escape for use inside a quoted CSS attribute value. CSS.escape() is the
+   * wrong tool here — it escapes identifiers, not string contents. */
+  const cssString = (v) => `"${String(v).replaceAll(/["\\]/g, "\\$&")}"`;
 
   function detectRootScopes() {
     const inner = new Set();
     for (const el of [document.documentElement, document.body].filter(Boolean)) {
       for (const cls of el.classList) {
-        if (/^(dark|dark-theme|theme-dark|dark-mode|night)$/i.test(cls)) inner.add("." + CSS.escape(cls));
+        if (/^(dark|dark-theme|theme-dark|dark-mode|night)$/i.test(cls)) inner.add(`.${CSS.escape(cls)}`);
       }
       for (const attr of el.getAttributeNames()) {
         if (/^(data-theme|data-color-mode|data-bs-theme|theme|dark)$/i.test(attr)) {
           const val = el.getAttribute(attr);
-          inner.add(val ? `[${attr}="${CSS.escape(val)}"]` : `[${attr}]`);
+          inner.add(val ? `[${attr}=${cssString(val)}]` : `[${attr}]`);
         }
       }
     }
-    inner.add("[dark]");
-    inner.add(".dark");
-    inner.add('[data-theme="dark"]');
+    inner.add("[dark]").add(".dark").add('[data-theme="dark"]');
     return `:root, :where(${[...inner].join(", ")})`;
   }
 
@@ -371,6 +425,8 @@
     return out;
   }
 
+  /* Broad structural repaint, used ONLY when the page exposes fewer than three
+   * mappable tokens (the popup double-confirms before this is written). */
   function structuralFallback() {
     return [
       "/* Structural theme — this page exposes no usable design tokens. */",
@@ -378,71 +434,56 @@
       "    background-color: var(--surface) !important;",
       "    color: var(--on_surface) !important;",
       "    color-scheme: dark !important;",
-      "    scrollbar-color: var(--surface_variant) transparent !important;",
       "}",
-      "",
-      ":not(a):not(button):not(input):not(select):not(textarea):not(code):not(pre):not(kbd)" +
-        ":not(table):not(thead):not(tbody):not(tr):not(th):not(td):not(svg):not(svg *)" +
-        ":not(img):not(video):not(canvas):not(i):not([class*=\"icon\" i])" +
-        ":not([class*=\"badge\" i]):not([class*=\"btn\" i]) {",
+      ":not(a):not(button):not(input):not(select):not(textarea):not(code):not(pre)",
+      ":not(table):not(svg):not(img):not(video):not([class*='icon']):not([class*='badge']):not([class*='btn']) {",
       "    background-color: transparent !important;",
       "    color: inherit !important;",
       "}",
-      "",
-      "header, nav, aside, footer, [role=\"navigation\"], [role=\"banner\"], [role=\"complementary\"],",
-      ".card, .container, .sidebar, .navbar, .box, .panel, .dialog, .modal {",
+      "header, nav, aside, footer, main > section, article,",
+      "[class*='card'], [class*='panel'], [class*='sidebar'], dialog, [role='dialog'] {",
       "    background-color: var(--surface_container) !important;",
       "    border-color: var(--outline_variant) !important;",
       "    color: var(--on_surface) !important;",
       "}",
-      "",
       "code, pre, kbd, samp {",
       "    background-color: var(--surface_container_high) !important;",
       "    color: var(--on_surface) !important;",
-      "    border-color: var(--outline_variant) !important;",
       "}",
-      "",
-      "a:any-link { color: var(--primary) !important; }",
-      "a:any-link:hover { color: var(--primary_fixed) !important; }",
+      "a { color: var(--primary) !important; }",
+      "a:hover { color: var(--primary_fixed) !important; }",
       "a:visited { color: var(--tertiary) !important; }",
-      "",
-      "input:not([type=\"submit\"]):not([type=\"button\"]):not([type=\"reset\"])" +
-        "     :not([type=\"checkbox\"]):not([type=\"radio\"]), textarea, select {",
+      "input, select, textarea {",
       "    background-color: var(--surface_container_low) !important;",
       "    color: var(--on_surface) !important;",
-      "    border: 1px solid var(--outline) !important;",
-      "    caret-color: var(--primary) !important;",
+      "    border-color: var(--outline) !important;",
       "}",
-      "::placeholder { color: var(--on_surface_variant) !important; opacity: 1 !important; }",
-      "",
-      "button, input[type=\"submit\"], input[type=\"button\"], .btn, .button {",
+      "button, [type='submit'], [role='button'] {",
       "    background-color: var(--primary) !important;",
       "    color: var(--on_primary) !important;",
-      "    border: none !important;",
+      "    border-color: var(--outline_variant) !important;",
       "}",
-      "button:hover, input[type=\"submit\"]:hover { background-color: var(--primary_fixed) !important; }",
-      "",
       "table, th, td { border-color: var(--outline_variant) !important; }",
-      "th { background-color: var(--surface_container_high) !important; color: var(--on_surface) !important; }",
-      "tr:nth-child(even) td { background-color: var(--surface_container_low) !important; }",
-      "",
-      "::selection { background: var(--primary_container) !important; color: var(--on_primary_container) !important; }",
+      "th { background-color: var(--surface_container_high) !important; }",
+      "hr { border-color: var(--outline_variant) !important; }",
+      "::selection {",
+      "    background-color: var(--primary_container) !important;",
+      "    color: var(--on_primary_container) !important;",
+      "}",
+      "::placeholder { color: var(--on_surface_variant) !important; }",
+      "* { scrollbar-color: var(--outline) var(--surface_container_low) !important; }",
     ].join("\n");
   }
 
-  const indent = (lines) => lines.map((l) => (l ? "    " + l : "")).join("\n");
+  const indent = (lines) => lines.map((l) => (l ? `    ${l}` : "")).join("\n");
 
-  // Filter out unused raw palette swatch dumps (e.g. pink-100..900, orange-100..900)
-  function isSemanticThemeVar(name) {
-    const n = name.toLowerCase();
-    if (/^--(pink|orange|yellow|purple|cyan|teal|lime|amber|violet|fuchsia|rose|emerald|sky)-[0-9]+[a-z]?$/.test(n)) {
-      return false;
-    }
-    return true;
-  }
+  /* Raw swatch dumps (pink-100 … pink-900) are not semantic theme tokens. */
+  const SWATCH_DUMP =
+    /^--(pink|orange|yellow|purple|cyan|teal|lime|amber|violet|fuchsia|rose|emerald|sky)-[0-9]+[a-z]?$/;
+  const isSemanticThemeVar = (name) => !SWATCH_DUMP.test(name.toLowerCase());
 
   function scan() {
-    customPropIndex = null;
+    dropIndex();
     const groups = new Map();
     const unmapped = [];
     let found = 0;
@@ -454,30 +495,31 @@
       found++;
       const token = matchKnownFramework(name) || classifyByValueAndName(name, col);
       if (!token || !TOKEN_NAMES.has(token)) { unmapped.push(name); continue; }
-      if ("--" + token === name) continue;
-      const key = col.shape === "rgb-triplet" ? token + "\u0000rgb"
-                : col.shape === "hsl-triplet" ? token + "\u0000hsl" : token;
+      if (`--${token}` === name) continue;
+      const key = col.shape === "rgb-triplet" ? `${token}\u0000rgb`
+        : col.shape === "hsl-triplet" ? `${token}\u0000hsl` : token;
       (groups.get(key) ?? groups.set(key, []).get(key)).push(name);
     }
 
     const body = [];
     let mapped = 0;
-
-    // A site with fewer than 3 variables is not variable-driven (e.g. X.com, static HTML).
-    // Always trigger the full structural theme so layout containers, tweets, and buttons are themed.
     let variableCount = 0;
     for (const list of groups.values()) variableCount += list.length;
 
-    if (variableCount >= 3) {
+    /* Fewer than three mappable variables means the page is not variable
+     * driven; only then do we reach for the (very broad) structural theme. */
+    const kind = variableCount >= 3 ? "tokens" : "structural";
+
+    if (kind === "tokens") {
       body.push(`${detectRootScopes()} {`, "    color-scheme: dark !important;");
       for (const [token] of TOKENS) {
         for (const suffix of ["", "\u0000rgb", "\u0000hsl"]) {
           const names = groups.get(token + suffix);
           if (!names) continue;
           const label = suffix === "\u0000rgb" ? `${token} (rgb components)`
-                      : suffix === "\u0000hsl" ? `${token} (hsl components)` : token;
+            : suffix === "\u0000hsl" ? `${token} (hsl components)` : token;
           body.push(`    /* ${label} */`);
-          for (const n of names.sort()) {
+          for (const n of names.toSorted()) {
             body.push(`    ${n}: var(--${token}) !important;`);
             mapped++;
           }
@@ -486,28 +528,77 @@
       body.push("}");
     } else {
       body.push(structuralFallback());
-      mapped = 1;
+      mapped = variableCount || 1;
     }
 
     if (unmapped.length) {
-      const sorted = unmapped.sort();
+      const sorted = unmapped.toSorted();
       const shown = sorted.slice(0, 30).join(", ") +
         (sorted.length > 30 ? `, +${sorted.length - 30} more` : "");
       body.push("", `/* unmapped: ${shown} */`);
     }
 
-    return { ok: true, found, mapped, body: indent(body.join("\n").split("\n")) };
+    dropProbe();
+    return {
+      ok: true, kind, found, mapped, palette: paletteLoaded(),
+      body: indent(body.join("\n").split("\n")),
+    };
   }
 
-  /* ══ VISUAL PICKER ═════════════════════════════════════════════════════ */
+  /* ══ VISUAL PICKER ══════════════════════════════════════════════════ */
+  const LIMITS = { RULES: 600, DECL: 4096, SEL: 512, BODY: 512 * 1024 };
+
   const S = {
-    active: false, hydrated: false, note: "", rev: 0,
-    rules: [], undo: [], redo: [], stack: [], depth: 0,
+    active: false, hydrated: false, note: "", rev: 0, warnings: [],
+    rules: Object.freeze([]), undo: [], redo: [], stack: [], depth: 0,
     locked: false, targetMode: "selector", group: "bg",
-    elementVars: [], dialogPos: null, raf: 0, saveSeq: 0, saving: null,
+    elementVars: [], panelPos: null, raf: 0, editKey: null, generation: 0,
   };
 
-  const KEY_RE = /\/\*\s*dusky\s+key=([^\s*]+)\s*(?:\|\s*(.*?)\s*)?\*\/\s*$/;
+  const US = "\u001F";
+  const ROOT_ARMOR = ":root:root:root";
+  const ORIGIN = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+  /* ── Rule model ────────────────────────────────────────────────────── */
+  /* encodeURIComponent leaves !'()* alone and KEY_RE stops at '*', so a
+   * selector like [class*="icon"] would round-trip TRUNCATED. Escape the full
+   * RFC 3986 sub-delims set. */
+  const enc = (s) => encodeURIComponent(String(s))
+    .replaceAll(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+  const dec = (s) => { try { return decodeURIComponent(s); } catch { return s; } };
+  const KEY_RE = /\/\*\s*dusky\s+key=([^\s*|]+)\s*(?:\|\s*([^*]*?)\s*)?\*\/\s*$/;
+
+  const oneLine = (s) => String(s ?? "").replaceAll(/\s*[\r\n]+\s*/g, " ").trim();
+  const safeMeta = (s) => oneLine(s).replaceAll("*/", "* /").slice(0, 160);
+
+  const selKey = (sel, group) => `sel${US}${sel}${US}${group}`;
+  const varKey = (scope, name) => `var${US}${scope}${US}${name}`;
+  const rawKey = (css) => `raw${US}${css}`;
+
+  /* One parser for every key shape — no more positional indexing. */
+  function decodeKey(key) {
+    const [kind, a, b] = String(key ?? "").split(US);
+    if (kind === "var" && a && b?.startsWith("--")) return { kind: "var", scope: a, name: b };
+    if (kind === "raw" && a !== undefined) return { kind: "raw", css: a };
+    if (kind === "sel" && a && b) return { kind: "sel", sel: a, group: b };
+    return { kind: "invalid" };
+  }
+
+  const propsOf = (decl) => [...new Set(String(decl).split(";")
+    .map((d) => d.split(":")[0].trim().toLowerCase()).filter(Boolean))].toSorted();
+
+  const PROP_GROUP = [
+    [/^background(-color|-image)?$/, "bg"], [/^color$/, "text"],
+    [/^border(-[a-z]+)?-color$/, "border"], [/^fill$/, "fill"], [/^display$/, "display"],
+  ];
+  function groupOfDecl(decl) {
+    const props = propsOf(decl);
+    const first = props[0] ?? "";
+    if (first.startsWith("--")) return "var";
+    for (const [re, g] of PROP_GROUP) if (re.test(first)) return g;
+    return `custom:${props.join(",")}`;
+  }
+  const tokenOf = (decl) => /var\(\s*--([a-z0-9_]+)/i.exec(String(decl ?? ""))?.[1] ?? "";
 
   function splitRule(text) {
     let depth = 0, inStr = 0, selEnd = -1, bodyStart = -1, bodyEnd = -1;
@@ -526,32 +617,40 @@
     const trimmed = line.trim();
     if (!trimmed) return null;
     const km = KEY_RE.exec(trimmed);
-    const [, rawKey = "", rawMeta = ""] = km || [];
-    const key = rawKey ? decodeURIComponent(rawKey) : "";
-    const meta = rawMeta;
+    const storedKey = km ? dec(km[1]) : "";
+    const meta0 = km ? (km[2] ?? "").trim() : "";
     const css = km ? trimmed.slice(0, km.index).trim() : trimmed;
+    if (!css) return null;
+
     const parts = splitRule(css);
-    if (!parts) return { raw: css, key: key || "raw\u001F" + css, meta: meta || "manual" };
-    return {
-      sel: parts.sel,
-      decl: parts.decl,
-      meta: meta || "restored",
-      key: key || "sel\u001F" + parts.sel + "\u001F" + (parts.decl.split(":")[0] || "?").trim(),
-    };
+    if (!parts?.sel || !parts?.decl) {
+      return { raw: css, meta: meta0 || "manual", key: rawKey(css) };
+    }
+    const decl = oneLine(parts.decl);
+    const group = groupOfDecl(decl);
+    const derived = group === "var" ? varKey(parts.sel, propsOf(decl)[0]) : selKey(parts.sel, group);
+    /* A stored key is honoured only when it parses AND its shape matches the
+     * CSS it labels; otherwise the CSS is authoritative (self-healing files). */
+    const stored = decodeKey(storedKey);
+    const keep = stored.kind === "var"
+      ? group === "var" && stored.scope === parts.sel
+      : stored.kind === "sel" && group !== "var" && stored.sel === parts.sel;
+    return { sel: parts.sel, decl, meta: meta0 || "restored", key: keep ? storedKey : derived };
   }
+  const parseLines = (text) => String(text ?? "").split("\n").map(parseRule).filter(Boolean);
 
   const ruleCss = (r) => (r.raw !== undefined ? r.raw : `${r.sel} { ${r.decl} }`);
   const ruleLine = (r) =>
-    `${ruleCss(r)} /* dusky key=${encodeURIComponent(r.key)}${r.meta ? " | " + r.meta : ""} */`;
+    `${ruleCss(r)} /* dusky key=${enc(r.key)}${r.meta ? ` | ${safeMeta(r.meta)}` : ""} */`;
+  const serialise = () => S.rules.map((r) => `    ${ruleLine(r)}`).join("\n");
 
   const target = () => S.stack.at(S.depth) ?? null;
-  const ROOT_ARMOR = ":root:root:root";
 
   const GROUPS = {
-    bg:     { extra: { label: "👻 Transparent",   css: "background: transparent !important; box-shadow: none !important;", meta: "bg: transparent" } },
-    text:   { extra: { label: "↩ Inherit colour", css: "color: inherit !important;",         meta: "text: inherit" } },
-    border: { extra: { label: "⊘ No border",      css: "border-color: transparent !important;", meta: "border: none" } },
-    fill:   { extra: { label: "🎨 currentColor",  css: "fill: currentColor !important;",     meta: "fill: currentColor" } },
+    bg: { label: "Background", extra: { label: "👻 Transparent", css: "background: transparent !important; box-shadow: none !important;", meta: "bg: transparent" } },
+    text: { label: "Text", extra: { label: "↩ Inherit colour", css: "color: inherit !important;", meta: "text: inherit" } },
+    border: { label: "Border", extra: { label: "⊘ No border", css: "border-color: transparent !important;", meta: "border: none" } },
+    fill: { label: "Fill", extra: { label: "🎨 currentColor", css: "fill: currentColor !important;", meta: "fill: currentColor" } },
   };
 
   const PAIRED_ON = {
@@ -569,10 +668,25 @@
     return `background-color: var(--${token}) !important;` +
       (on ? ` color: var(--${on}) !important; border-color: var(--outline_variant) !important;` : "");
   }
+  const colourGroup = (g) => (GROUPS[g] ? g : "bg");
 
-  const important = (text) =>
-    text.split(";").map((d) => d.trim()).filter(Boolean)
-        .map((d) => (/!important$/i.test(d) ? d : d + " !important") + ";").join(" ");
+  const important = (text) => text.split(";").map((d) => d.trim()).filter(Boolean)
+    .map((d) => `${/!important\s*$/i.test(d) ? d : `${d} !important`};`).join(" ");
+
+  function validSelector(sel) {
+    if (typeof sel !== "string" || !sel || sel.length > LIMITS.SEL) return false;
+    try { document.querySelector(sel); return true; } catch { return false; }
+  }
+
+  /* Validate a declaration list by parsing it into a detached style object. */
+  function normaliseDecl(text) {
+    const src = oneLine(text);
+    if (!src || src.length > LIMITS.DECL) return "";
+    const probe = document.createElement("div");
+    try { probe.style.cssText = src; } catch { return ""; }
+    if (!probe.style.length && !/--[\w-]+\s*:/.test(src)) return "";
+    return important(src);
+  }
 
   function getElementVars(elm) {
     if (elm?.nodeType !== 1) return [];
@@ -580,24 +694,16 @@
     const seen = new Set();
     const out = [];
     const add = (prop) => {
-      if (!prop.startsWith("--") || skipVar(prop) || seen.has(prop)) return;
+      if (!prop?.startsWith("--") || skipVar(prop) || seen.has(prop)) return;
       const v = cs.getPropertyValue(prop).trim();
       if (!v) return;
       seen.add(prop);
-      out.push({ name: prop, value: v.length > 44 ? v.slice(0, 41) + "…" : v });
+      out.push({ name: prop, value: v.length > 44 ? `${v.slice(0, 41)}…` : v });
     };
-
     for (const cls of elm.classList) {
-      const arb = /^[a-z-]+-\((--[\w-]+)\)$/.exec(cls);
-      if (arb) {
-        const [, arbVar] = arb;
-        add(arbVar);
-      }
-      const tok = /^[a-z-]+-token-([\w-]+)$/.exec(cls);
-      if (tok) {
-        const [, tokName] = tok;
-        add("--" + tokName);
-      }
+      add(/^[a-z-]+-\((--[\w-]+)\)$/.exec(cls)?.[1]);
+      const tok = /^[a-z-]+-token-([\w-]+)$/.exec(cls)?.[1];
+      if (tok) add(`--${tok}`);
     }
     for (const p of elm.style) add(p);
     for (const { sel, props } of propIndex()) {
@@ -606,62 +712,131 @@
       if (hit) for (const p of props) add(p);
     }
     for (const prop of ["background-color", "color", "border-color", "fill"]) {
-      const used = /var\((--[\w-]+)/.exec(cs.getPropertyValue(prop));
-      if (used) {
-        const [, usedVar] = used;
-        add(usedVar);
-      }
+      add(/var\((--[\w-]+)/.exec(cs.getPropertyValue(prop))?.[1]);
     }
     return out;
   }
 
-  /* ── Live style injection ────────────────────────────────────────────── */
-  const liveStyle = document.createElement("style");
-  const hoverStyle = document.createElement("style");
-  function mountStyles() {
-    if (!liveStyle.isConnected) (document.head || document.documentElement).append(liveStyle, hoverStyle);
-  }
-  const renderLive = () => { mountStyles(); liveStyle.textContent = S.rules.map(ruleCss).join("\n"); };
-  const setHover = (css) => { mountStyles(); hoverStyle.textContent = css || ""; };
+  /* ══ STYLE ENGINE — one adopted sheet, two cascade layers ═══════════ */
+  /* @layer dusky.preview, dusky.live;  ⇒ for !important declarations the
+   * EARLIEST layer wins (CSS Cascade 5 §layer ordering), so the preview always
+   * beats the live rule, and both beat the site's unlayered !important CSS. */
+  const SHEET = new CSSStyleSheet();
+  let liveCss = "";
+  let previewCss = "";
 
-  /* ── Shadow UI ───────────────────────────────────────────────────────── */
+  function flushSheet() {
+    SHEET.replaceSync(
+      "@layer dusky.preview, dusky.live;\n" +
+      `@layer dusky.live{\n${liveCss}\n}\n` +
+      `@layer dusky.preview{\n${previewCss}\n}\n`,
+    );
+    if (!document.adoptedStyleSheets.includes(SHEET)) {
+      document.adoptedStyleSheets = [...document.adoptedStyleSheets, SHEET];
+    }
+  }
+  function detachSheet() {
+    liveCss = previewCss = "";
+    document.adoptedStyleSheets = document.adoptedStyleSheets.filter((s) => s !== SHEET);
+  }
+
+  const renderLive = () => { liveCss = S.rules.map(ruleCss).join("\n"); flushSheet(); };
+
+  const OUTLINE = "outline:2px dashed #e6c280 !important;outline-offset:-2px !important";
+
+  /* THE single preview entry point — pick mode, edit mode, chips, drawer rows
+   * and the extra buttons all go through here, so they cannot diverge. */
+  const Preview = {
+    show(spec) {
+      if (!spec) return Preview.clear();
+      const chunks = [];
+      if (spec.highlight && validSelector(spec.highlight)) {
+        chunks.push(`${spec.highlight}{${OUTLINE}}`);
+      }
+      if (spec.css) chunks.push(spec.css);
+      previewCss = chunks.join("\n");
+      flushSheet();
+    },
+    clear() { previewCss = ""; flushSheet(); },
+  };
+
+  /* Build a preview spec for ANY rule key + token. Used by edit mode. */
+  function previewForKey(key, sel, decl, token) {
+    const k = decodeKey(key);
+    if (k.kind === "var") {
+      const scope = sel || k.scope || ROOT_ARMOR;
+      return token
+        ? { highlight: scope === ROOT_ARMOR ? "" : scope, css: `${scope}{${k.name}: var(--${token}) !important}` }
+        : { highlight: scope === ROOT_ARMOR ? "" : scope, css: "" };
+    }
+    if (k.kind === "raw") return { highlight: "", css: "" };
+    const useSel = sel || k.sel;
+    if (!token) return { highlight: useSel, css: "" };
+    if (k.group === "display") {
+      /* A hidden element cannot show a colour: preview the un-hide instead. */
+      return { highlight: useSel, css: `${useSel}{display:revert !important;${OUTLINE}}` };
+    }
+    if (k.group?.startsWith("custom:")) {
+      /* Substitute the token into the existing var() if the rule has one,
+       * otherwise just highlight — never lie with an unrelated background. */
+      const swapped = String(decl ?? "").replaceAll(/var\(\s*--[a-z0-9_]+/gi, `var(--${token}`);
+      return { highlight: useSel, css: swapped === decl ? "" : `${useSel}{${swapped}}` };
+    }
+    return { highlight: useSel, css: `${useSel}{${declFor(colourGroup(k.group), token)}}` };
+  }
+
+  /* ══ Shadow UI ══════════════════════════════════════════════════════ */
   const UI_CSS = `
 :host{all:initial!important;display:block!important;position:fixed!important;inset:0 auto auto 0!important;width:0!important;height:0!important;overflow:visible!important;z-index:2147483647!important;pointer-events:none!important;isolation:isolate!important}
-*{box-sizing:border-box}
-.mask{position:fixed;z-index:2147483646;display:none;pointer-events:none!important;border-radius:4px;outline:2px dashed #e6c280;box-shadow:0 0 0 200vmax rgba(18,15,12,.6)}
-.panel{position:fixed;z-index:2147483647;pointer-events:auto;background:#191614;color:#f5ebe0;border:1px solid #d4a359;border-radius:10px;box-shadow:0 12px 40px rgba(0,0,0,.85);font:12px/1.4 system-ui,sans-serif;user-select:none}
-.bar{top:12px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:8px;padding:6px 10px;white-space:nowrap;cursor:grab;touch-action:none;max-width:calc(100vw - 24px)}
-.grip{opacity:.5;padding:0 2px;cursor:grab}
-.title{font-weight:700;color:#e6c280}
-.info{max-width:340px;overflow:hidden;text-overflow:ellipsis;color:#c4b8aa;font:11px ui-monospace,monospace}
-.state{font-size:11px;color:#c4b8aa}.state.ok{color:#81c784}.state.err{color:#e57373}.state.warn{color:#e6c280}
-button{font:inherit;color:#f5ebe0;background:#2d2722;border:1px solid #3d342c;border-radius:6px;padding:4px 8px;cursor:pointer;white-space:nowrap}
-button:hover:not(:disabled){border-color:#d4a359}button:disabled{opacity:.4;cursor:default}
-button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid #e6c280;outline-offset:1px}
-.x{background:#b8545e;border-color:#b8545e;color:#fff;font-weight:700}
-.grow{flex:1}
-.dlg{top:64px;right:16px;width:430px;max-width:calc(100vw - 32px);max-height:calc(100vh - 96px);overflow:auto;padding:12px;outline:none;transition:opacity .15s}
-.dlg.ghost:not(:hover):not(:focus-within){opacity:.25}
-.head{display:flex;align-items:center;gap:6px;padding-bottom:8px;margin-bottom:8px;border-bottom:1px solid #3d342c;cursor:grab;touch-action:none}
-.head .title{flex:1}
-.row{display:flex;align-items:center;gap:6px;margin:6px 0}
-.lbl{flex:none;width:68px;color:#c4b8aa;font-size:11px}
-.tag{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#e6c280;font:11px ui-monospace,monospace}
-input[type=range]{flex:1;accent-color:#e6c280;margin:0}
-select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;color:#f5ebe0;background:#25201c;border:1px solid #3d342c;border-radius:6px;padding:5px 6px;user-select:text}
-.seg{flex:1;display:flex}.seg button{flex:1;border-radius:0}.seg button:first-child{border-radius:6px 0 0 6px}.seg button:last-child{border-radius:0 6px 6px 0}
-.seg button[aria-pressed=true]{background:#e6c280;border-color:#e6c280;color:#191614;font-weight:700}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:4px;margin:8px 0;max-height:236px;overflow-y:auto}
-.grid button{display:flex;align-items:center;gap:7px;text-align:left;padding:4px 7px}
-.sw{flex:none;width:13px;height:13px;border-radius:50%;border:1px solid #55493d}
-.hint{margin:8px 0 0;color:#8f857a;font-size:10.5px}
-.drawer{bottom:16px;right:16px;width:400px;max-width:calc(100vw - 32px);max-height:60vh;padding:12px;display:flex;flex-direction:column}
-.list{overflow:auto;display:flex;flex-direction:column;gap:4px}
-.item{display:flex;align-items:center;gap:6px;padding:4px 6px;background:#25201c;border:1px solid #3d342c;border-radius:6px}
-.item:hover{border-color:#d4a359}
-.item .sel{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:11px ui-monospace,monospace}
-.item .meta{flex:none;color:#e6c280;font-size:10.5px}
-.item button{padding:1px 6px}`;
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+button,input,select,textarea{font:inherit;color:inherit;background:none;border:0}
+.mask{position:fixed;display:none;pointer-events:none;outline:2px dashed #e6c280;outline-offset:-2px;background:rgba(230,194,128,.07);border-radius:2px}
+.panel{position:fixed;pointer-events:auto;background:#191614;color:#f5ebe0;border:1px solid #3d342c;border-radius:10px;box-shadow:0 14px 44px rgba(0,0,0,.65);font:13px/1.45 system-ui,sans-serif;display:flex;flex-direction:column;gap:6px;padding:8px;transition:opacity .12s ease}
+.panel.ghost{opacity:.25}
+.panel.ghost:hover,.panel.ghost:focus-within{opacity:1}
+.bar{top:10px;left:50%;transform:translateX(-50%);flex-direction:row;align-items:center;gap:6px;padding:6px 8px;max-width:min(96vw,980px)}
+.dlg{top:64px;right:16px;width:440px;max-height:calc(100vh - 88px);overflow:auto}
+.drawer{right:16px;bottom:16px;width:420px;max-height:62vh;overflow:hidden}
+.head{display:flex;align-items:center;gap:6px;cursor:grab;user-select:none}
+.head:active{cursor:grabbing}
+.grip{color:#6d645a;font-size:12px}
+.title{flex:1;font-weight:700;color:#e6c280;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.info{color:#c4b8aa;font:11.5px ui-monospace,monospace;max-width:38ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.state{font-size:11px;color:#c4b8aa;max-width:34ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.state.ok{color:#81c784}.state.err{color:#e57373}.state.warn{color:#e6c280}
+.panel button{cursor:pointer;background:#2d2722;border:1px solid #3d342c;border-radius:7px;padding:4px 8px;color:#f5ebe0;white-space:nowrap}
+.panel button:hover:not(:disabled){border-color:#d4a359}
+.panel button:disabled{opacity:.4;cursor:default}
+.panel button:focus-visible,.panel select:focus-visible,.panel input:focus-visible,.panel textarea:focus-visible{outline:2px solid #e6c280;outline-offset:1px}
+.panel button.x{border-color:#6d3b40;color:#ffb4ab}
+.panel button.grow{flex:1;justify-content:center;text-align:center}
+.row{display:flex;align-items:center;gap:6px}
+.lbl{flex:0 0 68px;color:#8f857a;font-size:11.5px}
+.tag{flex:1;font:11.5px ui-monospace,monospace;color:#e6c280;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.panel select,.panel input[type=text],.panel textarea{flex:1;min-width:0;background:#0f0d0c;border:1px solid #3d342c;border-radius:7px;padding:4px 6px;font:11.5px ui-monospace,monospace;color:#f5ebe0}
+.panel textarea{min-height:64px;resize:vertical}
+.panel input[type=range]{flex:1;accent-color:#e6c280}
+.seg{display:flex;flex:1;gap:2px;background:#0f0d0c;border:1px solid #3d342c;border-radius:7px;padding:2px}
+.seg button{flex:1;border:0;background:transparent;padding:3px 4px;font-size:11.5px;border-radius:5px}
+.seg button[aria-pressed=true]{background:#e6c280;color:#191614;font-weight:700}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:3px;max-height:230px;overflow:auto;padding:2px;border:1px solid #2a231d;border-radius:8px;background:#0f0d0c}
+.grid button{display:flex;align-items:center;gap:6px;border:1px solid transparent;background:transparent;padding:3px 5px;font-size:11.5px;text-align:left;overflow:hidden}
+.grid button:hover{background:#241f1a;border-color:#3d342c}
+.grid button.act{border-color:#e6c280}
+.grid button.act .lab::after{content:" ✓";color:#e6c280}
+.sw{flex:0 0 13px;height:13px;border-radius:50%;border:1px solid #00000066;box-shadow:inset 0 0 0 1px #ffffff14}
+.lab{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chips{display:flex;flex-wrap:wrap;gap:4px;align-items:center}
+.cap{width:100%;color:#8f857a;font-size:10.5px}
+.chip{display:flex;align-items:center;gap:5px;max-width:200px;font-size:11px}
+.dot{flex:0 0 10px;height:10px;border-radius:50%;border:1px solid #00000066}
+.hint{color:#8f857a;font-size:10.5px}
+.list{overflow:auto;display:flex;flex-direction:column;gap:3px;padding-right:2px}
+.item{display:flex;gap:4px}
+.item .open{flex:1;display:flex;align-items:center;gap:6px;overflow:hidden}
+.item .sel{flex:1;font:11px ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.item .meta{color:#8f857a;font-size:10.5px;white-space:nowrap}
+`;
 
   const BAR_HTML = `
 <span class="grip" aria-hidden="true">⠿</span>
@@ -670,48 +845,80 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
 <span class="state" id="bstate"></span>
 <button id="bundo" title="Undo (Ctrl+Z)">↶</button>
 <button id="bredo" title="Redo (Ctrl+Shift+Z)">↷</button>
-<button id="brules" title="Rules saved for this site">Rules</button>
+<button id="bsync" title="Re-read this site's file from disk">⟲</button>
+<button id="brules" title="Rules saved for this site — click one to recolour it">Rules</button>
 <button id="bexit" class="x" title="Stop picking (Esc)">✕ Exit</button>`;
 
-  const DIALOG_HTML = `
-<div class="head" id="dhead">
+  const PICK_HTML = `
+<div class="head" id="phead">
   <span class="grip" aria-hidden="true">⠿</span>
   <span class="title">🎨 Theme this element</span>
-  <button id="dghost" title="See-through while pointer is elsewhere" aria-pressed="false">👁</button>
-  <button id="dclose" title="Close (Esc)">✕</button>
+  <button id="pghost" title="See-through while the pointer is elsewhere" aria-pressed="false">👁</button>
+  <button id="pclose" title="Close (Esc)">✕</button>
 </div>
-<div class="row"><span class="lbl">Element</span><span class="tag" id="dtag"></span></div>
+<div class="row"><span class="lbl">Element</span><span class="tag" id="ptag"></span></div>
 <div class="row"><span class="lbl">Depth</span>
-  <button id="dchild" title="Down (↓)">↓ child</button>
-  <input type="range" id="dslider" min="0" max="0" value="0" aria-label="DOM depth">
-  <button id="dparent" title="Up (↑)">↑ parent</button>
+  <button id="pchild" title="Down (↓)">↓ child</button>
+  <input type="range" id="pslider" min="0" max="0" value="0" aria-label="DOM depth">
+  <button id="pparent" title="Up (↑)">↑ parent</button>
 </div>
 <div class="row"><span class="lbl">Target</span>
-  <div class="seg" id="dmode-seg" role="group" aria-label="Target mode">
+  <div class="seg" id="pmode" role="group" aria-label="Target mode">
     <button data-mode="selector" aria-pressed="true">Element selector</button>
-    <button data-mode="variable" aria-pressed="false" id="dmode-var-btn">CSS variable</button>
+    <button data-mode="variable" aria-pressed="false" id="pvarbtn">CSS variable</button>
   </div>
 </div>
-<div class="row" id="dsel-row"><span class="lbl">Selector</span><select id="dsel" aria-label="CSS selector"></select></div>
-<div class="row" id="dvar-row" hidden><span class="lbl">Variable</span><select id="dvar" aria-label="CSS variable"></select></div>
-<div class="row" id="dprop-row"><span class="lbl">Property</span>
-  <div class="seg" id="dseg" role="group" aria-label="Property">
+<div class="row" id="psel-row"><span class="lbl">Selector</span><select id="psel" aria-label="CSS selector"></select></div>
+<div class="row" id="pvar-row" hidden><span class="lbl">Variable</span><select id="pvar" aria-label="CSS variable"></select></div>
+<div class="row" id="pscope-row" hidden><span class="lbl">Scope</span><select id="pscope" aria-label="Override scope"></select></div>
+<div class="row" id="pprop-row"><span class="lbl">Property</span>
+  <div class="seg" id="pseg" role="group" aria-label="Property">
     <button data-group="bg" aria-pressed="true">Background</button>
     <button data-group="text" aria-pressed="false">Text</button>
     <button data-group="border" aria-pressed="false">Border</button>
     <button data-group="fill" aria-pressed="false">Fill (SVG)</button>
   </div>
 </div>
-<div class="grid" id="dgrid"></div>
+<div class="chips" id="pexist"></div>
+<div id="pgrid"></div>
 <div class="row">
-  <button id="dextra" class="grow"></button>
-  <button id="dhide" class="x grow" title="display:none — Shift+click on page does this">🙈 Hide element</button>
+  <button id="pextra" class="grow"></button>
+  <button id="phide" class="x grow" title="display:none — Shift+click on the page does this">🙈 Hide element</button>
 </div>
 <div class="row">
-  <input type="text" id="dcustom" placeholder="custom CSS, e.g. border-radius: 8px; opacity: .9" aria-label="Custom CSS">
-  <button id="dapply">Apply</button>
+  <input type="text" id="pcustom" spellcheck="false" placeholder="custom CSS, e.g. border-radius: 8px; opacity: .9" aria-label="Custom CSS">
+  <button id="papply">Apply</button>
 </div>
-<p class="hint">Hover swatch to preview · click to save · ↑ ↓ depth · Esc closes</p>`;
+<p class="hint">Hover or Tab to a swatch to preview · click/Enter applies — the panel stays open · ↑ ↓ change depth · click the page to move · Esc closes</p>`;
+
+  const EDIT_HTML = `
+<div class="head" id="ehead">
+  <span class="grip" aria-hidden="true">⠿</span>
+  <span class="title">✏️ Edit rule</span>
+  <button id="eghost" title="See-through while the pointer is elsewhere" aria-pressed="false">👁</button>
+  <button id="eclose" title="Close (Esc)">✕</button>
+</div>
+<div class="row" id="esel-row"><span class="lbl" id="esel-lbl">Selector</span><input type="text" id="esel" spellcheck="false" aria-label="Selector"></div>
+<div class="row" id="evar-row" hidden><span class="lbl">Variable</span><span class="tag" id="evar"></span></div>
+<div class="row" id="eprop-row"><span class="lbl">Property</span>
+  <div class="seg" id="eseg" role="group" aria-label="Property">
+    <button data-group="bg">Background</button>
+    <button data-group="text">Text</button>
+    <button data-group="border">Border</button>
+    <button data-group="fill">Fill (SVG)</button>
+  </div>
+</div>
+<div id="egrid"></div>
+<div class="row" id="eraw-row" hidden><textarea id="eraw" spellcheck="false" aria-label="Raw CSS"></textarea></div>
+<div class="row" id="ecustom-row">
+  <input type="text" id="ecustom" spellcheck="false" placeholder="declaration, e.g. color: var(--primary)" aria-label="Declaration">
+  <button id="eapply">Apply</button>
+</div>
+<div class="row">
+  <button id="edelete" class="x grow">🗑 Remove rule</button>
+  <button id="edone" class="grow">Done</button>
+</div>
+<p class="hint" id="ehint"></p>`;
 
   const DRAWER_HTML = `
 <div class="head" id="rhead">
@@ -721,25 +928,21 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
   <button id="rclose" title="Close">✕</button>
 </div>
 <div class="list" id="rlist"></div>
-<p class="hint">Hover a rule to highlight · ✕ removes it · saved into the picks region</p>`;
+<p class="hint">Click a rule to recolour or edit it · hover highlights it on the page · ✕ removes it</p>`;
 
-  const hostEl = document.createElement("dusky-picker");
-  for (const [p, v] of Object.entries({
-    all: "initial", display: "block", position: "fixed", top: "0", left: "0",
-    width: "0", height: "0", overflow: "visible", "z-index": "2147483647",
-    "pointer-events": "none", isolation: "isolate",
-  })) hostEl.style.setProperty(p, v, "important");
-
-  const root = hostEl.attachShadow({ mode: "closed" });
-  root.innerHTML = `<style>${UI_CSS}</style><div class="mask" id="mask"></div>`;
+  root.adoptedStyleSheets = [(() => { const s = new CSSStyleSheet(); s.replaceSync(UI_CSS); return s; })()];
+  root.innerHTML = `<div class="mask" id="mask"></div>`;
   const q = (id) => root.getElementById(id);
   const isOurs = (e) => e.composedPath().includes(hostEl);
 
-  let bar = null, dialog = null, drawer = null;
+  let bar = null, panel = null, panelKind = null, drawer = null;
+  /* Every panel publishes how IT previews a token. One contract, two panels. */
+  let previewOf = () => null;
 
   function el(tag, attrs, ...children) {
     const n = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs ?? {})) {
+      if (v === undefined || v === null) continue;
       if (k === "text") n.textContent = v;
       else if (k === "class") n.className = v;
       else if (k === "style") Object.assign(n.style, v);
@@ -751,16 +954,16 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
     return n;
   }
 
-  function drag(panel, handle, onMove) {
+  function drag(p, handle, onMove) {
     handle.addEventListener("pointerdown", (e) => {
       if (e.button !== 0 || e.target.closest("button,input,select,textarea,a,[contenteditable]")) return;
-      const r = panel.getBoundingClientRect();
+      const r = p.getBoundingClientRect();
       const ox = e.clientX - r.left, oy = e.clientY - r.top, w = r.width, h = r.height;
       const ctl = new AbortController();
       const move = (ev) => {
         const x = Math.min(Math.max(0, ev.clientX - ox), Math.max(0, innerWidth - w));
         const y = Math.min(Math.max(0, ev.clientY - oy), Math.max(0, innerHeight - h));
-        Object.assign(panel.style, { left: `${x}px`, top: `${y}px`, right: "auto", bottom: "auto", transform: "none" });
+        Object.assign(p.style, { left: `${x}px`, top: `${y}px`, right: "auto", bottom: "auto", transform: "none" });
         onMove?.(x, y);
       };
       handle.setPointerCapture(e.pointerId);
@@ -774,38 +977,38 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
 
   function drawMask() {
     const m = q("mask"), t = target();
-    if (!t?.isConnected) { m.style.display = "none"; return; }
+    if (!t?.isConnected || panelKind === "edit") { m.style.display = "none"; return; }
     const r = t.getBoundingClientRect();
     Object.assign(m.style, {
       display: "block", left: `${r.left}px`, top: `${r.top}px`,
       width: `${r.width}px`, height: `${r.height}px`,
     });
   }
-  const scheduleMask = () => {
-    S.raf ||= requestAnimationFrame(() => { S.raf = 0; drawMask(); });
-  };
+  const scheduleMask = () => { S.raf ||= requestAnimationFrame(() => { S.raf = 0; drawMask(); }); };
 
+  /* ── Selector synthesis ────────────────────────────────────────────── */
   const SKIP_CLASS = /^(is-|has-|js-|dusky)|^(active|selected|open|hover|focus|focused|visible|hidden|show|shown|collapsed|expanded|disabled|checked|current)$/;
-  const HASHY = /^(css|sc|jsx|jss|svelte|emotion)-|^_[a-z0-9]+$|__[a-z0-9]{5,}$\vert{}^[^-_]*\d[^-_]*$/i;
+  /* The v3 literal contained a stray markup artefact ("$\vert{}") which
+   * silently disabled the "looks like a hash" branch (\v is a vertical tab). */
+  const HASHY = /^(css|sc|jsx|jss|svelte|emotion)-|^_[a-z0-9]+$|__[a-z0-9]{5,}$|^[^-_]*\d[^-_]*$/i;
   const HASHY_ID = /^(radix|aria|headlessui|react-select|__next|mui|floating-ui)-|^:[a-z0-9]+:$/i;
   const TW_UTILITY = /^(flex|grid|block|inline|inline-flex|inline-block|contents|table|hidden|grow|shrink|relative|absolute|fixed|sticky|static|isolate|overflow-.*|truncate|antialiased|box-border|box-content|z-.*|w-.*|h-.*|size-.*|min-w-.*|max-w-.*|min-h-.*|max-h-.*|[pm][trblxy]?-.*|inset-.*|top-.*|left-.*|right-.*|bottom-.*|col-.*|row-.*|order-.*|basis-.*|items-.*|justify-.*|content-.*|place-.*|self-.*|gap-.*|space-.*|divide-.*|cursor-.*|select-.*|pointer-events-.*|rounded.*|shadow.*|opacity-.*|transition.*|duration-.*|ease-.*|animate-.*|scale-.*|rotate-.*|translate-.*|font-.*|text-.*|leading-.*|tracking-.*|whitespace-.*|break-.*|align-.*|list-.*|underline|uppercase|lowercase|capitalize|bg-.*|from-.*|via-.*|to-.*|border(-.*)?|ring-.*|outline-.*|fill-.*|stroke-.*|group|peer|sr-only|not-sr-only)$/i;
 
   const goodClasses = (n) => [...n.classList].filter((c) =>
     !SKIP_CLASS.test(c) && !HASHY.test(c) && !TW_UTILITY.test(c) &&
-    !c.includes(":") && !c.includes("(") && !c.includes("/") && !c.includes("[")
+    !c.includes(":") && !c.includes("(") && !c.includes("/") && !c.includes("["),
   ).slice(0, 3);
 
-  const simple = (n) => n.localName + goodClasses(n).map((c) => "." + CSS.escape(c)).join("");
-  const describe = (n) => simple(n) + (n.id && !HASHY_ID.test(n.id) && !HASHY.test(n.id) ? "#" + CSS.escape(n.id) : "");
+  const simple = (n) => n.localName + goodClasses(n).map((c) => `.${CSS.escape(c)}`).join("");
   const usableId = (n) => !!n.id && !HASHY.test(n.id) && !HASHY_ID.test(n.id);
-  const attrStr = (v) => '"' + v.replaceAll(/["\\]/g, "\\$&") + '"';
+  const describe = (n) => simple(n) + (usableId(n) ? `#${CSS.escape(n.id)}` : "");
 
   function pathSel(n) {
     const parts = [];
     for (let cur = n;
-         cur && cur !== document.body && cur !== document.documentElement && parts.length < 3;
-         cur = cur.parentElement) {
-      if (usableId(cur)) { parts.unshift("#" + CSS.escape(cur.id)); break; }
+      cur && cur !== document.body && cur !== document.documentElement && parts.length < 3;
+      cur = cur.parentElement) {
+      if (usableId(cur)) { parts.unshift(`#${CSS.escape(cur.id)}`); break; }
       let s = simple(cur);
       const sibs = cur.parentElement ? [...cur.parentElement.children] : [];
       let ambiguous = false;
@@ -822,12 +1025,12 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
     if (!n || n === document.documentElement) return [{ sel: "html", count: 1 }];
     if (n === document.body) return [{ sel: "body", count: 1 }];
     const out = [];
-    if (usableId(n)) out.push("#" + CSS.escape(n.id));
+    if (usableId(n)) out.push(`#${CSS.escape(n.id)}`);
     const s = simple(n);
     if (s !== n.localName) out.push(s);
     for (const a of ["role", "aria-label", "data-testid", "data-test-id", "name"]) {
       const v = n.getAttribute(a);
-      if (v && v.length < 60) out.push(`${n.localName}[${a}=${attrStr(v)}]`);
+      if (v && v.length < 60) out.push(`${n.localName}[${a}=${cssString(v)}]`);
     }
     out.push(pathSel(n), n.localName);
     const seen = new Set();
@@ -838,6 +1041,7 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
     }).filter((c) => c.count > 0);
   }
 
+  /* ── Toolbar ───────────────────────────────────────────────────────── */
   function buildBar() {
     bar = el("section", { class: "panel bar", role: "toolbar", "aria-label": "Dusky picker" });
     bar.innerHTML = BAR_HTML;
@@ -845,11 +1049,11 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
     drag(bar, bar);
     q("bundo").addEventListener("click", undo);
     q("bredo").addEventListener("click", redo);
+    q("bsync").addEventListener("click", () => void recover(true));
     q("brules").addEventListener("click", toggleDrawer);
-    q("bexit").addEventListener("click", () => setActive(false));
-    if (S.note) setState("⚠ not saving: " + S.note, "err");
-    else if (!paletteLoaded()) setState("⚠ palette variables not loaded on this page", "warn");
+    q("bexit").addEventListener("click", () => void setActive(false));
     refreshBar();
+    baseState();
   }
 
   function refreshBar() {
@@ -857,176 +1061,475 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
     const t = target();
     q("binfo").textContent = t
       ? `<${describe(t)}>${S.stack.length > 1 ? `  · depth ${S.depth}/${S.stack.length - 1}` : ""}`
-      : "Hover element · click to theme · Shift+click hides · Esc exits";
+      : "Hover an element · click to theme · Shift+click hides · Esc exits";
     q("bundo").disabled = !S.undo.length;
     q("bredo").disabled = !S.redo.length;
     q("brules").textContent = `Rules (${S.rules.length})`;
   }
 
-  function setState(text, cls) {
+  let flashTimer = 0;
+  function setState(text, cls = "") {
     const s = q("bstate");
-    if (s) { s.textContent = text; s.className = "state " + cls; }
+    if (s) { s.textContent = text; s.className = `state ${cls}`; }
+  }
+  function baseState() {
+    if (!S.hydrated) setState(`⚠ NOT SAVING — ${S.note || "host unreachable"} · press ⟲`, "err");
+    else if (S.warnings.length) setState(`⚠ ${S.warnings[0]}`, "warn");
+    else if (!paletteLoaded()) setState("⚠ palette variables not loaded on this page", "warn");
+    else setState("", "");
+  }
+  function flash(text, cls = "ok") {
+    clearTimeout(flashTimer);
+    setState(text, cls);
+    flashTimer = setTimeout(baseState, 2600);
   }
 
-  const selected = () => (dialog ? q("dsel").value : candidates(target()).at(0)?.sel ?? "");
-
-  function outline(extra) {
-    if (S.targetMode === "variable") { setHover(""); return; }
-    const sel = selected();
-    if (!sel) { setHover(""); return; }
-    setHover(`${sel}{outline:2px dashed #e6c280 !important;outline-offset:-2px !important}` +
-             (extra ? `\n${sel}{${extra}}` : ""));
+  /* ── Panels ────────────────────────────────────────────────────────── */
+  const rememberPos = (x, y) => { S.panelPos = { x, y }; };
+  function placePanel(p) {
+    if (S.panelPos) Object.assign(p.style, { left: `${S.panelPos.x}px`, top: `${S.panelPos.y}px`, right: "auto" });
   }
+  function dropPanel() {
+    panel?.remove();
+    panel = null;
+    panelKind = null;
+    previewOf = () => null;
+    S.editKey = null;
+  }
+  function closePanel() {
+    dropPanel();
+    S.locked = false;
+    Preview.clear();
+    drawMask();
+    refreshBar();
+  }
+  const refreshPanel = () => {
+    if (panelKind === "pick") refreshPick();
+    else if (panelKind === "edit") refreshEdit();
+  };
 
-  function openDialog() {
-    dialog?.remove();
-    dialog = el("section", { class: "panel dlg", role: "dialog", "aria-label": "Theme this element", tabindex: "-1" });
-    dialog.innerHTML = DIALOG_HTML;
-    if (S.dialogPos) Object.assign(dialog.style, { left: `${S.dialogPos.x}px`, top: `${S.dialogPos.y}px`, right: "auto" });
-    root.append(dialog);
-    drag(dialog, q("dhead"), (x, y) => { S.dialogPos = { x, y }; });
+  /* ── PaletteGrid: built ONCE, delegated events, never rebuilt ───────
+   * This is the structural fix for the dead edit-mode hover: no refresh can
+   * destroy the node the pointer is resting on, and pointerover bubbles, so a
+   * swatch inserted under a stationary pointer still previews on the next
+   * movement (mouseenter, which does not bubble, never would). */
+  function PaletteGrid({ onHover, onPick }) {
+    const grid = el("div", { class: "grid", role: "listbox", "aria-label": "Palette" });
+    const buttons = new Map();
+    for (const [token, label] of TOKENS) {
+      const b = el("button", { type: "button", "data-token": token, title: `var(--${token})`, tabindex: "-1" },
+        el("i", { class: "sw", style: { background: `var(--${token}, transparent)` } }),
+        el("span", { class: "lab", text: label }));
+      buttons.set(token, b);
+      grid.append(b);
+    }
+    grid.firstElementChild?.setAttribute("tabindex", "0");
 
-    const t = target();
-    S.elementVars = getElementVars(t);
-    S.group = t?.closest("svg") ? "fill" : "bg";
-    S.targetMode = "selector";
+    const tokenFrom = (node) => node?.closest?.("button[data-token]")?.dataset.token ?? null;
 
-    q("dclose").addEventListener("click", closeDialog);
-    q("dghost").addEventListener("click", (e) => {
-      e.currentTarget.setAttribute("aria-pressed", String(dialog.classList.toggle("ghost")));
+    grid.addEventListener("pointerover", (e) => { const t = tokenFrom(e.target); if (t) onHover(t); });
+    grid.addEventListener("pointerleave", () => onHover(null));
+    grid.addEventListener("focusin", (e) => { const t = tokenFrom(e.target); if (t) onHover(t); });
+    grid.addEventListener("focusout", (e) => { if (!grid.contains(e.relatedTarget)) onHover(null); });
+    grid.addEventListener("click", (e) => { const t = tokenFrom(e.target); if (t) onPick(t); });
+    grid.addEventListener("keydown", (e) => {
+      const step = { ArrowRight: 1, ArrowLeft: -1, ArrowDown: 2, ArrowUp: -2 }[e.key];
+      if (!step) return;
+      const items = [...buttons.values()];
+      const i = items.indexOf(e.target.closest("button[data-token]"));
+      const next = items[Math.min(Math.max(0, i + step), items.length - 1)];
+      if (!next || next === e.target) return;
+      for (const b of items) b.tabIndex = -1;
+      next.tabIndex = 0;
+      next.focus();
+      e.preventDefault();
+      e.stopPropagation();
     });
-    q("dslider").addEventListener("input", (e) => { S.depth = Number(e.target.value); retarget(); });
-    q("dchild").addEventListener("click", () => step(-1));
-    q("dparent").addEventListener("click", () => step(1));
-    q("dsel").addEventListener("change", () => outline());
 
-    const modeSeg = q("dmode-seg"), varBtn = q("dmode-var-btn");
+    return {
+      el: grid,
+      setActive(token) {
+        for (const [name, b] of buttons) b.classList.toggle("act", name === token);
+      },
+    };
+  }
+
+  /* ---- pick panel ---- */
+  let pickGrid = null;
+  const selected = () => (panelKind === "pick" ? q("psel").value : candidates(target()).at(0)?.sel ?? "");
+
+  function pickPreviewSpec(token) {
+    if (S.targetMode === "variable") {
+      const name = q("pvar").value;
+      const scope = q("pscope").value || ROOT_ARMOR;
+      if (!name) return { highlight: "", css: "" };
+      return previewForKey(varKey(scope, name), scope, "", token);
+    }
+    const sel = selected();
+    return previewForKey(selKey(sel, S.group), sel, "", token);
+  }
+  const pickPreview = (token) => Preview.show(pickPreviewSpec(token));
+
+  function openPick() {
+    const t = target();
+    if (!t) return;
+    dropPanel();
+    panelKind = "pick";
+    S.locked = true;
+    S.elementVars = getElementVars(t);
+    S.targetMode = "selector";
+    if (t.closest("svg") && S.group === "bg") S.group = "fill";
+
+    panel = el("section", { class: "panel dlg", role: "dialog", "aria-label": "Theme this element", tabindex: "-1" });
+    panel.innerHTML = PICK_HTML;
+    placePanel(panel);
+    root.append(panel);
+    drag(panel, q("phead"), rememberPos);
+
+    previewOf = pickPreviewSpec;
+    pickGrid = PaletteGrid({
+      onHover: (token) => Preview.show(previewOf(token)),
+      onPick: (token) => {
+        if (S.targetMode === "variable") {
+          const name = q("pvar").value;
+          if (!name) return;
+          const sc = q("pscope").value || ROOT_ARMOR;
+          upsert({
+            sel: sc, decl: `${name}: var(--${token}) !important;`,
+            meta: `var ${name} → ${token}`, key: varKey(sc, name),
+          });
+          flash(`✓ ${name} → ${token}`);
+        } else {
+          applySel(declFor(S.group, token), `${S.group}: ${token}`, S.group);
+        }
+      },
+    });
+    q("pgrid").append(pickGrid.el);
+
+    q("pclose").addEventListener("click", closePanel);
+    q("pghost").addEventListener("click", (e) =>
+      e.currentTarget.setAttribute("aria-pressed", String(panel.classList.toggle("ghost"))));
+    q("pslider").addEventListener("input", (e) => { S.depth = Number(e.target.value); retarget(); });
+    q("pchild").addEventListener("click", () => step(-1));
+    q("pparent").addEventListener("click", () => step(1));
+    for (const id of ["psel", "pvar", "pscope"]) {
+      q(id).addEventListener("change", () => refreshPick());
+    }
+
+    const varBtn = q("pvarbtn");
     varBtn.disabled = S.elementVars.length === 0;
     varBtn.title = varBtn.disabled
       ? "No CSS custom properties detected on this element"
       : `${S.elementVars.length} variable(s) detected`;
-
-    modeSeg.addEventListener("click", (e) => {
+    q("pmode").addEventListener("click", (e) => {
       const b = e.target.closest("button[data-mode]");
       if (!b || b.disabled) return;
       S.targetMode = b.dataset.mode;
-      for (const x of modeSeg.children) x.setAttribute("aria-pressed", String(x === b));
-      const isVar = S.targetMode === "variable";
-      q("dsel-row").hidden = isVar;
-      q("dprop-row").hidden = isVar;
-      q("dvar-row").hidden = !isVar;
-      outline();
+      refreshPick();
     });
-
-    const dseg = q("dseg");
-    for (const x of dseg.children) x.setAttribute("aria-pressed", String(x.dataset.group === S.group));
-    dseg.addEventListener("click", (e) => {
+    q("pseg").addEventListener("click", (e) => {
       const b = e.target.closest("button[data-group]");
       if (!b) return;
       S.group = b.dataset.group;
-      for (const x of dseg.children) x.setAttribute("aria-pressed", String(x === b));
-      q("dextra").textContent = GROUPS[S.group].extra.label;
-      outline();
+      refreshPick();
     });
 
-    const grid = q("dgrid");
-    for (const [token, label] of TOKENS) {
-      const b = el("button", { title: `var(--${token})` },
-        el("i", { class: "sw", style: { background: `var(--${token}, transparent)` } }),
-        el("span", { text: label }));
-      b.addEventListener("mouseenter", () => { if (S.targetMode === "selector") outline(declFor(S.group, token)); });
-      b.addEventListener("mouseleave", () => outline());
-      b.addEventListener("click", () => {
-        if (S.targetMode === "variable") {
-          const v = q("dvar").value;
-          if (v) applyVar(v, token);
-        } else {
-          apply(declFor(S.group, token), `${S.group}: ${token}`, S.group);
-        }
-      });
-      grid.append(b);
-    }
-
-    const extra = q("dextra");
-    extra.textContent = GROUPS[S.group].extra.label;
-    extra.addEventListener("mouseenter", () => { if (S.targetMode === "selector") outline(GROUPS[S.group].extra.css); });
-    extra.addEventListener("mouseleave", () => outline());
-    extra.addEventListener("click", () => apply(GROUPS[S.group].extra.css, GROUPS[S.group].extra.meta, S.group));
-
-    const hide = q("dhide");
-    hide.addEventListener("mouseenter", () => outline("display:none !important;"));
-    hide.addEventListener("mouseleave", () => outline());
-    hide.addEventListener("click", () => apply("display: none !important;", "hidden", "display"));
-
-    const custom = q("dcustom");
-    const applyCustom = () => {
-      const v = custom.value.trim();
-      if (v) apply(important(v), "custom", "custom");
+    const hoverExtra = (css) => () => {
+      if (S.targetMode !== "selector") return;
+      const sel = selected();
+      Preview.show({ highlight: sel, css: validSelector(sel) ? `${sel}{${css}}` : "" });
     };
-    q("dapply").addEventListener("click", applyCustom);
+    q("pextra").addEventListener("pointerenter", () => hoverExtra(GROUPS[S.group].extra.css)());
+    q("pextra").addEventListener("focus", () => hoverExtra(GROUPS[S.group].extra.css)());
+    q("pextra").addEventListener("pointerleave", () => pickPreview(null));
+    q("pextra").addEventListener("blur", () => pickPreview(null));
+    q("pextra").addEventListener("click", () =>
+      applySel(GROUPS[S.group].extra.css, GROUPS[S.group].extra.meta, S.group));
+
+    q("phide").addEventListener("pointerenter", hoverExtra("display:none !important;"));
+    q("phide").addEventListener("pointerleave", () => pickPreview(null));
+    q("phide").addEventListener("click", () => applySel("display: none !important;", "hidden", "display"));
+
+    const custom = q("pcustom");
+    const applyCustom = () => {
+      const decl = normaliseDecl(custom.value);
+      if (!decl) { flash("that is not a valid declaration", "err"); return; }
+      applySel(decl, `custom: ${propsOf(decl).join(", ")}`, `custom:${propsOf(decl).join(",")}`);
+      custom.value = "";
+    };
+    q("papply").addEventListener("click", applyCustom);
     custom.addEventListener("keydown", (e) => {
       if (e.key === "Enter") { e.preventDefault(); applyCustom(); }
     });
 
-    refreshDialog();
-    dialog.focus({ preventScroll: true });
+    refreshPick(true);
+    panel.focus({ preventScroll: true });
   }
 
-  function refreshDialog() {
+  function rulesTouching(t) {
+    if (!t) return [];
+    const cands = new Set(candidates(t).map((c) => c.sel));
+    const vars = new Set(S.elementVars.map((v) => v.name));
+    return S.rules.filter((r) => {
+      const k = decodeKey(r.key);
+      if (k.kind === "var") return vars.has(k.name);
+      if (k.kind === "raw") return false;
+      if (cands.has(r.sel)) return true;
+      try { return t.matches(r.sel); } catch { return false; }
+    });
+  }
+
+  let lastPickTarget = null;
+  function refreshPick(full = false) {
     const t = target();
-    if (!dialog || !t) return;
-    q("dtag").textContent = `<${describe(t)}>`;
-    const sl = q("dslider");
+    if (panelKind !== "pick" || !t) return;
+    const changed = full || t !== lastPickTarget;
+    lastPickTarget = t;
+
+    q("ptag").textContent = `<${describe(t)}>`;
+
+    const sl = q("pslider");
     sl.max = String(Math.max(0, S.stack.length - 1));
     sl.value = String(S.depth);
-    q("dchild").disabled = S.depth === 0;
-    q("dparent").disabled = S.depth >= S.stack.length - 1;
+    q("pchild").disabled = S.depth === 0;
+    q("pparent").disabled = S.depth >= S.stack.length - 1;
 
-    const sel = q("dsel");
-    sel.textContent = "";
-    for (const c of candidates(t)) {
-      sel.append(el("option", { value: c.sel, text: `${c.sel}   — ${c.count} match${c.count === 1 ? "" : "es"}` }));
+    const isVar = S.targetMode === "variable";
+    for (const x of q("pmode").children) x.setAttribute("aria-pressed", String(x.dataset.mode === S.targetMode));
+    q("psel-row").hidden = isVar;
+    q("pprop-row").hidden = isVar;
+    q("pvar-row").hidden = !isVar;
+    q("pscope-row").hidden = !isVar;
+    q("pextra").disabled = isVar;
+    q("phide").disabled = isVar;
+
+    /* Selects are rebuilt only when the target element actually changed, so a
+     * selection made inside them is never clobbered by an unrelated refresh. */
+    if (changed) {
+      const cands = candidates(t);
+      const fill = (node, options, keep) => {
+        node.textContent = "";
+        for (const o of options) node.append(el("option", o));
+        if (keep && [...node.options].some((o) => o.value === keep)) node.value = keep;
+      };
+      fill(q("psel"), cands.map((c) => ({
+        value: c.sel, text: `${c.sel}   — ${c.count} match${c.count === 1 ? "" : "es"}`,
+      })), q("psel").value);
+      fill(q("pvar"), S.elementVars.map((v) => ({ value: v.name, text: `${v.name}  =  ${v.value}` })), q("pvar").value);
+      fill(q("pscope"), [
+        { value: ROOT_ARMOR, text: ":root  (whole page)" },
+        ...cands.map((c) => ({ value: c.sel, text: `${c.sel}  (${c.count})` })),
+      ], q("pscope").value);
     }
-    const dvar = q("dvar");
-    dvar.textContent = "";
-    for (const v of S.elementVars) dvar.append(el("option", { value: v.name, text: `${v.name}  =  ${v.value}` }));
-    outline();
+
+    for (const x of q("pseg").children) x.setAttribute("aria-pressed", String(x.dataset.group === S.group));
+    q("pextra").textContent = GROUPS[S.group].extra.label;
+
+    /* existing rules for this element → one click to edit */
+    const chips = q("pexist");
+    chips.textContent = "";
+    const touching = rulesTouching(t);
+    if (touching.length) {
+      chips.append(el("span", { class: "cap", text: "already themed here — click to edit:" }));
+      for (const r of touching) {
+        const tok = tokenOf(r.decl);
+        const chip = el("button", { class: "chip", type: "button", title: ruleCss(r), onclick: () => openEdit(r) },
+          el("i", { class: "dot", style: { background: tok ? `var(--${tok}, transparent)` : "transparent" } }),
+          el("span", { class: "lab", text: r.meta || ruleCss(r) }));
+        chip.addEventListener("pointerenter", () => Preview.show(previewForKey(r.key, r.sel, r.decl, "")));
+        chip.addEventListener("pointerleave", () => pickPreview(null));
+        chips.append(chip);
+      }
+    }
+
+    /* palette: tick whatever is currently applied for this selector+property */
+    const activeKey = isVar
+      ? varKey(q("pscope").value || ROOT_ARMOR, q("pvar").value)
+      : selKey(q("psel").value, S.group);
+    pickGrid?.setActive(tokenOf(S.rules.find((r) => r.key === activeKey)?.decl));
+    pickPreview(null);
   }
 
-  function closeDialog() {
-    dialog?.remove();
-    dialog = null;
-    S.locked = false;
-    setHover("");
-  }
-
-  const selKey = (sel, group) => `sel\u001F${sel}\u001F${group}`;
-  const varKey = (sel, name) => `var\u001F${sel}\u001F${name}`;
-
-  function upsert(rule) {
-    snapshot();
-    const i = S.rules.findIndex((r) => r.key === rule.key);
-    if (i >= 0) S.rules[i] = rule; else S.rules.push(rule);
-    commit();
-  }
-
-  function apply(decl, meta, group) {
+  function applySel(decl, meta, group) {
     const sel = selected();
-    if (!sel) return;
+    if (!validSelector(sel)) { flash("invalid selector", "err"); return; }
+    if (group === "display" && /^(html|body)$/i.test(sel.trim())) {
+      flash("refusing to hide the whole page", "err");
+      return;
+    }
     upsert({ sel, decl, meta, key: selKey(sel, group) });
-    closeDialog();
+    flash(`✓ ${meta}`);
   }
 
-  function applyVar(varName, token) {
-    upsert({
-      sel: ROOT_ARMOR,
-      decl: `${varName}: var(--${token}) !important;`,
-      meta: `var ${varName} → ${token}`,
-      key: varKey(ROOT_ARMOR, varName),
+  /* ---- edit panel ---- */
+  let editGrid = null;
+  const currentEdit = () => S.rules.find((r) => r.key === S.editKey) ?? null;
+
+  function editPreviewSpec(token) {
+    const r = currentEdit();
+    if (!r) return null;
+    /* The selector box may hold an unsaved edit — preview what the user sees. */
+    const sel = r.raw !== undefined ? "" : (q("esel")?.value.trim() || r.sel);
+    return previewForKey(r.key, sel, r.decl, token);
+  }
+
+  function openEdit(rule) {
+    const live = S.rules.find((r) => r.key === rule.key) ?? rule;
+    dropPanel();
+    panelKind = "edit";
+    S.editKey = live.key;
+    S.locked = true;
+    panel = el("section", { class: "panel dlg", role: "dialog", "aria-label": "Edit rule", tabindex: "-1" });
+    panel.innerHTML = EDIT_HTML;
+    placePanel(panel);
+    root.append(panel);
+    drag(panel, q("ehead"), rememberPos);
+
+    previewOf = editPreviewSpec;
+    editGrid = PaletteGrid({
+      onHover: (token) => Preview.show(previewOf(token)),
+      onPick: (token) => editPick(token),
     });
-    closeDialog();
+    q("egrid").append(editGrid.el);
+
+    q("eclose").addEventListener("click", closePanel);
+    q("edone").addEventListener("click", closePanel);
+    q("eghost").addEventListener("click", (e) =>
+      e.currentTarget.setAttribute("aria-pressed", String(panel.classList.toggle("ghost"))));
+    q("edelete").addEventListener("click", () => { removeRule(S.editKey); closePanel(); });
+    q("esel").addEventListener("change", commitSelector);
+    q("esel").addEventListener("input", () => Preview.show(previewOf("")));
+    q("eapply").addEventListener("click", commitDecl);
+    q("ecustom").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); commitDecl(); }
+    });
+    q("eraw").addEventListener("change", commitRaw);
+    q("eseg").addEventListener("click", (e) => {
+      const b = e.target.closest("button[data-group]");
+      const r = currentEdit();
+      if (!b || !r) return;
+      const k = decodeKey(r.key);
+      if (k.kind !== "sel") return;
+      const token = tokenOf(r.decl) || "primary";
+      writeRule(r.key, {
+        sel: r.sel, decl: declFor(b.dataset.group, token),
+        meta: `${b.dataset.group}: ${token}`, key: selKey(r.sel, b.dataset.group),
+      });
+      flash(`✓ ${b.dataset.group}`);
+    });
+
+    drawMask();
+    refreshEdit();
+    /* Preview the rule's own outline immediately so the user sees the target. */
+    Preview.show(previewOf(""));
+    panel.focus({ preventScroll: true });
   }
 
+  function editPick(token) {
+    const r = currentEdit();
+    if (!r) return;
+    const k = decodeKey(r.key);
+    if (k.kind === "var") {
+      writeRule(r.key, {
+        sel: r.sel, decl: `${k.name}: var(--${token}) !important;`,
+        meta: `var ${k.name} → ${token}`, key: r.key,
+      });
+      flash(`✓ ${k.name} → ${token}`);
+      return;
+    }
+    if (k.kind !== "sel") return;
+    if (k.group?.startsWith("custom:") || k.group === "display") {
+      const swapped = String(r.decl).replaceAll(/var\(\s*--[a-z0-9_]+/gi, `var(--${token}`);
+      if (swapped === r.decl) { flash("this rule has no colour to change", "warn"); return; }
+      writeRule(r.key, { ...r, decl: swapped, meta: `${k.group}: ${token}` });
+      flash(`✓ ${token}`);
+      return;
+    }
+    const group = colourGroup(k.group);
+    writeRule(r.key, {
+      sel: r.sel, decl: declFor(group, token),
+      meta: `${group}: ${token}`, key: selKey(r.sel, group),
+    });
+    flash(`✓ ${group}: ${token}`);
+  }
+
+  function commitSelector() {
+    const r = currentEdit();
+    if (!r) return;
+    const sel = q("esel").value.trim();
+    const k = decodeKey(r.key);
+    if (!validSelector(sel)) { flash("invalid selector", "err"); q("esel").value = r.sel ?? ""; return; }
+    if (sel === r.sel) return;
+    const key = k.kind === "var" ? varKey(sel, k.name) : selKey(sel, k.group ?? groupOfDecl(r.decl));
+    writeRule(r.key, { ...r, sel, key });
+    flash("✓ selector updated");
+  }
+
+  function commitDecl() {
+    const r = currentEdit();
+    if (!r || r.raw !== undefined) return;
+    const decl = normaliseDecl(q("ecustom").value);
+    if (!decl) { flash("that is not a valid declaration", "err"); return; }
+    const k = decodeKey(r.key);
+    if (k.kind === "var") {
+      const first = propsOf(decl)[0] ?? "";
+      const name = first.startsWith("--") ? first : k.name;
+      writeRule(r.key, {
+        sel: r.sel, decl, meta: `var ${name} → ${tokenOf(decl) || "custom"}`, key: varKey(r.sel, name),
+      });
+    } else {
+      const group = groupOfDecl(decl);
+      writeRule(r.key, {
+        sel: r.sel, decl, meta: `${group}: ${tokenOf(decl) || "custom"}`, key: selKey(r.sel, group),
+      });
+    }
+    flash("✓ declaration updated");
+  }
+
+  function commitRaw() {
+    const r = currentEdit();
+    if (!r) return;
+    const next = parseRule(oneLine(q("eraw").value));
+    if (!next) { flash("nothing to save", "err"); return; }
+    writeRule(r.key, next);
+    flash("✓ rule updated");
+  }
+
+  /* Refresh mutates state only — it NEVER rebuilds the palette grid. */
+  function refreshEdit() {
+    if (panelKind !== "edit") return;
+    const r = currentEdit();
+    if (!r) { closePanel(); return; }
+    const k = decodeKey(r.key);
+    const isVar = k.kind === "var";
+    const isRaw = r.raw !== undefined;
+
+    q("esel-lbl").textContent = isVar ? "Scope" : "Selector";
+    q("esel-row").hidden = isRaw;
+    if (!isRaw && q("esel") !== root.activeElement) q("esel").value = r.sel;
+    q("evar-row").hidden = !isVar;
+    if (isVar) q("evar").textContent = k.name;
+    q("eprop-row").hidden = isVar || isRaw;
+    q("eraw-row").hidden = !isRaw;
+    if (isRaw && q("eraw") !== root.activeElement) q("eraw").value = r.raw;
+    q("ecustom-row").hidden = isRaw;
+    if (!isRaw && q("ecustom") !== root.activeElement) q("ecustom").value = r.decl;
+    q("egrid").hidden = isRaw;
+
+    const group = k.kind === "sel" ? colourGroup(k.group) : "";
+    for (const b of q("eseg").children) b.setAttribute("aria-pressed", String(b.dataset.group === group));
+    editGrid?.setActive(tokenOf(r.decl));
+
+    q("ehint").textContent = isRaw
+      ? "Hand-written rule — edit the CSS and press Tab/Enter to save it."
+      : isVar
+        ? "Hover or Tab a swatch to preview this variable pointing at another palette colour; click commits. Scope is where the override is declared."
+        : k.group?.startsWith("custom:") || k.group === "display"
+          ? "Hover a swatch to preview substituting the colour inside this rule; click commits."
+          : "Hover or Tab a swatch to preview · click commits · switch Property to convert the rule · the selector is editable.";
+  }
+
+  /* ── Rules drawer ──────────────────────────────────────────────────── */
   function toggleDrawer() {
     if (drawer) { drawer.remove(); drawer = null; return; }
     drawer = el("section", { class: "panel drawer", role: "dialog", "aria-label": "Rules for this site" });
@@ -1035,7 +1538,7 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
     drag(drawer, q("rhead"));
     q("rclose").addEventListener("click", toggleDrawer);
     q("rclear").addEventListener("click", () => {
-      if (S.rules.length) { snapshot(); S.rules = []; commit(); }
+      if (S.rules.length) { snapshot(); S.rules = Object.freeze([]); commit(); }
     });
     refreshDrawer();
   }
@@ -1048,78 +1551,203 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
       list.append(el("p", { class: "hint", text: "No rules yet — click any element on the page." }));
       return;
     }
-    S.rules.forEach((r, i) => {
-      const item = el("div", { class: "item" },
-        el("span", { class: "sel", title: ruleLine(r), text: r.raw !== undefined ? r.raw : r.sel }),
-        el("span", { class: "meta", text: r.meta || "manual" }),
+    for (const r of S.rules) {
+      const tok = tokenOf(r.decl);
+      const open = el("button", { class: "open", type: "button", title: ruleLine(r), onclick: () => openEdit(r) },
+        el("i", { class: "dot", style: { background: tok ? `var(--${tok}, transparent)` : "transparent" } }),
+        el("span", { class: "sel", text: r.raw !== undefined ? r.raw : r.sel }),
+        el("span", { class: "meta", text: r.meta || "manual" }));
+      /* Hover here previews the rule — and leaving restores whatever the open
+       * panel was previewing, WITHOUT rebuilding any panel DOM. */
+      open.addEventListener("pointerenter", () => Preview.show(previewForKey(r.key, r.sel, r.decl, "")));
+      open.addEventListener("pointerleave", () => Preview.show(previewOf(null)));
+      list.append(el("div", { class: "item" }, open,
         el("button", {
-          title: "Remove this rule", text: "✕",
-          onclick: () => { snapshot(); S.rules.splice(i, 1); commit(); },
-        }));
-      if (r.raw === undefined) {
-        item.addEventListener("mouseenter", () =>
-          setHover(`${r.sel}{outline:2px dashed #e6c280 !important;outline-offset:-2px !important}`));
-        item.addEventListener("mouseleave", () => (dialog ? outline() : setHover("")));
-      }
-      list.append(item);
-    });
+          class: "del x", type: "button", title: "Remove this rule", text: "✕",
+          onclick: () => removeRule(r.key),
+        })));
+    }
   }
 
+  /* ══ Mutation / history / persistence ═══════════════════════════════ */
   function snapshot() {
-    S.undo.push(S.rules.slice());
+    S.undo.push(S.rules);                       /* frozen array — safe by value */
     if (S.undo.length > 100) S.undo.shift();
     S.redo = [];
   }
   const undo = () => { if (S.undo.length) { S.redo.push(S.rules); S.rules = S.undo.pop(); commit(); } };
   const redo = () => { if (S.redo.length) { S.undo.push(S.rules); S.rules = S.redo.pop(); commit(); } };
-  const commit = () => { renderLive(); refreshBar(); refreshDrawer(); void persist(); };
 
-  const serialise = () => S.rules.map((r) => "    " + ruleLine(r)).join("\n");
+  function commit() {
+    S.generation++;
+    renderLive();
+    refreshBar();
+    refreshDrawer();
+    refreshPanel();
+    schedulePersist();
+  }
 
+  function validRule(rule) {
+    if (rule.raw !== undefined) return rule.raw.length <= LIMITS.DECL;
+    if (!validSelector(rule.sel)) { flash("invalid selector", "err"); return false; }
+    if (!rule.decl || rule.decl.length > LIMITS.DECL) { flash("declaration too long", "err"); return false; }
+    if (decodeKey(rule.key).kind === "invalid") { flash("internal: bad rule key", "err"); return false; }
+    return true;
+  }
+
+  function upsert(rule) {
+    if (!validRule(rule)) return;
+    const i = S.rules.findIndex((r) => r.key === rule.key);
+    if (i < 0 && S.rules.length >= LIMITS.RULES) { flash(`rule limit (${LIMITS.RULES}) reached`, "err"); return; }
+    snapshot();
+    const next = S.rules.slice();
+    if (i >= 0) next[i] = rule; else next.push(rule);
+    S.rules = Object.freeze(next);
+    commit();
+  }
+
+  /* Replace oldKey in place, even when the new rule has a different key. */
+  function writeRule(oldKey, rule) {
+    if (!validRule(rule)) return;
+    snapshot();
+    const next = S.rules.slice();
+    if (rule.key !== oldKey) {
+      const dup = next.findIndex((r) => r.key === rule.key);
+      if (dup >= 0) next.splice(dup, 1);
+    }
+    const at = next.findIndex((r) => r.key === oldKey);
+    if (at >= 0) next[at] = rule; else next.push(rule);
+    S.rules = Object.freeze(next);
+    S.editKey = rule.key;
+    commit();
+  }
+
+  function removeRule(key) {
+    const i = S.rules.findIndex((r) => r.key === key);
+    if (i < 0) return;
+    snapshot();
+    const next = S.rules.slice();
+    next.splice(i, 1);
+    S.rules = Object.freeze(next);
+    commit();
+  }
+
+  const send = (msg) => browser.runtime.sendMessage({ ...msg, origin: ORIGIN })
+    .catch((e) => ({ ok: false, error: String(e?.message ?? e) }));
+
+  /* Keep local rules, adopt anything new that appeared on disk. */
   function mergeForeign(foreignPicks) {
     const mine = new Map(S.rules.map((r) => [r.key, r]));
     const merged = [];
-    for (const line of String(foreignPicks || "").split("\n")) {
-      const r = parseRule(line);
-      if (!r) continue;
+    for (const r of parseLines(foreignPicks)) {
       if (mine.has(r.key)) { merged.push(mine.get(r.key)); mine.delete(r.key); }
       else merged.push(r);
     }
     merged.push(...mine.values());
-    S.rules = merged;
+    S.rules = Object.freeze(merged);
   }
 
-  async function persist() {
-    const seq = ++S.saveSeq;
-    setState("saving…", "");
-    S.saving = (async () => {
-      const reply = await send({ type: "splice", region: "picks", body: serialise() });
-      if (seq !== S.saveSeq) return;
-      if (reply?.ok) {
-        setState("✓ saved " + String(reply.path).split("/").pop(), "ok");
-      } else {
-        setState("⚠ not saved: " + (reply?.error ?? "no reply"), "err");
-      }
+  let saveInFlight = null;
+
+  function schedulePersist() {
+    if (!S.hydrated) {                          /* never write what we never read */
+      setState(`⚠ NOT SAVING — ${S.note || "host unreachable"} · press ⟲`, "err");
+      return;
+    }
+    if (saveInFlight) return;                   /* generation loop picks it up */
+    saveInFlight = (async () => {
+      try {
+        let written = -1;
+        while (written !== S.generation) {
+          const generation = S.generation;
+          await persistOnce();
+          written = generation;
+        }
+      } finally { saveInFlight = null; }
     })();
-    return S.saving;
   }
 
-  const send = (msg) => browser.runtime.sendMessage(msg)
-    .catch((e) => ({ ok: false, error: String(e?.message ?? e) }));
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  async function persistOnce() {
+    const body = serialise();
+    if (body.length > LIMITS.BODY) {
+      S.note = "picks region exceeds 512 KiB — remove some rules";
+      setState(`⚠ NOT SAVED: ${S.note}`, "err");
+      return;
+    }
+    setState("saving…", "");
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const reply = await send({ type: "splice", region: "picks", body: serialise(), base_rev: S.rev });
+      if (reply?.ok) {
+        S.rev = reply.rev ?? 0;
+        S.note = "";
+        flash(`✓ saved ${String(reply.path ?? "").split("/").pop()}`);
+        return;
+      }
+      if (!reply?.conflict) {
+        S.note = reply?.error ?? "no reply";
+        setState(`⚠ NOT SAVED: ${S.note}`, "err");
+        return;
+      }
+      /* Someone else wrote the file: adopt their rules, keep ours, retry. */
+      const fresh = await send({ type: "read" });
+      if (fresh?.ok) {
+        S.rev = fresh.rev ?? 0;
+        mergeForeign(fresh.picks);
+        renderLive(); refreshBar(); refreshDrawer(); refreshPanel();
+      }
+      await sleep(40 + Math.random() * 120 * (attempt + 1));
+    }
+    S.note = "the file keeps changing on disk";
+    setState(`⚠ NOT SAVED: ${S.note} — press ⟲`, "err");
+  }
 
   async function hydrate(force = false) {
-    if (S.hydrated && !force) return;
+    if (S.hydrated && !force) return true;
     const reply = await send({ type: "read" });
-    if (reply?.ok) {
-      S.hydrated = true;
-      S.note = "";
-      S.rev = reply.rev ?? 0;
-      S.rules = String(reply.picks || "").split("\n").map(parseRule).filter(Boolean);
-    } else {
-      S.note = reply?.error ?? "cannot reach native host";
+    if (!reply?.ok) {
+      S.note = reply?.error ?? "cannot reach the native host";
+      return false;
     }
+    S.hydrated = true;
+    S.note = "";
+    S.rev = reply.rev ?? 0;
+    S.warnings = reply.warnings ?? [];
+    S.rules = Object.freeze(parseLines(reply.picks));
+    return true;
   }
 
+  /* Re-read disk and re-apply anything we have locally that disk lacks. */
+  async function recover(manual = false) {
+    await saveInFlight?.catch(() => {});
+    const local = S.rules;
+    const before = serialise();
+    if (!await hydrate(true)) { baseState(); return false; }
+    const merged = S.rules.slice();
+    for (const r of local) {
+      const i = merged.findIndex((x) => x.key === r.key);
+      if (i >= 0) merged[i] = r; else merged.push(r);
+    }
+    S.rules = Object.freeze(merged);
+    renderLive(); refreshBar(); refreshDrawer(); refreshPanel();
+    if (serialise() !== before) { S.generation++; schedulePersist(); }
+    if (manual) flash("⟲ resynced with disk");
+    return true;
+  }
+
+  /* Disk changed under us (popup saved / deleted): disk wins. */
+  async function rehydrate() {
+    await saveInFlight?.catch(() => {});
+    const before = S.rules;
+    const beforeText = serialise();
+    if (!await hydrate(true)) { baseState(); return; }
+    if (serialise() !== beforeText) S.undo.push(before);
+    renderLive(); refreshBar(); refreshDrawer(); refreshPanel();
+    flash("↻ reloaded from disk");
+  }
+
+  /* ══ Targeting ══════════════════════════════════════════════════════ */
   function setStack(elm) {
     const chain = [];
     for (let n = elm; n?.nodeType === 1; n = n.parentElement) chain.push(n);
@@ -1127,7 +1755,16 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
     S.depth = 0;
     retarget();
   }
-  const retarget = () => { drawMask(); refreshBar(); refreshDialog(); };
+  function retarget() {
+    drawMask();
+    refreshBar();
+    if (panelKind === "pick") {
+      S.elementVars = getElementVars(target());
+      q("pvarbtn").disabled = S.elementVars.length === 0;
+      if (!S.elementVars.length) S.targetMode = "selector";
+      refreshPick(true);
+    }
+  }
   function step(delta) {
     if (!S.stack.length) return;
     S.depth = Math.min(Math.max(0, S.depth + delta), S.stack.length - 1);
@@ -1138,29 +1775,42 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
     return !!a && (a.isContentEditable || /^(input|select|textarea)$/i.test(a.tagName));
   }
 
+  /* ══ Page events ════════════════════════════════════════════════════ */
   const onOver = (e) => { if (!S.locked && !isOurs(e)) setStack(e.target); };
   const onPointerDown = (e) => {
     if (isOurs(e)) return;
     e.preventDefault();
     e.stopImmediatePropagation();
   };
+
   function onClick(e) {
     if (isOurs(e)) return;
     e.preventDefault();
     e.stopImmediatePropagation();
-    if (!S.stack.length) setStack(e.target);
+    const sameTarget = panelKind === "pick" && S.stack.includes(e.target);
+
     if (e.shiftKey) {
-      const sel = candidates(target()).at(0)?.sel;
-      if (sel) upsert({ sel, decl: "display: none !important;", meta: "hidden", key: selKey(sel, "display") });
+      /* Honour the panel's selector + depth when it is open on this element. */
+      if (!sameTarget) { S.locked = false; setStack(e.target); }
+      const sel = sameTarget ? selected() : (candidates(target()).at(0)?.sel ?? "");
+      if (!validSelector(sel)) { flash("no usable selector here", "err"); return; }
+      if (/^(html|body)$/i.test(sel.trim())) { flash("refusing to hide the whole page", "err"); return; }
+      upsert({ sel, decl: "display: none !important;", meta: "hidden", key: selKey(sel, "display") });
+      flash(`✓ hidden ${sel}`);
       return;
     }
-    S.locked = true;
-    openDialog();
+    if (panelKind === "edit") closePanel();
+    S.locked = false;
+    setStack(e.target);
+    openPick();
   }
+
   function onKey(e) {
     const k = e.key, ctrl = e.ctrlKey || e.metaKey;
     if (k === "Escape") {
-      if (dialog) closeDialog();
+      /* First Esc leaves the field (keeping what you typed), second closes. */
+      if (typing()) (root.activeElement ?? document.activeElement)?.blur?.();
+      else if (panel) closePanel();
       else if (drawer) toggleDrawer();
       else void setActive(false);
     } else if (typing()) return;
@@ -1173,26 +1823,31 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
     e.preventDefault();
     e.stopImmediatePropagation();
   }
-  const LISTENERS = [["mouseover", onOver], ["pointerdown", onPointerDown], ["click", onClick], ["keydown", onKey]];
 
+  const LISTENERS = [["mouseover", onOver], ["pointerdown", onPointerDown], ["click", onClick], ["keydown", onKey]];
   let listenerCtl = null;
 
   async function setActive(on) {
     if (on === S.active) return;
     S.active = on;
     if (on) {
-      customPropIndex = null;
+      dropIndex();
       await hydrate(true);
       document.documentElement.append(hostEl);
       buildBar();
       renderLive();
       listenerCtl = new AbortController();
-      const opts = { capture: true, signal: listenerCtl.signal };
+      const { signal } = listenerCtl;
+      const opts = { capture: true, signal };
       for (const [type, fn] of LISTENERS) window.addEventListener(type, fn, opts);
-      window.addEventListener("scroll", scheduleMask, { capture: true, passive: true, signal: listenerCtl.signal });
-      window.addEventListener("resize", scheduleMask, { passive: true, signal: listenerCtl.signal });
+      window.addEventListener("scroll", scheduleMask, { capture: true, passive: true, signal });
+      window.addEventListener("resize", scheduleMask, { passive: true, signal });
+      /* SPA route changes leave the stack pointing at detached nodes. */
+      globalThis.navigation?.addEventListener("navigate", () => {
+        S.stack = []; S.depth = 0; dropIndex(); closePanel();
+      }, { signal });
     } else {
-      closeDialog();
+      closePanel();
       if (drawer) toggleDrawer();
       bar?.remove();
       bar = null;
@@ -1201,32 +1856,32 @@ select,input[type=text]{flex:1;min-width:0;font:11px ui-monospace,monospace;colo
       S.stack = [];
       S.depth = 0;
       S.locked = false;
-      customPropIndex = null;
-      drawMask();
+      dropIndex();
       hostEl.remove();
       dropProbe();
-      await S.saving?.catch(() => {});
+      await saveInFlight?.catch(() => {});
+      detachSheet();
     }
   }
 
+  /* ══ Extension messages ═════════════════════════════════════════════ */
   browser.runtime.onMessage.addListener((msg) => {
     switch (msg?.type) {
       case "ping":
-        return Promise.resolve({ ok: true, active: S.active, rules: S.rules.length });
+        return Promise.resolve({ ok: true, active: S.active, rules: S.rules.length, hydrated: S.hydrated });
       case "scan":
         try { return Promise.resolve(scan()); }
-        catch (e) { return Promise.resolve({ ok: false, error: "Scan failed: " + (e?.message ?? e) }); }
+        catch (e) { return Promise.resolve({ ok: false, error: `Scan failed: ${e?.message ?? e}` }); }
       case "picker":
         return setActive(msg.enable ?? !S.active).then(() => ({ ok: true, active: S.active }));
       case "reset":
-        S.rules = []; S.undo = []; S.redo = []; S.hydrated = true; S.note = ""; S.rev = 0;
-        renderLive(); refreshBar(); refreshDrawer();
+        S.rules = Object.freeze([]); S.undo = []; S.redo = [];
+        S.hydrated = true; S.note = ""; S.rev = 0;
+        renderLive(); refreshBar(); refreshDrawer(); refreshPanel(); baseState();
         return Promise.resolve({ ok: true });
       case "rehydrate":
-        return hydrate(true).then(() => {
-          renderLive(); refreshBar(); refreshDrawer();
-          return { ok: true, rules: S.rules.length };
-        });
+        if (!S.active) { S.hydrated = false; return Promise.resolve({ ok: true, active: false }); }
+        return rehydrate().then(() => ({ ok: true, rules: S.rules.length }));
       default:
         return false;
     }
