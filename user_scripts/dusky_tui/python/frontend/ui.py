@@ -2978,10 +2978,11 @@ Tooltip {
                     r, g, b = color_to_rgb(resolved_color)
                     hex_color = f"#{r:02x}{g:02x}{b:02x}"
 
-                    if not is_theme_variable(val_str):
+                    is_variable = is_theme_variable(val_str)
+                    if not is_variable:
                         txt.append("⬤ ", style=hex_color if exists else self.theme_colors["muted"])
 
-                    if is_theme_variable(val_str):
+                    if is_variable:
                         display_name = None
 
                         # Map to schema hints if possible.
@@ -3269,16 +3270,7 @@ Tooltip {
             first_ol.focus()
             self._update_pagination(first_ol)
 
-        # Telemetry.
         self.telemetry_engine = None
-        for engine in self.engine_pool.values():
-            if hasattr(engine, "get_telemetry"):
-                self.telemetry_engine = engine
-                break
-
-        if self.telemetry_engine:
-            self.query_one("#telemetry-banner").display = True
-            self.set_interval(1.0, self.update_telemetry)
 
         if self.theme_path:
             self.set_interval(1.0, self.watch_theme_file)
@@ -3405,6 +3397,7 @@ Tooltip {
                 self._preset_matrix.ingest_items(global_fresh)
 
     def _mark_boot_complete_if_done(self) -> None:
+        was_complete = self._boot_complete
         self._boot_complete = (
             not self._pending_engine_loads
             and set(self.engine_pool).issubset(
@@ -3421,6 +3414,19 @@ Tooltip {
                 self._option_cache.invalidate_presets()
             self._schema_dirty_counter += 1
             self._refresh_presets_ui()
+        if self._boot_complete and not was_complete:
+            for ekey in self.engine_pool:
+                if ekey not in self._loaded_engines:
+                    continue
+                engine = self.engine_pool[ekey]
+                if hasattr(engine, "get_telemetry"):
+                    self.telemetry_engine = engine
+                    break
+
+            if self.telemetry_engine:
+                self.query_one("#telemetry-banner").display = True
+                self.set_interval(1.0, self.update_telemetry)
+
         if self._boot_complete and self.deferred_load and not self._deferred_started:
             self._deferred_started = True
             self._run_deferred_load()
@@ -4028,7 +4034,10 @@ Tooltip {
         try:
             changed_any = False
 
-            for e_key, engine in self.engine_pool.items():
+            for e_key in self.engine_pool:
+                if e_key in self._failed_engines:
+                    continue
+                engine = self.engine_pool[e_key]
                 if not engine.target_path:
                     continue
 
