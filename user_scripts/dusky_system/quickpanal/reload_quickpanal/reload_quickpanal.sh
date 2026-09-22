@@ -21,8 +21,7 @@ trap '' HUP
 # -----------------------------------------------------------------------------
 readonly APP_NAME="Dusky quickpanal"
 readonly SERVICE_NAME="dusky_quickpanal.service"
-readonly PROCESS_PATTERN='dusky_quickpanal\.py'
-readonly GUI_SCRIPT_PATH="${HOME}/user_scripts/dusky_system/quickpanal/dusky_quickpanal.py"
+readonly PROCESS_PATTERN='^([^[:space:]]*/)?python[0-9.]*([[:space:]]+-[^[:space:]]+)*[[:space:]]+([^[:space:]]*/)?dusky_quickpanal[.]py([[:space:]]|$)'
 
 # Timing Constants (Seconds)
 readonly GRACE_PERIOD_LOOPS=20
@@ -57,7 +56,7 @@ preflight_checks() {
     fi
 
     local -a missing=()
-    for cmd in pgrep systemctl journalctl python3; do
+    for cmd in pgrep systemctl journalctl gdbus flock; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
 
@@ -144,20 +143,11 @@ start_and_verify_service() {
 # UI Activation
 # -----------------------------------------------------------------------------
 activate_ui() {
-    if [[ ! -f "$GUI_SCRIPT_PATH" ]]; then
-        log_warn "UI script not found at: $GUI_SCRIPT_PATH"
-        return 0
-    fi
-
     log_info "Activating UI window via D-Bus..."
-
-    # GTK3 Gtk.Application natively handles D-Bus activation.
-    # Running it sends the signal to the primary daemon and exits immediately.
-    if [[ -x "$GUI_SCRIPT_PATH" ]]; then
-        "$GUI_SCRIPT_PATH" >/dev/null 2>&1
-    else
-        python3 -- "$GUI_SCRIPT_PATH" >/dev/null 2>&1
-    fi
+    # Avoid importing Python/GTK in a second process just to activate the daemon.
+    gdbus call --session --dest org.dusky.quickpanal \
+        --object-path /org/dusky/quickpanal \
+        --method org.freedesktop.Application.Activate '{}' >/dev/null
 }
 
 # -----------------------------------------------------------------------------
@@ -174,6 +164,13 @@ main() {
     done
 
     preflight_checks || return 1
+
+    local reload_lock_fd
+    exec {reload_lock_fd}>"${XDG_RUNTIME_DIR:-/run/user/$UID}/dusky-quickpanel-reload.lock"
+    if ! flock --nonblock "$reload_lock_fd"; then
+        log_info "A restart is already in progress."
+        return 0
+    fi
 
     log_info "Initiating restart for ${C_BOLD}${APP_NAME}${C_RESET}..."
 

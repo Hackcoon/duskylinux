@@ -12,6 +12,7 @@ if not os.environ.get('WAYLAND_DISPLAY') and (not os.environ.get('DISPLAY')):
 import json
 import gc
 import signal
+import time
 import tomllib
 from datetime import datetime
 from pathlib import Path
@@ -65,7 +66,20 @@ def load_or_create_config() -> dict[str, Any]:
             return tomllib.loads(DEFAULT_TOML_CONFIG)
     try:
         with CONFIG_FILE.open('rb') as f:
-            return tomllib.load(f)
+            config = tomllib.load(f)
+        layout = config.get('layout', {})
+        if not isinstance(layout, dict) or any(not isinstance(v, bool) for v in layout.values()):
+            raise ValueError('[layout] must contain boolean settings')
+        toggles = config.get('toggles', [])
+        if not isinstance(toggles, list) or any(
+            not isinstance(toggle, dict) or any(
+                not isinstance(toggle[key], str)
+                for key in ('id', 'icon', 'label', 'tooltip', 'on_left', 'on_middle', 'on_right')
+                if key in toggle
+            ) for toggle in toggles
+        ):
+            raise ValueError('[[toggles]] entries must contain string fields')
+        return config
     except Exception as e:
         LOG.error(f'Error loading {CONFIG_FILE}: {e}')
         return tomllib.loads(DEFAULT_TOML_CONFIG)
@@ -98,9 +112,12 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         self.layout_cfg = self.config.get('layout', {})
         self._timer_id: int | None = None
         self._visible = False
+        self._view_revision = 0
+        self._trim_id: int | None = None
+        self._weather_retry_after = 0.0
         self._updating_radios = False
         self._reposition_scheduled = False
-        self._cpu_last = (0, 0)
+        self._cpu_last: tuple[int, int] | None = None
         self._updating_power = False
         self._slider_rows: list[CompactSliderRow] = []
         self.dynamic_toggles: dict[str, QuickIconToggle] = {}
@@ -110,12 +127,12 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         self._bt_adapter: str | None = None
         self._power_pending_revision = 0
         self._power_pending_profile: str | None = None
+        self._powertop_pending = False
         self.set_default_size(320, -1)
         self.set_size_request(320, -1)
         self.set_resizable(False)
         self.set_decorated(False)
         _add_css_class(self, 'panel-window')
-        self._ignore_grab_cleared_until: float = 0.0
         self.connect('delete-event', self._on_delete_event)
         self.connect('show', self._on_show)
         self.connect('hide', self._on_hide)
@@ -286,7 +303,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
             self.sliders_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
             _add_css_class(self.sliders_box, 'sliders-container')
             if HAS_VOLUME:
-                row = CompactSliderRow("󰕾", "volume", 0.0, 100.0, 1.0, get_volume, volume_submit, self.pool)
+                row = CompactSliderRow("󰕾", "volume", 0.0, 100.0, 1.0, get_volume, volume_submit, self.pool, post_submit_refresh_grace_seconds=BRIGHTNESS_POST_SUBMIT_REFRESH_GRACE_SECONDS)
                 self._slider_rows.append(row)
                 self.sliders_box.pack_start(row, False, False, 0)
             if HAS_BRIGHTNESS:
@@ -378,6 +395,9 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
                 if data and data.get('text'):
                     GLib.idle_add(self._apply_weather, data.get('text').strip())
                     return
+            if time.monotonic() < self._weather_retry_after:
+                return
+            self._weather_retry_after = time.monotonic() + 60.0
             data = fetch_json_output(f'python3 {HOME}/user_scripts/waybar/weather.py')
             if data and data.get('text'):
                 GLib.idle_add(self._apply_weather, data.get('text').strip())
@@ -416,7 +436,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
     def _fetch_idle(self) -> None:
         if not self.dynamic_toggles.get('idle') or not self._visible:
             return
-        r = run_command(['pgrep', '-x', 'hypridle'], timeout=0.8, capture_stdout=True)
+        r = run_command(['pgrep', '-u', str(os.getuid()), '-x', 'hypridle'], timeout=0.8, capture_stdout=True)
         GLib.idle_add(self._apply_idle, r is not None and r.returncode == 0)
 
     def _apply_idle(self, is_active: bool) -> None:
@@ -447,13 +467,6 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         else:
             tg.update_state(icon='preferences-desktop-appearance-symbolic', css_class='normal', tooltip='Visuals: Performance Mode\nLMB: Toggle')
 
-    @staticmethod
-    def _is_bt_rfkill_blocked() -> bool:
-        r = run_command(['rfkill', 'list', 'bluetooth'], timeout=0.5, capture_stdout=True)
-        if r is not None and r.returncode == 0 and r.stdout:
-            return 'Soft blocked: yes' in r.stdout or 'Hard blocked: yes' in r.stdout
-        return False
-
     def _fetch_net_bt_state(self) -> None:
         if not hasattr(self, 'wifi_switch') or not self._visible:
             return
@@ -464,8 +477,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
             adapter = self._bt_adapter if self._bt_adapter in adapters else next(iter(adapters), None)
             bt_r = run_command(['busctl', 'get-property', 'org.bluez', f'/org/bluez/{adapter}', 'org.bluez.Adapter1', 'Powered'], timeout=0.8, capture_stdout=True) if adapter else None
             bt_powered = bt_r is not None and bt_r.returncode == 0 and ('true' in bt_r.stdout)
-            bt_rfkill_blocked = self._is_bt_rfkill_blocked()
-            bt_on = bt_powered and (not bt_rfkill_blocked)
+            bt_on = bt_powered
             GLib.idle_add(self._apply_net_bt_state, wifi_on, bt_on, adapter if bt_r is not None and bt_r.returncode == 0 else None)
         except Exception:
             pass
@@ -552,7 +564,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
                 state = path.read_text(encoding='utf-8').strip().lower()
                 GLib.idle_add(self._apply_power_profile, state)
             else:
-                LOG.warning(f'Power profile state file does not exist: {path}')
+                LOG.debug(f'Power profile state file does not exist: {path}')
         except Exception as e:
             LOG.exception('Failed to fetch power profile: %s', e)
 
@@ -594,6 +606,9 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
     def _on_power_save_button_press(self, button: Gtk.RadioButton, event: Gdk.EventButton) -> bool:
         if event.button != 3:
             return False
+        if self._powertop_pending:
+            return True
+        self._powertop_pending = True
         start_thread('powertop-autotune', self._run_powertop_autotune_worker)
         return True
 
@@ -610,7 +625,12 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         except Exception as e:
             LOG.error(f'Powertop auto-tune failed: {e}')
         finally:
-            GLib.idle_add(_remove_css_class, self.btn_save, 'applying')
+            GLib.idle_add(self._powertop_finished)
+
+    def _powertop_finished(self) -> None:
+        self._powertop_pending = False
+        if self._power_pending_profile is None:
+            _remove_css_class(self.btn_save, 'applying')
 
     def _power_cmd_finished(self, revision: int) -> bool:
         if revision != self._power_pending_revision:
@@ -631,9 +651,13 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
                 parts = [int(p) for p in f.readline().split()[1:]]
             idle = parts[3] + parts[4]
             total = sum(parts[:8])  # Guest time is already included in user/nice.
-            last_idle, last_total = self._cpu_last
-            d_idle, d_total = (idle - last_idle, total - last_total)
-            cpu_usage = 100 * (1.0 - d_idle / d_total) if d_total > 0 else 0
+            cpu_text = '--'
+            if self._cpu_last is not None:
+                last_idle, last_total = self._cpu_last
+                d_idle, d_total = (idle - last_idle, total - last_total)
+                if d_total > 0:
+                    cpu_usage = max(0.0, min(100.0, 100 * (1.0 - d_idle / d_total)))
+                    cpu_text = f'{cpu_usage:.0f}%'
             self._cpu_last = (idle, total)
             mem_tot = mem_av = 0
             with open('/proc/meminfo', 'r', encoding='utf-8') as f:
@@ -645,7 +669,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
                     if mem_tot and mem_av:
                         break
             ram_used = (mem_tot - mem_av) / 1048576
-            GLib.idle_add(self.pill_cpu.set_value, f'{cpu_usage:.0f}%')
+            GLib.idle_add(self.pill_cpu.set_value, cpu_text)
             GLib.idle_add(self.pill_ram.set_value, f'{ram_used:.1f} GB')
         except Exception:
             pass
@@ -711,17 +735,17 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
 
     def _on_unmap(self, *args: Any) -> None:
         if LIBGRAB and self._grab_active:
-            LIBGRAB.destroy_wayland_grab()
             self._grab_active = False
+            LIBGRAB.destroy_wayland_grab()
 
     def handle_toggle_execute(self, cmd: str, button: int = 1) -> None:
         if not cmd:
             return
         if button == 1:
             self.hide()
-            execute_cmd(cmd)
+            execute_cmd(cmd, detached=True)
         else:
-            execute_cmd(cmd)
+            execute_cmd(cmd, detached=True)
             def _single_shot_update() -> bool:
                 if self._visible:
                     self._update_ui_state()
@@ -732,11 +756,15 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         if not cmd:
             return
         self.hide()
-        execute_cmd(cmd)
+        execute_cmd(cmd, detached=True)
 
     def _on_grab_cleared(self) -> None:
+        if not self._grab_active:
+            return
+        revision = self._view_revision
         def safe_hide() -> bool:
-            self.hide()
+            if revision == self._view_revision and self._visible:
+                self.hide()
             return GLib.SOURCE_REMOVE
         GLib.idle_add(safe_hide)
 
@@ -772,8 +800,8 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         if self._visible and self.pool:
             self.pool.submit(self._fetch_position)
 
-    def _apply_monitor_height(self, height: int) -> None:
-        if self._visible and height != self.scrolled_main.get_max_content_height():
+    def _apply_monitor_height(self, height: int, revision: int) -> None:
+        if self._visible and revision == self._view_revision and height != self.scrolled_main.get_max_content_height():
             self.scrolled_main.set_max_content_height(height)
 
     def _fetch_position(self) -> None:
@@ -782,6 +810,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         """
         if not self._visible:
             return
+        revision = self._view_revision
         try:
             r = run_command(['hyprctl', '-j', 'monitors'], timeout=0.8, capture_stdout=True)
             if r is None or r.returncode != 0 or (not r.stdout):
@@ -797,7 +826,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
             mon_h = float(mon['height']) / scale
             if int(mon.get('transform', 0)) % 2:
                 mon_w, mon_h = mon_h, mon_w
-            GLib.idle_add(self._apply_monitor_height, max(1, int(mon_h * 0.85)))
+            GLib.idle_add(self._apply_monitor_height, max(1, int(mon_h * 0.85)), revision)
             r = run_command(['hyprctl', '-j', 'clients'], timeout=0.8, capture_stdout=True)
             if r is None or r.returncode != 0 or (not r.stdout):
                 return
@@ -812,13 +841,22 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
             if win.get('at') == [target_x, target_y]:
                 return
             win_target = f"address:{win['address']}" if win.get('address') else 'class:dusky_quickpanal.py'
-            if self._visible:
+            if self._visible and revision == self._view_revision:
                 run_command(['hyprctl', 'dispatch', f'hl.dsp.window.move({{ window = "{win_target}", x = {target_x}, y = {target_y}, relative = false }})'], timeout=1.0, capture_stdout=True)
         except Exception as e:
             LOG.debug(f'Reposition dispatch error: {e}')
 
     def _on_show(self, *args: Any) -> None:
         self._visible = True
+        self._view_revision += 1
+        self._cpu_last = None
+        if self._trim_id is not None:
+            GLib.source_remove(self._trim_id)
+            self._trim_id = None
+        for row in self._slider_rows:
+            row.resume()
+        if hasattr(self, 'notifications_module'):
+            self.notifications_module.resume()
         app = self.get_application()
         if app and hasattr(app, 'resume_workers'):
             app.resume_workers()
@@ -833,6 +871,11 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
 
     def _on_hide(self, *args: Any) -> None:
         self._visible = False
+        self._view_revision += 1
+        for row in self._slider_rows:
+            row.suspend()
+        if hasattr(self, 'notifications_module'):
+            self.notifications_module.suspend()
         if self._timer_id is not None:
             GLib.source_remove(self._timer_id)
             self._timer_id = None
@@ -841,7 +884,15 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         app = self.get_application()
         if app and hasattr(app, 'suspend_workers'):
             app.suspend_workers()
-        GLib.timeout_add(500, lambda: (self._visible or _reclaim_idle_memory(), GLib.SOURCE_REMOVE)[1])
+        if self._trim_id is not None:
+            GLib.source_remove(self._trim_id)
+        self._trim_id = GLib.timeout_add(500, self._trim_idle)
+
+    def _trim_idle(self) -> bool:
+        self._trim_id = None
+        if not self._visible:
+            _reclaim_idle_memory()
+        return GLib.SOURCE_REMOVE
 
 class QuickPanalApp(Gtk.Application):
 
