@@ -240,9 +240,9 @@ PROFILE_SPEC: Final[dict[str, tuple[FieldSpec, ...]]] = {
         F("manifest_path", "str", "", "Path to target hardware manifest.json for remote builds", wizard=False),
     ),
     "release": (
-        F("channel", "str", "mainline", "Upstream release channel", CHANNEL_CHOICES),
-        F("pin", "str", "", "Exact version pin (e.g. 7.2.3 or 7.3-rc2); empty = newest in channel"),
-        F("allow_rc", "bool", True, "Allow -rc snapshot tarballs (mainline)"),
+        F("channel", "str", "mainline", "Preferred upstream release channel for the interactive picker", CHANNEL_CHOICES),
+        F("pin", "str", "", "Exact unattended version; preselected in the interactive picker (e.g. 7.2.3 or 7.3-rc2)"),
+        F("allow_rc", "bool", True, "Allow -rc as the automatic mainline choice; interactive selection can override"),
         F("min_version", "str", "7.2", "Hard floor; anything older is rejected", wizard=False),
         F("require_signature", "bool", True, "Require PGP or SHA256 verification of release tarballs"),
     ),
@@ -486,5 +486,4 @@ SECURITY_BUNDLES: Final[dict[str, dict[str, Any]]] = {
                  "slab_freelist_hardened": True, "slab_freelist_random": True, "randomize_kstack": True, "ubsan_bounds": True, "lockdown_early": True},
 }
 FOOTPRINT_RANK: Final = {name: i for i, name in enumerate(FOOTPRINT_CHOICES)}
-
 

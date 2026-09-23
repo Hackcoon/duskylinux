@@ -2378,21 +2378,39 @@ def pinned_release(pin: str, releases: Sequence[Release]) -> Release:
     return Release(pin, "pinned", "", cdn_url(pin), cdn_url(pin).replace(".tar.xz", ".tar.sign"))
 
 
-def choose_release(p: KernelProfile, releases: Sequence[Release]) -> Release:
+def choose_release(p: KernelProfile, releases: Sequence[Release], exact_pin: bool = False) -> Release:
     pin = p.g("release", "pin")
-    if pin:
-        rel = pinned_release(pin, releases)
-        ok(f"Pinned release {rel.version}")
-        return rel
     channel = p.g("release", "channel")
+    preferred = pinned_release(pin, releases) if pin else None
     cands = candidates_for(releases, channel, p.g("release", "allow_rc"), p.g("release", "min_version"))
-    if not cands:
-        raise NetworkError(f"No kernel >= {MIN_KERNEL[0]}.{MIN_KERNEL[1]} found in channel '{channel}' (allow_rc={p.g('release', 'allow_rc')})")
-    if not interactive() or ASSUME_YES:
+    if exact_pin or not interactive() or ASSUME_YES:
+        if preferred:
+            ok(f"Pinned release {preferred.version}")
+            return preferred
+        if not cands:
+            raise NetworkError(f"No kernel >= {MIN_KERNEL[0]}.{MIN_KERNEL[1]} found in channel '{channel}' (allow_rc={p.g('release', 'allow_rc')})")
         return cands[0]
-    rule(f"Select kernel release ({channel})")
-    table(["#", "version", "moniker", "released"], [[str(i), r.version, r.moniker, r.released] for i, r in enumerate(cands[:12], 1)])
-    return cands[ask_index("Release", min(12, len(cands)), 1) - 1]
+    floor = max(KVer.parse(p.g("release", "min_version")) or KVer(*MIN_KERNEL), KVer(*MIN_KERNEL), key=lambda k: k.key())
+    listed = {r.version: r for r in releases if r.moniker in CHANNEL_CHOICES and r.kver.key() >= floor.key()}
+    if preferred:
+        listed.setdefault(preferred.version, preferred)
+    selectable = sorted(listed.values(), key=lambda r: r.kver.key(), reverse=True)
+    if not selectable:
+        raise NetworkError(f"No kernel >= {floor} available in kernel.org releases.json; use --pin for an exact version")
+    fallback = next((r for r in selectable if p.g("release", "allow_rc") or not r.is_rc), selectable[0])
+    default_version = preferred.version if preferred else (cands[0].version if cands else fallback.version)
+    default_index = next(i for i, r in enumerate(selectable, 1) if r.version == default_version)
+    rule("Select kernel release (profile preference marked ★)")
+    default_label = "★ profile default" if preferred or cands else "★ fallback (preferred channel unavailable)"
+    rows = [[str(i), r.version, r.moniker, r.released, default_label if i == default_index else ""]
+            for i, r in enumerate(selectable, 1)]
+    unavailable = sorted((r for r in releases if r.moniker in CHANNEL_CHOICES and r.kver.key() < floor.key()),
+                         key=lambda r: r.kver.key(), reverse=True)
+    rows.extend(["–", r.version, r.moniker, r.released, f"below {floor} minimum"] for r in unavailable)
+    table(["#", "version", "channel", "released", "status"], rows)
+    if not (preferred or cands):
+        warn(f"Profile channel '{channel}' has no selectable release; choose a supported version")
+    return selectable[ask_index("Release", len(selectable), default_index) - 1]
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -5080,7 +5098,13 @@ def do_build(args: argparse.Namespace) -> int:
         target_facts = target_facts_for_profile(profile, facts)
         check_disk_space(profile.g("compiler", "lto"), installing=not args.no_install and not args.configure_only)
         rule("Kernel release")
-        release = choose_release(profile, fetch_releases())
+        release = choose_release(profile, fetch_releases(), exact_pin=bool(args.pin or os.environ.get("DUSKY_PIN")))
+        # Record the one-time choice in the resolved profile packaged with this build.
+        profile.set("release", "pin", release.version)
+        if release.moniker in CHANNEL_CHOICES:
+            profile.set("release", "channel", release.moniker)
+        if release.is_rc:
+            profile.set("release", "allow_rc", True)
         tarball = obtain_tarball(release, bool(profile.g("release", "require_signature")))
         identity = json.dumps({"profile": profile.sections, "target": target_facts.as_json(),
                                "engine": sha256_file(Path(__file__)),
@@ -5560,13 +5584,13 @@ def build_parser() -> argparse.ArgumentParser:
     ov.add_argument("--modules-mode", choices=list(MODULES_MODE_CHOICES))
     ov.add_argument("--toolchain", choices=list(TOOLCHAIN_CHOICES))
     ov.add_argument("--lto", choices=list(LTO_CHOICES))
-    ov.add_argument("--channel", choices=list(CHANNEL_CHOICES))
+    ov.add_argument("--channel", choices=list(CHANNEL_CHOICES), help="preferred channel for the interactive release picker")
     ov.add_argument("--scheduler", choices=list(SCHED_CHOICES))
     ov.add_argument("--scx", metavar="SCHEDULER")
     ov.add_argument("--headers", choices=list(HEADERS_CHOICES))
     ov.add_argument("--no-headers", action="store_const", dest="headers", const="never")
     ov.add_argument("--footprint", choices=list(FOOTPRINT_CHOICES))
-    ov.add_argument("--pin", metavar="VERSION", help="exact kernel version (7.2.3, 7.3-rc2)")
+    ov.add_argument("--pin", metavar="VERSION", help="exact kernel version; bypasses the interactive release picker")
     ov.add_argument("-j", "--jobs", type=int)
     ov.add_argument("--no-rust", action="store_true")
     bh = ap.add_argument_group("build behaviour")

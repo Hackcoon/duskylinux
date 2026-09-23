@@ -76,6 +76,47 @@ class AuditTests(unittest.TestCase):
         p.set('release', 'pin', '7.3-rc4'); p.set('release', 'allow_rc', False)
         with self.assertRaises(k.ProfileError): k.cross_validate(p)
 
+    def test_release_picker_shows_supported_channels_and_profile_default(self):
+        releases = [k.Release('7.3-rc4', 'mainline', '2026-09-20', 'rc', None),
+                    k.Release('7.2.7', 'stable', '2026-09-21', 'stable', None),
+                    k.Release('6.18.53', 'longterm', '2026-09-21', 'lts', None)]
+        p = profile(); p.set('release', 'channel', 'stable')
+        seen = {}
+        def capture_table(_headers, rows):
+            seen['rows'] = rows
+        def choose(_label, maximum, default):
+            self.assertEqual((maximum, default), (2, 2))
+            return 1
+        with patch.object(k, 'interactive', return_value=True), patch.object(k, 'table', side_effect=capture_table), \
+             patch.object(k, 'ask_index', side_effect=choose):
+            selected = k.choose_release(p, releases)
+        self.assertEqual(selected.version, '7.3-rc4')
+        self.assertEqual([row[1] for row in seen['rows']], ['7.3-rc4', '7.2.7', '6.18.53'])
+        self.assertIn('profile default', seen['rows'][1][4])
+        self.assertEqual(seen['rows'][2][0], '–')
+
+    def test_release_picker_respects_exact_cli_pin_and_unattended_default(self):
+        releases = [k.Release('7.3-rc4', 'mainline', '', 'rc', None),
+                    k.Release('7.2.7', 'stable', '', 'stable', None)]
+        p = profile(); p.set('release', 'channel', 'stable'); p.set('release', 'pin', '7.3-rc4')
+        with patch.object(k, 'interactive', return_value=True), patch.object(k, 'ask_index') as ask:
+            self.assertEqual(k.choose_release(p, releases, exact_pin=True).version, '7.3-rc4')
+            ask.assert_not_called()
+        p.set('release', 'pin', '')
+        with patch.object(k, 'interactive', return_value=False):
+            self.assertEqual(k.choose_release(p, releases).version, '7.2.7')
+
+    def test_future_supported_lts_is_selectable_without_code_changes(self):
+        releases = [k.Release('7.4.12', 'longterm', '2027-03-01', 'future-lts', None),
+                    k.Release('7.5-rc2', 'mainline', '2027-03-01', 'future-rc', None),
+                    k.Release('6.18.53', 'longterm', '2026-09-21', 'old-lts', None)]
+        p = profile(); p.set('release', 'channel', 'longterm')
+        with patch.object(k, 'interactive', return_value=True), patch.object(k, 'table'), \
+             patch.object(k, 'ask_index', side_effect=lambda _label, maximum, default: default) as ask:
+            selected = k.choose_release(p, releases)
+        self.assertEqual(selected.version, '7.4.12')
+        self.assertEqual(ask.call_args.args[1:], (2, 2))
+
     def test_rc_archive_falls_back_to_tagged_source(self):
         rel = k.Release('7.3-rc4', 'mainline', '', 'https://git.kernel.org/torvalds/t/linux-7.3-rc4.tar.gz', None)
         with tempfile.TemporaryDirectory() as td, patch.object(k, 'TARBALL_DIR', Path(td)), \
