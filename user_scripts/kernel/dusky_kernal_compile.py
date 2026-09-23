@@ -5557,7 +5557,7 @@ def build_parser() -> argparse.ArgumentParser:
     ov.add_argument("-j", "--jobs", type=int)
     ov.add_argument("--no-rust", action="store_true")
     bh = ap.add_argument_group("build behaviour")
-    bh.add_argument("--settings", type=Path, help="machine storage TOML (default: adjacent kernel_settings.toml)")
+    bh.add_argument("--settings", type=Path, help="machine storage TOML (default: kernel_profiles/settings/kernel_settings.toml)")
     bh.add_argument("--ram-build", action="store_true", help="explicit RAM choice for noninteractive runs; interactive runs still ask")
     bh.add_argument("--build-dir", type=Path, metavar="DIR", help="persistent build directory; RAM workspace is configured separately")
     bh.add_argument("--wizard", action="store_true", help="always enter the granular configuration wizard")
@@ -5752,7 +5752,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     global _VERBOSE, ASSUME_YES, STORAGE, CCACHE_DIR
     args = build_parser().parse_args(argv)
     try:
-        STORAGE = kernel_storage.load_settings(args.settings or SCRIPT_DIR / "kernel_settings.toml", XDG_CACHE, args.build_dir)
+        STORAGE = kernel_storage.load_settings(args.settings or SCRIPT_DIR / "kernel_profiles" / "settings" / "kernel_settings.toml", XDG_CACHE, args.build_dir)
         CCACHE_DIR = STORAGE["ccache_dir"]
         set_build_dir(STORAGE["persistent_dir"])
     except (OSError, ValueError) as exc:

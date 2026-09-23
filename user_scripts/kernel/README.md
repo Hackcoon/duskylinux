@@ -64,7 +64,7 @@ Saved packages carry their resolved profile, including boot-entry preferences. H
 
 ## Optional RAM builds and persistent storage
 
-Edit the adjacent `kernel_settings.toml` for machine storage policy; keep kernel tuning in the profile. `--settings FILE` selects another settings file. Empty persistent paths default to `~/.cache/dusky-kernel` (respecting XDG_CACHE_HOME).
+Edit `kernel_profiles/settings/kernel_settings.toml` for machine storage policy; keep kernel tuning in the profile. `--settings FILE` selects another settings file. Empty persistent paths default to `~/.cache/dusky-kernel` (respecting XDG_CACHE_HOME).
 
 - `persistent_dir`: saved source trees, object files, seeds, downloads and patches.
 - `packages_dir`: completed packages; defaults to `persistent_dir/packages`.

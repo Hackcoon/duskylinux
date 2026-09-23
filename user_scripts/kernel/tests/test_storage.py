@@ -81,14 +81,14 @@ class StorageTests(unittest.TestCase):
                         self.fail()
 
     def test_build_dir_override_updates_default_cache_paths(self):
-        template = Path(__file__).resolve().parents[1] / 'kernel_settings.toml'
+        template = Path(__file__).resolve().parents[1] / 'kernel_profiles' / 'settings' / 'kernel_settings.toml'
         with patch.dict('os.environ', {}, clear=True):
             cfg = s.load_settings(template, Path('/old/cache'), Path('/new/build'))
         self.assertEqual(cfg['packages_dir'], Path('/new/build/packages'))
         self.assertEqual(cfg['thinlto_dir'], Path('/new/build/thinlto-cache'))
 
     def test_settings_validation_and_defaults(self):
-        template = Path(__file__).resolve().parents[1] / 'kernel_settings.toml'
+        template = Path(__file__).resolve().parents[1] / 'kernel_profiles' / 'settings' / 'kernel_settings.toml'
         with patch.dict('os.environ', {}, clear=True):
             cfg = s.load_settings(template, Path('/disk/cache'))
             self.assertEqual(cfg['packages_dir'], Path('/disk/cache/dusky-kernel/packages'))
