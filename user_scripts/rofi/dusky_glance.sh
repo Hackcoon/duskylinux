@@ -12,6 +12,7 @@ SETTINGS_DIR="$HOME/.config/dusky/settings/dusky_glance"
 mkdir -p "$SETTINGS_DIR"
 TIMER_STATE="$SETTINGS_DIR/timer.state"
 POMO_STATE="$SETTINGS_DIR/pomodoro.state"
+ALARM_STATE="$SETTINGS_DIR/alarm.state"
 RECENTS_STATE="$SETTINGS_DIR/recents"
 
 # --- HELPER: SAVE RECENT ---
@@ -80,6 +81,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     printf "\e[1mCOMMANDS:\e[0m\n"
     printf "  \e[32m--pomodoro [work] [break]\e[0m  Start Pomodoro (e.g., 45 10)\n"
     printf "  \e[32m--timer [time]\e[0m             Start Timer (e.g., 90s, 15m)\n"
+    printf "  \e[32m--alarm HH:MM [label]\e[0m      Set alarm for next HH:MM (e.g., 07:30 Wake)\n"
     printf "  \e[32m--stopwatch\e[0m                Start the stopwatch\n"
     printf "  \e[32m--clock\e[0m                    Show the live clock\n"
     printf "  \e[32m--clock-short\e[0m              Show the live clock (no seconds)\n"
@@ -139,6 +141,24 @@ if (( $# > 0 )); then
                 [[ -f "$TIMER_STATE" ]] && last_timer=$(<"$TIMER_STATE")
                 secs=$(parse_timer "$last_timer")
                 "$DAEMON_SCRIPT" --timer "$secs" & disown
+            fi
+            ;;
+        --alarm)
+            if [[ -n "${2:-}" ]]; then
+                [[ "$2" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "Alarm time must be HH:MM (24-hour)" >&2; exit 1; }
+                alarm_lbl="${3:-Alarm}"
+                alarm_lbl="${alarm_lbl// /_}"
+                echo "$2 $alarm_lbl" > "$ALARM_STATE"
+                "$DAEMON_SCRIPT" --alarm "$2" "$alarm_lbl" & disown
+            else
+                last_alarm=""
+                [[ -f "$ALARM_STATE" ]] && last_alarm=$(<"$ALARM_STATE")
+                if [[ -z "$last_alarm" ]]; then
+                    echo "Usage: $0 --alarm HH:MM [label]" >&2
+                    exit 1
+                fi
+                read -r at_ms at_lbl _ <<< "$last_alarm"
+                "$DAEMON_SCRIPT" --alarm "$at_ms" "${at_lbl:-Alarm}" & disown
             fi
             ;;
         *)
@@ -510,6 +530,7 @@ while true; do
                     "󰔚  System Uptime"
                     "󱑎  Stopwatch"
                     "󱎫  Pomodoro"
+                    "󰂞  Alarm"
                     "  Back"
                 )
                 tfchoice=$(printf '%s\n' "${tf_opts[@]}" | "${ROFI_SUB[@]}" -p "Time & Focus") || break
@@ -643,6 +664,37 @@ while true; do
                         save_recent "System Uptime" "--uptime"
                         "$DAEMON_SCRIPT" --uptime & disown
                         exit 0
+                        ;;
+                    *"Alarm"*)
+                        while true; do
+                            last_alarm=""
+                            [[ -f "$ALARM_STATE" ]] && last_alarm=$(<"$ALARM_STATE")
+                            a_opts=(
+                                "󰐊  Start Last (${last_alarm:-unset})"
+                                "󰒓  Set HH:MM + Label"
+                                "  Back"
+                            )
+                            achoice=$(printf '%s\n' "${a_opts[@]}" | "${ROFI_SUB[@]}" -p "Alarm") || break
+                            [[ "$achoice" == "  Back" ]] && break
+
+                            if [[ "$achoice" == *"Start Last"* ]]; then
+                                [[ -z "$last_alarm" ]] && continue
+                                read -r at_ms at_lbl _ <<< "$last_alarm"
+                                [[ "$at_ms" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || continue
+                                save_recent "Alarm ($at_ms ${at_lbl:-Alarm})" "--alarm $at_ms ${at_lbl:-Alarm}"
+                                "$DAEMON_SCRIPT" --alarm "$at_ms" "${at_lbl:-Alarm}" & disown
+                                exit 0
+                            elif [[ "$achoice" == *"Set HH:MM"* ]]; then
+                                at_ms=$(rofi -dmenu -i -p "Alarm HH:MM (24h)" -location 3 -theme-str "$PROMPT_STYLE") || continue
+                                [[ "$at_ms" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { rofi -e "Use HH:MM, e.g. 07:30"; continue; }
+                                at_lbl=$(rofi -dmenu -i -p "Label (one word)" -location 3 -theme-str "$PROMPT_STYLE") || continue
+                                at_lbl="${at_lbl// /_}"; [[ -z "$at_lbl" ]] && at_lbl="Alarm"
+                                echo "$at_ms $at_lbl" > "$ALARM_STATE"
+                                save_recent "Alarm ($at_ms $at_lbl)" "--alarm $at_ms $at_lbl"
+                                "$DAEMON_SCRIPT" --alarm "$at_ms" "$at_lbl" & disown
+                                exit 0
+                            fi
+                        done
                         ;;
                     *"Pomodoro"*)
                         while true; do

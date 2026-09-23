@@ -132,7 +132,7 @@ def build_standard_glance(suffix, label_name, group_name="Modules", expanded=Fal
     
     # Surgical variants directly compiled from the active Mako specification sheet
     width_map = {
-        "": 170, "clock": 170, "clock-short": 120, "stopwatch": 170, "timer": 170, "pomodoro": 170,
+        "": 170, "clock": 170, "clock-short": 120, "stopwatch": 170, "timer": 170, "pomodoro": 170, "alarm": 170,
         "cpu": 100, "cpu-power": 130, "ram": 120, "ram-temp": 160, "zram": 210, "temp": 110,
         "battery": 180, "battery-percent": 100, "battery-watts": 120, "battery-time": 130,
         "gpu-power": 130, "gpu-usage": 100, "gpu-mem": 160,
@@ -611,6 +611,7 @@ SCHEMA = {
        build_standard_glance("stopwatch", "Stopwatch", "Time") +
        build_standard_glance("timer", "Timer", "Time") +
        build_standard_glance("pomodoro", "Pomodoro", "Time") +
+       build_standard_glance("alarm", "Alarm", "Time") +
        build_standard_glance("world-clock", "World-Clock", "Time"),
 
     # --- TAB 3: Core Hardware ---
