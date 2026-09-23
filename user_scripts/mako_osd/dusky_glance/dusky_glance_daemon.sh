@@ -100,7 +100,7 @@ case "$MODE" in
     *) die "Unknown mode: $MODE" ;;
 esac
 
-for required in flock busctl sha256sum timeout stat; do require_cmd "$required"; done
+for required in flock busctl sha256sum timeout stat mkfifo; do require_cmd "$required"; done
 
 check_private_dir() {
     local perms
@@ -130,7 +130,7 @@ process_start() {
     [[ "$raw" == "$pid ("* ]] || return 1
     read -r -a fields <<< "${raw##*) }"
     (( ${#fields[@]} >= 20 )) || return 1
-    [[ "${fields[0]}" != Z && "${fields[0]}" != X &&
+    [[ "${fields[0]}" != Z && "${fields[0]}" != X && "${fields[0]}" != x &&
        "${fields[19]}" =~ ^[0-9]+$ ]] || return 1
     printf '%s\n' "${fields[19]}"
 }
@@ -139,37 +139,60 @@ same_process() {
     actual=$(process_start "$1") || return 1
     [[ "$actual" == "$2" ]]
 }
-stop_record() {
-    local file="$1" pid="" started="" attempt
-    if [[ -L "$file" ]] || ! read -r pid started < "$file" 2>/dev/null; then
-        rm -f -- "$file"
+stale_record() {
+    rm -f -- "${1%.pid}.fifo" "$1"
+}
+request_stop() {
+    local record="$1" fifo="${1%.pid}.fifo" pid="" started=""
+    if [[ -L "$record" ]] || ! read -r pid started < "$record" 2>/dev/null ||
+       ! same_process "$pid" "$started"; then
+        rm -f -- "${record%.pid}.fifo" "$record"
         return 0
     fi
-    if ! same_process "$pid" "$started"; then
-        rm -f -- "$file"
-        return 0
+    if [[ -p "$fifo" ]] && { exec 8<> "$fifo"; } 2>/dev/null; then
+        printf 'stop\n' >&8 || true
+        exec 8>&- || true
+    else
+        kill -TERM "$pid" 2>/dev/null || true
     fi
-    kill -TERM "$pid" 2>/dev/null || true
+}
+wait_records() {
+    local record pid="" started="" attempt pending result=0
+    local -a records=("$@")
     for ((attempt = 0; attempt < 120; attempt++)); do
-        if ! same_process "$pid" "$started"; then
-            rm -f -- "$file"
-            return 0
-        fi
+        pending=0
+        for record in "${records[@]}"; do
+            if [[ -f "$record" ]] &&
+               { read -r pid started < "$record"; } 2>/dev/null &&
+               same_process "$pid" "$started"; then
+                pending=1
+                break
+            fi
+        done
+        (( pending == 0 )) && break
         sleep 0.1
     done
-    printf 'dusky-glance: PID %s did not stop; retaining %s\n' "$pid" "$file" >&2
-    return 1
+    for record in "${records[@]}"; do
+        if [[ -f "$record" ]] &&
+           { read -r pid started < "$record"; } 2>/dev/null &&
+           same_process "$pid" "$started"; then
+            printf 'dusky-glance: PID %s did not stop: %s\n' "$pid" "$record" >&2
+            result=1
+        else
+            rm -f -- "${record%.pid}.fifo" "$record"
+        fi
+    done
+    return "$result"
 }
 
 [[ ! -L "$GLANCE_STATE_DIR/control.lock" ]] || die 'Unsafe control lock'
 exec 9>"$GLANCE_STATE_DIR/control.lock"
 flock -x 9
 if [[ "$MODE" == --stop || "$MODE" == --stop-all ]]; then
-    result=0
-    for record in "$GLANCE_STATE_DIR"/*.pid; do
-        stop_record "$record" || result=1
-    done
-    exit "$result"
+    records=("$GLANCE_STATE_DIR"/*.pid)
+    for record in "${records[@]}"; do request_stop "$record"; done
+    wait_records "${records[@]}"
+    exit $?
 fi
 
 case "$MODE" in
@@ -188,6 +211,7 @@ MODE_BASE="${MODE#--}"
 instance_hash=$(printf '%s\0' "$@" | sha256sum)
 instance_hash="${instance_hash%% *}"
 PID_FILE="$GLANCE_STATE_DIR/${MODE_BASE}-${instance_hash}.pid"
+FIFO_FILE="$GLANCE_STATE_DIR/${MODE_BASE}-${instance_hash}.fifo"
 CURRENT_APP="dusky-glance-${MODE_BASE}"
 
 if [[ -e "$PID_FILE" || -L "$PID_FILE" ]]; then
@@ -195,11 +219,13 @@ if [[ -e "$PID_FILE" || -L "$PID_FILE" ]]; then
     if [[ ! -L "$PID_FILE" ]] &&
        read -r old_pid old_start < "$PID_FILE" 2>/dev/null &&
        same_process "$old_pid" "$old_start"; then
-        stop_record "$PID_FILE"
-        exit 0
+        request_stop "$PID_FILE"
+        wait_records "$PID_FILE"
+        exit $?
     fi
-    rm -f -- "$PID_FILE"
+    rm -f -- "$FIFO_FILE" "$PID_FILE"
 fi
+rm -f -- "$FIFO_FILE"
 
 case "$MODE" in
     --alarm|--timer|--pomodoro) require_cmd notify-send ;;
@@ -226,6 +252,12 @@ OSD_ID=0
 OSD_OWNER=""
 NEXT_NOTIFY_TRY=0
 LAST_NOTIFY_WARNING=-30
+LAST_OSD=-8
+LAST_BODY=""
+NEXT_TICK=0
+TICK_PERIOD_US=1000000
+HAS_RECORD=0
+FIFO_OPEN=0
 
 warn_notification() {
     if (( SECONDS - LAST_NOTIFY_WARNING >= 30 )); then
@@ -265,19 +297,55 @@ clear_osd() {
     fi
     OSD_ID=0
 }
+pause_for() {
+    local message=""
+    if IFS= read -r -t "$1" -u 7 message 2>/dev/null; then
+        [[ "$message" == stop ]] && exit 0
+    fi
+    return 0
+}
+wait_tick() {
+    local now="" wait_us=1000000 delay=1
+    if boottime_us now; then
+        if (( NEXT_TICK == 0 )); then
+            NEXT_TICK=$((now + TICK_PERIOD_US))
+        elif (( NEXT_TICK <= now )); then
+            NEXT_TICK=$((NEXT_TICK + ((now - NEXT_TICK) / TICK_PERIOD_US + 1) * TICK_PERIOD_US))
+        fi
+        wait_us=$((NEXT_TICK - now))
+        NEXT_TICK=$((NEXT_TICK + TICK_PERIOD_US))
+        printf -v delay '%d.%06d' "$((wait_us / 1000000))" "$((wait_us % 1000000))"
+    else
+        NEXT_TICK=0
+    fi
+    pause_for "$delay"
+}
 cleanup() {
     local pid="" started=""
     trap '' INT TERM
     clear_osd
-    if [[ -f "$PID_FILE" && ! -L "$PID_FILE" ]] &&
-       read -r pid started < "$PID_FILE" 2>/dev/null &&
-       [[ "$pid" == "$MY_PID" && "$started" == "$MY_START" ]]; then
-        rm -f -- "$PID_FILE" || true
+    if (( HAS_RECORD )); then
+        if [[ -f "$PID_FILE" && ! -L "$PID_FILE" ]] &&
+           read -r pid started < "$PID_FILE" 2>/dev/null &&
+           [[ "$pid" == "$MY_PID" && "$started" == "$MY_START" ]]; then
+            rm -f -- "$FIFO_FILE" || true
+            rm -f -- "$PID_FILE" || true
+        fi
+    else
+        rm -f -- "$FIFO_FILE" || true
     fi
+    if (( FIFO_OPEN )); then exec 7>&- || true; fi
 }
 trap cleanup EXIT
 trap 'exit 0' INT TERM
-printf '%s %s\n' "$MY_PID" "$MY_START" > "$PID_FILE"
+mkfifo -m 600 -- "$FIFO_FILE" || die 'Cannot create control FIFO'
+exec 7<> "$FIFO_FILE" || die 'Cannot open control FIFO'
+FIFO_OPEN=1
+if ! printf '%s %s\n' "$MY_PID" "$MY_START" > "$PID_FILE"; then
+    rm -f -- "$PID_FILE"
+    die 'Cannot write PID record'
+fi
+HAS_RECORD=1
 flock -u 9
 exec 9>&-
 
@@ -291,6 +359,9 @@ escape_markup() {
 }
 send_body() {
     local reply kind new_id
+    if (( OSD_ID > 0 && SECONDS - LAST_OSD < 8 )) && [[ "$1" == "$LAST_BODY" ]]; then
+        return 0
+    fi
     (( SECONDS >= NEXT_NOTIFY_TRY )) || return 0
     if [[ -z "$OSD_OWNER" ]]; then
         if ! OSD_OWNER=$(notification_owner); then
@@ -305,7 +376,7 @@ send_body() {
         org.freedesktop.Notifications Notify \
         'susssasa{sv}i' "$CURRENT_APP" "$OSD_ID" '' ' ' "$1" \
         0 0 15000 2>/dev/null); then
-        OSD_OWNER="" OSD_ID=0
+        OSD_OWNER="" OSD_ID=0 LAST_BODY=""
         warn_notification
         return 0
     fi
@@ -313,8 +384,10 @@ send_body() {
     if [[ "$kind" == u && "$new_id" =~ ^[1-9][0-9]{0,9}$ ]] &&
        (( new_id <= 4294967295 )); then
         OSD_ID=$new_id
+        LAST_BODY="$1"
+        LAST_OSD=$SECONDS
     else
-        OSD_OWNER="" OSD_ID=0
+        OSD_OWNER="" OSD_ID=0 LAST_BODY=""
         warn_notification
     fi
     return 0
@@ -410,9 +483,9 @@ flash_finish() {
     local i
     for ((i = 0; i < 3; i++)); do
         send_osd '00:00'
-        sleep 0.4
+        pause_for 0.4
         send_osd '     '
-        sleep 0.4
+        pause_for 0.4
     done
 }
 
@@ -619,7 +692,10 @@ cpu_usage_once() {
     local _total _idle_all _diff_total _diff_idle _usage
     _dest=N/A
     if { read -r _tag _user _nice _system _idle _iowait _irq _softirq _steal _ < /proc/stat; } 2>/dev/null &&
-       [[ "$_tag" == cpu ]]; then
+       [[ "$_tag" == cpu && "$_user" =~ ^[0-9]+$ && "$_nice" =~ ^[0-9]+$ &&
+          "$_system" =~ ^[0-9]+$ && "$_idle" =~ ^[0-9]+$ &&
+          "$_iowait" =~ ^[0-9]+$ && "$_irq" =~ ^[0-9]+$ &&
+          "$_softirq" =~ ^[0-9]+$ && "$_steal" =~ ^[0-9]+$ ]]; then
         _idle_all=$((_idle + _iowait))
         _total=$((_user + _nice + _system + _idle + _iowait + _irq + _softirq + _steal))
         _diff_total=$((_total - CPU_PREV_TOTAL))
@@ -688,7 +764,7 @@ GPU_CARD="" GPU_VENDOR="" GPU_PDEV="" NVIDIA_PCI_ID=""
 GPU_POWER_PATH="" GPU_POWER_KIND="" GPU_POWER_LAST=-5
 GPU_IDLE_PATH="" GPU_IDLE_DISCOVER=-5
 GPU_RC6_LAST=-1 GPU_RC6_TIME=0
-GPU_MEM_LAST=-5 GPU_MEM_CACHE=N/A
+GPU_MEM_LAST=-15 GPU_MEM_CACHE=N/A
 GPU_TEMP_LAST=-5
 GPU_NV_SEC=-1 GPU_NV_POWER=N/A GPU_NV_USAGE=N/A GPU_NV_MEM=N/A GPU_NV_TEMP=N/A
 GPU_TEMP_FILES=()
@@ -720,7 +796,7 @@ query_nvidia() {
 }
 nvidia_snapshot() {
     local line="" power="" usage="" memory="" temp="" whole frac
-    (( GPU_NV_SEC != SECONDS )) || return 0
+    (( SECONDS - GPU_NV_SEC >= 2 )) || return 0
     GPU_NV_SEC=$SECONDS
     GPU_NV_POWER=N/A GPU_NV_USAGE=N/A GPU_NV_MEM=N/A GPU_NV_TEMP=N/A
     if is_nvidia_suspended; then
@@ -922,7 +998,7 @@ gpu_mem_once() {
     _dest=N/A
     case "$GPU_VENDOR" in
         intel)
-            if (( SECONDS - GPU_MEM_LAST >= 5 )); then
+            if (( SECONDS - GPU_MEM_LAST >= 15 )); then
                 GPU_MEM_LAST=$SECONDS
                 if intel_memory_mib _mib "$GPU_PDEV"; then
                     GPU_MEM_CACHE="${_mib}MB"
@@ -950,7 +1026,9 @@ gpu_temp_once() {
         _dest=$GPU_NV_TEMP
         return 0
     fi
-    if (( ${#GPU_TEMP_FILES[@]} == 0 )) && (( SECONDS - GPU_TEMP_LAST >= 5 )); then
+    period=15
+    (( ${#GPU_TEMP_FILES[@]} == 0 )) && period=5
+    if (( SECONDS - GPU_TEMP_LAST >= period )); then
         GPU_TEMP_LAST=$SECONDS
         mapfile -t GPU_TEMP_FILES < <(find_gpu_temp_sensors "$GPU_CARD")
     fi
@@ -989,7 +1067,7 @@ case "$MODE" in
         while true; do
             printf -v current_time '%(%I:%M:%S)T' -1
             send_osd "$current_time"
-            sleep 1
+            wait_tick
         done ;;
 
     --clock-short)
@@ -1001,18 +1079,20 @@ case "$MODE" in
                 send_osd "$current_time"
                 last_clock_value=$current_time last_clock_push=$SECONDS
             fi
-            sleep 1
+            delay=$((60 - EPOCHSECONDS % 60))
+            (( delay > 10 )) && delay=10
+            (( delay < 1 )) && delay=1
+            pause_for "$delay"
         done ;;
 
     --world-clock)
-        tz_name="$2" place_label="$3"
+        tz_name="$2" place_label="$3" local_tz="${TZ-:/etc/localtime}"
         while true; do
             now=$EPOCHSECONDS
-            printf -v local_offset '%(%z)T' "$now"
-            if ! target_data=$(TZ="$tz_name" timeout --kill-after=1s 3s \
-                date -d "@$now" '+%I:%M:%S %p|%z' 2>/dev/null); then
+            if ! { TZ="$local_tz" printf -v local_offset '%(%z)T' "$now" &&
+                   TZ="$tz_name" printf -v target_data '%(%I:%M:%S %p|%z)T' "$now"; }; then
                 send_osd N/A
-                sleep 1
+                wait_tick
                 continue
             fi
             time_str="${target_data%|*}"
@@ -1036,7 +1116,7 @@ case "$MODE" in
                 diff_label=N/A
             fi
             send_world_clock_osd "$time_str" "$place_label" "$diff_label"
-            sleep 1
+            wait_tick
         done ;;
 
     --stopwatch)
@@ -1049,7 +1129,7 @@ case "$MODE" in
             else
                 send_osd N/A
             fi
-            sleep 1
+            wait_tick
         done ;;
 
     --timer)
@@ -1058,7 +1138,7 @@ case "$MODE" in
         while true; do
             if ! boottime_us now_us; then
                 send_osd N/A
-                sleep 1
+                wait_tick
                 continue
             fi
             if (( now_us >= target_us )); then
@@ -1070,7 +1150,7 @@ case "$MODE" in
             left=$(((target_us - now_us + 999999) / 1000000))
             format_time time_str "$left"
             send_osd "$time_str"
-            sleep 1
+            wait_tick
         done ;;
 
     --alarm)
@@ -1087,7 +1167,7 @@ case "$MODE" in
             alarm_mins=$(((left + 59) / 60))
             printf -v time_str '%02d:%02d' "$((alarm_mins / 60))" "$((alarm_mins % 60))"
             send_osd "$time_str"
-            sleep 1
+            wait_tick
         done ;;
 
     --pomodoro)
@@ -1097,7 +1177,7 @@ case "$MODE" in
         while true; do
             if ! boottime_us now_us; then
                 send_osd N/A
-                sleep 1
+                wait_tick
                 continue
             fi
             if (( now_us >= target_us )); then
@@ -1122,38 +1202,40 @@ case "$MODE" in
             format_time time_str "$left"
             if [[ "$phase" == BREAK ]]; then time_str="B $time_str"; fi
             send_osd "$time_str"
-            sleep 1
+            wait_tick
         done ;;
 
     --cpu-power)
         cpu_power_once initial
-        sleep 1
+        wait_tick
         while true; do
             cpu_power_once reading
             send_osd "$reading"
-            sleep 1
+            wait_tick
         done ;;
 
     --cpu)
         cpu_usage_once initial
-        sleep 1
+        wait_tick
         while true; do
             cpu_usage_once reading
             send_osd "$reading"
-            sleep 1
+            wait_tick
         done ;;
 
     --ram)
         while true; do
             ram_once reading
             send_osd "$reading"
-            sleep 1
+            wait_tick
         done ;;
 
     --ram-temp)
         temp_files=() last_discover=-5
         while true; do
-            if (( ${#temp_files[@]} == 0 )) && (( SECONDS - last_discover >= 5 )); then
+            period=15
+            (( ${#temp_files[@]} == 0 )) && period=5
+            if (( SECONDS - last_discover >= period )); then
                 last_discover=$SECONDS
                 for dir in /sys/class/hwmon/hwmon*/; do
                     name=""
@@ -1175,7 +1257,7 @@ case "$MODE" in
                 temp_files=()
                 send_osd N/A
             fi
-            sleep 1
+            wait_tick
         done ;;
 
     --zram)
@@ -1192,14 +1274,14 @@ case "$MODE" in
             else
                 send_osd N/A
             fi
-            sleep 1
+            wait_tick
         done ;;
 
     --temp)
         while true; do
             cpu_temp_once reading
             send_osd "$reading"
-            sleep 1
+            wait_tick
         done ;;
 
     --battery|--battery-percent|--battery-watts|--battery-time)
@@ -1218,7 +1300,7 @@ case "$MODE" in
             fi
             if [[ -z "$bat_dir" ]]; then
                 send_osd 'Bat: N/A'
-                sleep 1
+                wait_tick
                 continue
             fi
 
@@ -1236,7 +1318,7 @@ case "$MODE" in
             if [[ "$MODE" == --battery-percent ]]; then
                 if [[ "$capacity" == '?' ]]; then send_osd 'Bat: N/A'
                 else send_osd "${capacity}%"; fi
-                sleep 1
+                wait_tick
                 continue
             fi
 
@@ -1288,7 +1370,7 @@ case "$MODE" in
             fi
             if [[ "$MODE" == --battery-watts ]]; then
                 send_osd "$watts"
-                sleep 1
+                wait_tick
                 continue
             fi
 
@@ -1363,10 +1445,11 @@ case "$MODE" in
             else
                 send_osd "${capacity}% ${watts}"
             fi
-            sleep 1
+            wait_tick
         done ;;
 
     --disk)
+        TICK_PERIOD_US=5000000
         while true; do
             df_out=$(timeout --kill-after=1s 3s df -h --output=used,size,pcent / 2>/dev/null) || df_out=""
             row="${df_out##*$'\n'}"
@@ -1377,7 +1460,7 @@ case "$MODE" in
             else
                 send_osd 'Disk: N/A'
             fi
-            sleep 1
+            wait_tick
         done ;;
 
     --disk-read|--disk-write)
@@ -1393,7 +1476,7 @@ case "$MODE" in
                ! boottime_us now_us; then
                 have_previous=false
                 send_osd N/A
-                sleep 1
+                wait_tick
                 continue
             fi
             sectors=$((10#${stats[field]}))
@@ -1413,10 +1496,11 @@ case "$MODE" in
             fi
             previous_sectors=$sectors previous_time=$now_us
             have_previous=true
-            sleep 1
+            wait_tick
         done ;;
 
     --disk-temp)
+        TICK_PERIOD_US=5000000
         dev="$2"
         mapfile -t temp_files < <(find_disk_temp_sensors "$dev")
         last_discover=$SECONDS
@@ -1427,7 +1511,9 @@ case "$MODE" in
             has_smart=true
         fi
         while true; do
-            if (( ${#temp_files[@]} == 0 )) && (( SECONDS - last_discover >= 5 )); then
+            period=15
+            (( ${#temp_files[@]} == 0 )) && period=5
+            if (( SECONDS - last_discover >= period )); then
                 last_discover=$SECONDS
                 mapfile -t temp_files < <(find_disk_temp_sensors "$dev")
             fi
@@ -1467,7 +1553,7 @@ case "$MODE" in
                     send_osd N/A
                 fi
             fi
-            sleep 1
+            wait_tick
         done ;;
 
     --network|--network-down|--network-up|--network-combined|\
@@ -1481,28 +1567,12 @@ case "$MODE" in
         DAEMON_PID_FILE="$NET_STATE_DIR/daemon.pid"
 
         wake_network_daemon() {
-            local d_pid="" fd="" arg="" n verified=false
             [[ -d "$NET_STATE_DIR" ]] || mkdir -m 700 -p -- "$NET_STATE_DIR" 2>/dev/null || true
             : > "$HEARTBEAT_FILE" 2>/dev/null || true
-            if [[ -r "$DAEMON_PID_FILE" ]] && read -r d_pid < "$DAEMON_PID_FILE" 2>/dev/null &&
-               [[ "$d_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$d_pid" 2>/dev/null; then
-                if { exec {fd}< "/proc/$d_pid/cmdline"; } 2>/dev/null; then
-                    for ((n = 0; n < 4; n++)); do
-                        IFS= read -r -d '' arg <&"$fd" 2>/dev/null || break
-                        if [[ "$arg" == *network_meter_daemon* ]]; then
-                            verified=true
-                            break
-                        fi
-                    done
-                    { exec {fd}<&-; } 2>/dev/null || true
-                fi
-            fi
-            if [[ "$verified" == true ]]; then
-                kill -USR1 "$d_pid" 2>/dev/null || true
-            else
+            timeout --kill-after=1s 3s systemctl --user --kill-whom=main \
+                --signal=USR1 kill network_meter.service >/dev/null 2>&1 || \
                 timeout --kill-after=1s 3s systemctl --user start \
                     network_meter.service >/dev/null 2>&1 || true
-            fi
         }
 
         wake_network_daemon
@@ -1586,7 +1656,7 @@ case "$MODE" in
                 last_network_wake=$SECONDS
             fi
             send_osd "$reading"
-            sleep 1
+            wait_tick
         done ;;
 
     --uptime)
@@ -1599,30 +1669,30 @@ case "$MODE" in
             else
                 send_osd 'Up: N/A'
             fi
-            sleep 1
+            wait_tick
         done ;;
 
     --gpu-power)
-        if [[ "$GPU_VENDOR" == intel ]]; then gpu_power_once initial; sleep 1; fi
+        if [[ "$GPU_VENDOR" == intel ]]; then gpu_power_once initial; wait_tick; fi
         while true; do
             gpu_power_once reading
             send_osd "$reading"
-            sleep 1
+            wait_tick
         done ;;
 
     --gpu-usage)
-        if [[ "$GPU_VENDOR" == intel ]]; then gpu_usage_once initial; sleep 1; fi
+        if [[ "$GPU_VENDOR" == intel ]]; then gpu_usage_once initial; wait_tick; fi
         while true; do
             gpu_usage_once reading
             send_osd "$reading"
-            sleep 1
+            wait_tick
         done ;;
 
     --gpu-mem)
         while true; do
             gpu_mem_once reading
             send_osd "$reading"
-            sleep 1
+            wait_tick
         done ;;
 
     --hud)
@@ -1632,7 +1702,7 @@ case "$MODE" in
             gpu_power_once initial
             gpu_usage_once initial
         fi
-        sleep 1
+        wait_tick
         while true; do
             cpu_usage_once cpu_usage
             cpu_power_once cpu_watts
@@ -1662,10 +1732,11 @@ case "$MODE" in
                 "$gpu_usage" "$gpu_watts" "$gpu_temp" \
                 "$ram_str" "$vram_label" "$gpu_vram"
             send_hud_osd "$hud_text"
-            sleep 1
+            wait_tick
         done ;;
 
     --workspace)
+        TICK_PERIOD_US=2000000
         while true; do
             ws_id='?'
             if ws_json=$(timeout --kill-after=1s 3s hyprctl -j activeworkspace 2>/dev/null) &&
@@ -1673,6 +1744,6 @@ case "$MODE" in
                 ws_id="${BASH_REMATCH[1]}"
             fi
             send_osd "WS: $ws_id"
-            sleep 1
+            wait_tick
         done ;;
 esac
