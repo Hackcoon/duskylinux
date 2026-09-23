@@ -34,5 +34,6 @@
     a.rum-ib8x33.rum-oehx4z.rum-vxl0e0 { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fa.rum-ib8x33.rum-oehx4z.rum-vxl0e0%1Fbg | bg: surface */
     rum-video-thumbnail.rum-1sazlf { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Frum-video-thumbnail.rum-1sazlf%1Fbg | bg: surface */
     div.user-notifications.pop-show { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.user-notifications.pop-show%1Fbg | bg: surface */
+    main { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fmain%1Fbg | bg: surface */
     /* <<< dusky:picks */
 }
