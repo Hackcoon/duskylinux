@@ -309,7 +309,10 @@ def parse_swaps(data: bytes) -> tuple[SwapSplit, frozenset[str]]:
         if len(f) < 5:
             continue
         name = f[0].decode(errors="replace")
-        size, used = int(f[2]) << 10, int(f[3]) << 10
+        try:
+            size, used = int(f[2]) << 10, int(f[3]) << 10
+        except ValueError:
+            continue
         devs.append(name)
         if name.startswith("/dev/zram"):
             zt, zu = zt + size, zu + used
@@ -396,7 +399,11 @@ def scan_top(limit: int = TOP_N) -> list[tuple[int, int, int, str]]:
             continue
         finally:
             os.close(fd)
-        if len(fields) >= 2 and (rss := int(fields[1])):
+        try:
+            rss = int(fields[1]) if len(fields) >= 2 else 0
+        except ValueError:
+            continue
+        if rss:
             ranked.append((rss, int(name)))
     rows = []
     for rss, pid in heapq.nlargest(limit, ranked):
@@ -845,6 +852,7 @@ class Sampler(threading.Thread):
         self.oomd = load_oomd_conf()
         self.oom_base: int | None = None
         self.over_since: float | None = None
+        self.rule_since: dict[str, float] = {}
         self.last_error = ""
 
     def run(self) -> None:
@@ -963,12 +971,28 @@ class Sampler(threading.Thread):
         self.over_since = (self.over_since or now) if over else None
         over_for = now - self.over_since if self.over_since else 0.0
         swap_trip = st > 0 and mem_f > c.swap_limit and swap_f > c.swap_limit
-        hits = [r.name for r in c.rules
-                if (r.swap_max is None or swap_f > r.swap_max) and (r.psi_above is None or full > r.psi_above)]
+        live = {r.name for r in c.rules}
+        for stale in set(self.rule_since) - live:
+            self.rule_since.pop(stale, None)
+        hits, pending = [], []
+        for r in c.rules:
+            active = ((r.swap_max is None or swap_f > r.swap_max)
+                      and (r.psi_above is None or full > r.psi_above))
+            if not active:
+                self.rule_since.pop(r.name, None)
+                continue
+            since = self.rule_since.setdefault(r.name, now)
+            if now - since >= r.lasting:
+                hits.append(r.name)
+            else:
+                pending.append((r.name, r.lasting - (now - since)))
         if swap_trip or (over and over_for >= c.psi_duration) or hits:
             why = ("mem∧swap > limit" if swap_trip
                    else f"full {full:.0%} > {c.psi_limit:.0%} for {over_for:.0f}s" if over else f"rule {hits[0]}")
             return ("CRITICAL" if self.oomd_on else "TRIPPED (oomd off)", CRIT, why)
+        if pending:
+            name, left = pending[0]
+            return ("HIGH", EB, f"rule {name} over threshold ({left:.0f}s to trip)")
         if over:
             return ("HIGH", EB, f"full {full:.0%} > {c.psi_limit:.0%} for {over_for:.0f}/{c.psi_duration:.0f}s")
         if st and mem_f > 0.9 * c.swap_limit and swap_f > 0.9 * c.swap_limit:
@@ -1270,7 +1294,8 @@ class BalloonEngine:
         return Block(cat, size, fd, mm)
 
     # -- residency accounting ---------------------------------------------------
-    def _cachestat(self, fd: int) -> _CacheStat | None:
+    def _cachestat(self, fd: int, size: int) -> _CacheStat | None:
+        self._crange.off, self._crange.len = 0, size
         rc = _libc.syscall(ctypes.c_long(NR_CACHESTAT), ctypes.c_long(fd), ctypes.byref(self._crange),
                            ctypes.byref(self._cstat), ctypes.c_long(0))
         return self._cstat if rc == 0 else None
@@ -1288,7 +1313,7 @@ class BalloonEngine:
         res = dirty = wb = 0
         for b in blocks:
             if b.fd >= 0:
-                if (cs := self._cachestat(b.fd)) is None:
+                if (cs := self._cachestat(b.fd, b.size)) is None:
                     res = -1
                     break
                 res, dirty, wb = res + cs.cache * PAGE, dirty + cs.dirty * PAGE, wb + cs.writeback * PAGE
@@ -1362,7 +1387,7 @@ class BalloonEngine:
         if not blocks:
             self._toast("No DIRTY blocks to sync", "warning")
             return
-        dirty = sum(cs.dirty * PAGE for b in blocks if (cs := self._cachestat(b.fd)) is not None)
+        dirty = sum(cs.dirty * PAGE for b in blocks if (cs := self._cachestat(b.fd, b.size)) is not None)
         t0 = time.perf_counter()
         for b in blocks:
             os.fdatasync(b.fd)                           # GIL released; page cache knows every dirty page
