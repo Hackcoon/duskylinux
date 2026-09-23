@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Bootstrap the one dependency needed to start the Python dependency resolver.
+set -euo pipefail
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if ! command -v python3 >/dev/null || ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 14))'; then
+    read -r -p 'Python 3.14+ is required. Install Arch package python? [Y/n] ' answer
+    case ${answer,,} in n|no) exit 1 ;; esac
+    if (( EUID == 0 )); then
+        pacman -S --needed python
+    elif command -v sudo >/dev/null; then
+        sudo pacman -S --needed python
+    elif command -v run0 >/dev/null; then
+        run0 pacman -S --needed python
+    elif command -v doas >/dev/null; then
+        doas pacman -S --needed python
+    else
+        printf '%s\n' 'Install python with pacman as root, then run this launcher as your normal user.' >&2
+        exit 1
+    fi
+fi
+exec python3 "$script_dir/dusky_kernal_compile.py" "$@"

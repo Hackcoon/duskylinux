@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dusky Kernel Compiler v6.0.0 -- bespoke kernel compilation engine for Arch Linux.
+"""Dusky Kernel Compiler v6.2.0 -- bespoke kernel compilation engine for Arch Linux.
 
 Target stack (no legacy paths exist in this program):
   * Arch Linux rolling (September 2026 spec), Linux 7.2+ and 7.3-rc, Python 3.14+
@@ -19,20 +19,23 @@ Pipeline (one profile -> two pacman packages):
 Quick start:
   ./dusky_kernal_compile.py --write-default-profiles
   ./dusky_kernal_compile.py --doctor
-  ./dusky_kernal_compile.py --profile low_ram             # asks: use defaults exactly? [Y/n]
-  ./dusky_kernal_compile.py --profile gaming --wizard      # force the granular questionnaire
-  ./dusky_kernal_compile.py --profile gaming --configure-only --print-matrix
+  ./dusky_kernal_compile.py --profile battery             # asks: use defaults exactly? [Y/n]
+  ./dusky_kernal_compile.py --profile battery --wizard      # force the granular questionnaire
+  ./dusky_kernal_compile.py --profile battery --configure-only --print-matrix
 """
 
 import sys
 
-if sys.version_info < (3, 11):
-    sys.stderr.write(f"Dusky Kernel Compiler requires Python >= 3.11 (running {sys.version.split()[0]}).\n")
+if sys.version_info < (3, 14):
+    sys.stderr.write(f"Dusky Kernel Compiler requires Python >= 3.14 (running {sys.version.split()[0]}).\n")
     raise SystemExit(70)
 
 import argparse
+import kernel_storage
 import collections
 import functools
+import fcntl
+from contextlib import contextmanager
 import hashlib
 import itertools
 import json
@@ -66,7 +69,7 @@ type Json = dict[str, Any]
 # Constants & filesystem layout (XDG aware, env-overridable)
 # ---------------------------------------------------------------------------------------------------
 APP_NAME: Final = "Dusky Kernel Compiler"
-APP_VERSION: Final = "6.0.0"
+APP_VERSION: Final = "6.2.0"
 APP_TAGLINE: Final = "Tailored Arch Linux kernels (Linux 7.2+ / 7.3-rc)"
 MIN_KERNEL: Final = (7, 2)
 SCRIPT_DIR: Final = Path(__file__).resolve().parent
@@ -84,13 +87,6 @@ def _detect_default_build_dir() -> Path:
     env = os.environ.get("DUSKY_BUILD_DIR")
     if env:
         return Path(env).expanduser()
-    zram_root = Path("/mnt/zram1")
-    if zram_root.is_dir() and os.access(zram_root, os.W_OK):
-        try:
-            if shutil.disk_usage(zram_root).free >= 20 << 30:
-                return zram_root / f"dusky_kernel_{os.geteuid()}"
-        except OSError:
-            pass
     return XDG_CACHE / "dusky-kernel"
 
 
@@ -101,17 +97,20 @@ PATCH_CACHE: Path = Path(os.environ.get("DUSKY_PATCH_CACHE") or XDG_CACHE / "dus
 THINLTO_CACHE_DIR: Path = Path(os.environ.get("DUSKY_THINLTO_CACHE") or XDG_CACHE / "dusky-kernel" / "thinlto-cache")
 PKGDEST_DIR: Path = Path(os.environ.get("DUSKY_PKGDEST") or BUILD_DIR / "packages")
 IMPORT_DIR: Final = STATE_DIR / "imports"
+STORAGE: dict = {}
+CCACHE_DIR: Path = XDG_CACHE / "dusky-kernel" / "ccache"
+RAM_RESERVE_GIB: int = 0
 
 
 def set_build_dir(new_path: Path | str) -> None:
     global BUILD_DIR, SRC_DIR, TARBALL_DIR, PATCH_CACHE, THINLTO_CACHE_DIR, PKGDEST_DIR
-    BUILD_DIR = Path(new_path).expanduser()
+    BUILD_DIR = Path(new_path).expanduser().resolve()
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     SRC_DIR = BUILD_DIR / "src"
-    TARBALL_DIR = Path(os.environ.get("DUSKY_TARBALL_DIR") or XDG_CACHE / "dusky-kernel" / "tarballs")
-    PATCH_CACHE = Path(os.environ.get("DUSKY_PATCH_CACHE") or XDG_CACHE / "dusky-kernel" / "patches")
-    THINLTO_CACHE_DIR = Path(os.environ.get("DUSKY_THINLTO_CACHE") or XDG_CACHE / "dusky-kernel" / "thinlto-cache")
-    PKGDEST_DIR = Path(os.environ.get("DUSKY_PKGDEST") or BUILD_DIR / "packages")
+    TARBALL_DIR = Path(os.environ.get("DUSKY_TARBALL_DIR") or STORAGE.get("persistent_dir", XDG_CACHE / "dusky-kernel") / "tarballs")
+    PATCH_CACHE = Path(os.environ.get("DUSKY_PATCH_CACHE") or STORAGE.get("persistent_dir", XDG_CACHE / "dusky-kernel") / "patches")
+    THINLTO_CACHE_DIR = STORAGE.get("thinlto_dir", Path(os.environ.get("DUSKY_THINLTO_CACHE") or XDG_CACHE / "dusky-kernel" / "thinlto-cache"))
+    PKGDEST_DIR = STORAGE.get("packages_dir", Path(os.environ.get("DUSKY_PKGDEST") or XDG_CACHE / "dusky-kernel" / "packages"))
     IMPORT_DIR.mkdir(parents=True, exist_ok=True)
     for d in (SRC_DIR, TARBALL_DIR, PATCH_CACHE, THINLTO_CACHE_DIR, PKGDEST_DIR, BUILD_DIR / "seeds"):
         d.mkdir(parents=True, exist_ok=True)
@@ -262,34 +261,6 @@ def resolve_modprobed_db(custom: str | None = None) -> Path | None:
             best_key = key
             best = resolved
     return best
-
-
-def ensure_modprobed_compat_link() -> None:
-    """Best-effort legacy symlink: ~/.config/modprobed.db -> canonical DB.
-
-    Keeps old tooling working. Never overwrites a real file; cleans up broken
-    symlinks and only creates the link when legacy is missing and canonical exists.
-    """
-    try:
-        if MODPROBED_DB_PATH.is_symlink() and not MODPROBED_DB_PATH.exists():
-            try:
-                MODPROBED_DB_PATH.unlink()
-            except OSError:
-                return
-        if MODPROBED_DB_PATH.exists():
-            return
-        canon: Path | None = None
-        for cand in (MODPROBED_DB_CANONICAL, _modprobed_db_from_conf()):
-            if cand and _is_usable_db(cand) and count_db_modules(cand) > 0:
-                canon = cand
-                break
-        if canon is None:
-            return
-        MODPROBED_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        MODPROBED_DB_PATH.symlink_to(canon)
-        debug(f"created compat symlink {MODPROBED_DB_PATH} -> {canon}")
-    except (OSError, RuntimeError) as e:
-        debug(f"compat symlink skipped: {e}")
 
 
 def normalize_lsmod_file_to_db(src: Path, dest: Path) -> int:
@@ -608,499 +579,52 @@ class AbortError(DuskyError):
 # ---------------------------------------------------------------------------------------------------
 # Choice vocabularies (single source of truth for validation, CLI, wizard and Kconfig mapping)
 # ---------------------------------------------------------------------------------------------------
-CPU_ARCHES: Final = (
-    "native", "generic", "generic_v2", "generic_v3", "generic_v4",
-    "sandybridge", "ivybridge", "haswell", "broadwell", "skylake", "skylake-avx512", "icelake-client",
-    "icelake-server", "tigerlake", "rocketlake", "alderlake", "raptorlake", "meteorlake", "arrowlake",
-    "lunarlake", "sapphirerapids", "emeraldrapids", "graniterapids",
-    "znver1", "znver2", "znver3", "znver4", "znver5",
-)
-# psABI level implied by a micro-architecture (what CONFIG_X86_64_VERSION can express) + graysky symbol.
-UARCH_INFO: Final[dict[str, tuple[int, str]]] = {
-    "generic": (1, "GENERIC_CPU"), "generic_v2": (2, "GENERIC_CPU2"), "generic_v3": (3, "GENERIC_CPU3"), "generic_v4": (4, "GENERIC_CPU4"),
-    "sandybridge": (2, "MSANDYBRIDGE"), "ivybridge": (2, "MIVYBRIDGE"), "haswell": (3, "MHASWELL"), "broadwell": (3, "MBROADWELL"),
-    "skylake": (3, "MSKYLAKE"), "skylake-avx512": (4, "MSKYLAKEX"), "icelake-client": (4, "MICELAKE_CLIENT"), "icelake-server": (4, "MICELAKE_SERVER"),
-    "tigerlake": (4, "MTIGERLAKE"), "rocketlake": (4, "MROCKETLAKE"), "alderlake": (3, "MALDERLAKE"), "raptorlake": (3, "MRAPTORLAKE"),
-    "meteorlake": (3, "MMETEORLAKE"), "arrowlake": (3, "MARROWLAKE"), "lunarlake": (3, "MLUNARLAKE"), "sapphirerapids": (4, "MSAPPHIRERAPIDS"),
-    "emeraldrapids": (4, "MEMERALDRAPIDS"), "graniterapids": (4, "MGRANITERAPIDS"),
-    "znver1": (3, "MZEN"), "znver2": (3, "MZEN2"), "znver3": (3, "MZEN3"), "znver4": (4, "MZEN4"), "znver5": (4, "MZEN5"),
-}
-GRAYSKY_SYMBOLS: Final = tuple(sorted({v[1] for v in UARCH_INFO.values()} | {"MNATIVE_INTEL", "MNATIVE_AMD", "MK8", "MPSC", "MCORE2", "MATOM"}))
-HZ_CHOICES: Final = (100, 250, 300, 500, 600, 750, 1000)
-HZ_UPSTREAM: Final = (100, 250, 300, 1000)
-TICKLESS_CHOICES: Final = ("periodic", "idle", "full")
-PREEMPT_CHOICES: Final = ("lazy", "full", "rt")
-SCHED_CHOICES: Final = ("eevdf", "bore", "bmq")
-SCX_CHOICES: Final = ("none", "scx_lavd", "scx_bpfland", "scx_layered", "scx_rusty", "scx_flash", "scx_p2dq", "scx_cosmos")
-CHANNEL_CHOICES: Final = ("mainline", "stable", "longterm")
-LTO_CHOICES: Final = ("none", "thin", "full")
-OPT_CHOICES: Final = ("o2", "o3", "size")
-FDO_CHOICES: Final = ("none", "autofdo", "autofdo_propeller")
-THP_CHOICES: Final = ("always", "madvise", "never")
-THP_DEFRAG_CHOICES: Final = ("always", "defer", "defer+madvise", "madvise", "never")
-THP_SHMEM_CHOICES: Final = ("always", "within_size", "advise", "never")
-SWAP_BACKEND_CHOICES: Final = ("zram", "zswap", "none")
-ZRAM_ALGO_CHOICES: Final = ("zstd", "lz4", "lz4hc", "lzo-rle")
-ZSWAP_COMP_CHOICES: Final = ("zstd", "lz4", "lz4hc", "lzo")
-FOOTPRINT_CHOICES: Final = ("standard", "lean", "minimal", "embedded")
-TRACING_CHOICES: Final = ("auto", "full", "minimal")
-GOV_CHOICES: Final = ("schedutil", "performance", "powersave", "ondemand", "conservative")
-EPP_CHOICES: Final = ("default", "performance", "balance_performance", "balance_power", "power")
-PSTATE_CHOICES: Final = ("active", "guided", "passive", "disable", "undefined")
-MITIGATION_CHOICES: Final = ("on", "off", "nosmt")
-IDLE_GOV_CHOICES: Final = ("teo", "menu", "haltpoll")
-PCIE_ASPM_CHOICES: Final = ("default", "powersave", "powersupersave", "performance")
-CONG_CHOICES: Final = ("bbr", "cubic", "reno")
-QDISC_CHOICES: Final = ("fq", "cake", "fq_codel", "fq_pie", "pfifo_fast")
-TOOLCHAIN_CHOICES: Final = ("llvm", "gcc")
-HEADERS_CHOICES: Final = ("auto", "always", "never")
-MODULES_MODE_CHOICES: Final = ("strict", "expanded")
-COMPRESS_CHOICES: Final = ("zstd", "xz", "gzip", "none")
-DEBUG_CHOICES: Final = ("none", "reduced", "full")
-SECURITY_PROFILES: Final = ("balanced", "extreme", "hardened")
-STACKPROTECTOR_CHOICES: Final = ("strong", "regular", "none")
-IOSCHED_CHOICES: Final = ("none", "mq-deadline", "bfq", "kyber", "keep")
-SEED_CHOICES: Final = ("auto", "snapshot", "arch", "running", "headers", "defconfig")
-CMDLINE_CHOICES: Final = ("bake", "entry", "print")
-
-# Per-choice context shown by the wizard (section, key) -> {value: explanation}
-CHOICE_HELP: Final[dict[tuple[str, str], dict[str, str]]] = {
-    ("release", "channel"): {
-        "mainline": "Linus' tree: newest features; 7.3-rc snapshots when allow_rc=true",
-        "stable": "latest stable point release (7.2.y) -- recommended for daily drivers",
-        "longterm": "LTS branch (still subject to the >= 7.2 floor)",
-    },
-    ("cpu", "arch"): {
-        "native": "-march=native via CONFIG_X86_NATIVE_CPU: fastest, host-only, never portable",
-        "generic": "x86-64 baseline (psABI v1): maximally portable",
-        "generic_v2": "x86-64-v2: SSE4.2/POPCNT/CX16 (Nehalem+, Bulldozer+)",
-        "generic_v3": "x86-64-v3: AVX2/BMI2/FMA/MOVBE (Haswell+, Zen+) -- best portable choice",
-        "generic_v4": "x86-64-v4: AVX-512 -- the kernel never emits AVX-512, so this equals v3 for kernel code",
-    },
-    ("cpu", "governor"): {
-        "schedutil": "utilization-driven, integrates with EEVDF/sched_ext (default)",
-        "performance": "pin maximum frequency (desktops on wall power)",
-        "powersave": "with intel_pstate/amd_pstate=active this is the HWP-driven default and is not slow",
-        "ondemand": "legacy sampling governor (only meaningful with acpi-cpufreq)",
-        "conservative": "legacy sampling governor with slow ramp (acpi-cpufreq only)",
-    },
-    ("cpu", "amd_pstate"): {
-        "active": "EPP autonomous mode: firmware picks frequency, kernel provides hints (Zen 2+ best)",
-        "guided": "kernel provides min/max band, firmware selects inside it",
-        "passive": "kernel-driven target frequency (CPPC, non-autonomous)",
-        "disable": "fall back to acpi-cpufreq",
-        "undefined": "leave the Kconfig default (3 = active)",
-    },
-    ("cpu", "epp"): {
-        "default": "do not touch the firmware EPP hint",
-        "performance": "EPP 0: maximum performance bias",
-        "balance_performance": "EPP 128: desktop default bias",
-        "balance_power": "EPP 192: efficiency bias",
-        "power": "EPP 255: maximum efficiency bias (battery)",
-    },
-    ("cpu", "mitigations"): {
-        "on": "build and enable CPU vulnerability mitigations (safe default)",
-        "off": "compile out CONFIG_CPU_MITIGATIONS and boot with mitigations=off (faster syscalls/IO; trusted single-user machines only)",
-        "nosmt": "keep mitigations, boot with mitigations=auto,nosmt (disables SMT siblings)",
-    },
-    ("scheduler", "type"): {
-        "eevdf": "upstream EEVDF (7.x default) -- required for sched_ext BPF classes",
-        "bore": "BORE: burst-oriented EEVDF variant (out-of-tree patch, sched_ext compatible)",
-        "bmq": "Project C BMQ (out-of-tree patch replacing EEVDF; incompatible with sched_ext)",
-    },
-    ("scheduler", "scx"): {
-        "none": "no BPF scheduler daemon (sched_ext class may still be compiled)",
-        "scx_lavd": "latency-criticality aware (gaming/handheld); flags: --autopilot or --autopower",
-        "scx_bpfland": "interactive-first vruntime scheduler; '-m performance' for gaming",
-        "scx_layered": "config-driven layered scheduler (workstations, mixed workloads)",
-        "scx_rusty": "multi-domain hybrid user/BPF (servers, large NUMA)",
-        "scx_flash": "EDF-style fairness with predictable latency (audio, soft-RT)",
-        "scx_p2dq": "pick-2 dispatch queues, LLC-aware, simple and robust",
-        "scx_cosmos": "lightweight LLC/hybrid-topology aware scheduler",
-    },
-    ("timing", "tickless"): {
-        "periodic": "always tick (legacy; only for debugging)",
-        "idle": "NO_HZ_IDLE: stop ticks on idle CPUs (desktop/laptop default)",
-        "full": "NO_HZ_FULL: adaptive ticks -- only useful with nohz_full=/isolcpus= CPU isolation (RT/HPC)",
-    },
-    ("timing", "preempt"): {
-        "lazy": "PREEMPT_LAZY: full-preempt responsiveness with voluntary-like throughput (7.x desktop default)",
-        "full": "PREEMPT: lowest scheduling latency",
-        "rt": "PREEMPT_RT: hard real-time; disables PREEMPT_DYNAMIC and costs throughput",
-    },
-    ("memory", "thp"): {
-        "always": "THP for all anonymous memory (fastest for games/JVMs; more RSS, khugepaged activity)",
-        "madvise": "THP only where applications ask (balanced default)",
-        "never": "no THP: smallest footprint, no khugepaged (low-RAM)",
-    },
-    ("memory", "swap_backend"): {
-        "zram": "compressed RAM swap via zram-generator: best for systems without disk swap",
-        "zswap": "compressed cache in front of an existing disk swap device",
-        "none": "no compressed swap layer (zswap disabled)",
-    },
-    ("memory", "zram_algo"): {
-        "zstd": "best ratio (~3-4x), higher CPU cost",
-        "lz4": "fastest, lower ratio (~2-2.5x); pair with zstd recompression",
-        "lz4hc": "lz4 high-compression variant (slow compress, fast decompress)",
-        "lzo-rle": "kernel default; balanced",
-    },
-    ("memory", "footprint"): {
-        "standard": "distribution-like feature set",
-        "lean": "<= 8 GiB: drop debug/tracing/legacy cgroup v1/kexec/kcore, smaller log buffer",
-        "minimal": "<= 4-8 GiB, sub-300 MiB idle target: lean + SLUB_TINY, no hugetlbfs, no KALLSYMS_ALL, DAMON reclaim",
-        "embedded": "<= 4 GiB headless/appliance: minimal + BASE_SMALL, no 32-bit compat, no hibernation",
-    },
-    ("memory", "tracing"): {
-        "auto": "full tracing when a sched_ext daemon is selected, minimal otherwise",
-        "full": "ftrace + kprobes + uprobes + BPF events (perf, bpftrace, scx tooling)",
-        "minimal": "tracepoints + BPF syscall only; no function tracer/kprobes (smaller text, fewer pages)",
-    },
-    ("compiler", "toolchain"): {
-        "llvm": "clang/lld: LTO, kCFI, AutoFDO/Propeller, ThinLTO cache",
-        "gcc": "GCC + ld.bfd: no LTO/kCFI/FDO paths",
-    },
-    ("compiler", "optimize"): {
-        "o2": "-O2: upstream default, best tested",
-        "o3": "-O3: aggressive instruction scheduling, loop pipelining, and x86 SIMD safety guards",
-        "size": "-Os: ~15-25% smaller text; slower hot paths; for minimal/embedded footprints",
-    },
-    ("compiler", "lto"): {
-        "none": "no link-time optimization (fastest builds, compatible with Rust+BTF)",
-        "thin": "ThinLTO: parallel, cached in ~/.cache/dusky-kernel/thinlto-cache",
-        "full": "monolithic LTO: best codegen; vmlinux link needs ~16-24 GiB RAM and is single-threaded",
-    },
-    ("compiler", "fdo"): {
-        "none": "no profile-guided optimization",
-        "autofdo": "CONFIG_AUTOFDO_CLANG with a perf-derived .afdo profile",
-        "autofdo_propeller": "AutoFDO + Propeller basic-block layout (needs create_llvm_prof profiles)",
-    },
-    ("compiler", "debug_info"): {
-        "none": "DEBUG_INFO_NONE (forced to DWARF5 when BTF is required by sched_ext/BPF)",
-        "reduced": "DWARF5 debug info (needed for BTF); no runtime memory cost",
-        "full": "full DWARF5, uncompressed (largest build tree)",
-    },
-    ("security", "profile"): {
-        "balanced": "Arch-like hardening: usercopy checks, init_on_alloc, freelist hardening, UBSAN bounds",
-        "extreme": "performance over hardening: disables most runtime checks (requires acknowledge_risk)",
-        "hardened": "KSPP-style: adds init_on_free, kCFI, random kmalloc caches, strict IOMMU, lockdown early",
-    },
-    ("storage", "io_scheduler"): {
-        "none": "no scheduler for NVMe (lowest overhead)",
-        "mq-deadline": "deadline-based, good for SATA SSDs",
-        "bfq": "fairness/latency oriented, best for rotational disks",
-        "kyber": "token-based low-latency scheduler for fast SSDs",
-        "keep": "do not install I/O scheduler udev rules",
-    },
-    ("power", "cpu_idle_governor"): {
-        "teo": "timer-events oriented: best for tickless desktops/laptops",
-        "menu": "classic predictive governor",
-        "haltpoll": "for KVM guests (polls before halting)",
-    },
-    ("network", "congestion"): {"bbr": "model-based, best for internet links", "cubic": "loss-based upstream default", "reno": "classic"},
-    ("network", "qdisc"): {
-        "fq": "fair queue pacing (pairs with BBR)", "cake": "bufferbloat killer for home links (runtime sysctl; Kconfig falls back to fq_codel)",
-        "fq_codel": "upstream default", "fq_pie": "PIE-based AQM", "pfifo_fast": "legacy FIFO",
-    },
-    ("modules", "mode"): {
-        "strict": "hardware-only via modprobed.db (LSMOD): tiny module set, tiny memory",
-        "expanded": "modprobed.db + LMC_KEEP safety net (USB/GPU/net/HID/fs stay available)",
-    },
-    ("compiler", "headers"): {
-        "auto": "build -headers only when DKMS modules are installed (nvidia, zfs, v4l2loopback...)",
-        "always": "always build the -headers package",
-        "never": "never build headers (enables TRIM_UNUSED_KSYMS eligibility)",
-    },
-    ("dusky", "seed"): {
-        "auto": "snapshot -> Arch upstream config -> /proc/config.gz -> headers -> defconfig",
-        "snapshot": "only the saved snapshot for this profile",
-        "arch": "Arch Linux packaging config (gitlab.archlinux.org)",
-        "running": "/proc/config.gz of the running kernel",
-        "headers": "/usr/lib/modules/$(uname -r)/build/.config",
-        "defconfig": "make defconfig (last resort; not desktop-complete)",
-    },
-    ("boot", "cmdline"): {
-        "bake": "compile flavor tuning into CONFIG_CMDLINE (bootloader options still win; per-kernel)",
-        "entry": "write tuning into the systemd-boot entry for this flavor only",
-        "print": "only print the recommended command line",
-    },
-}
-
-
-# ---------------------------------------------------------------------------------------------------
-# Profile schema
-# ---------------------------------------------------------------------------------------------------
-type FieldKind = Literal["str", "int", "bool", "list", "table"]
-
-
-@dataclass(frozen=True, slots=True)
-class FieldSpec:
-    key: str
-    kind: FieldKind
-    default: Any
-    help: str
-    choices: tuple[Any, ...] | None = None
-    required: bool = False
-    wizard: bool = True
-    minimum: int | None = None
-    maximum: int | None = None
-
-
-def F(key: str, kind: FieldKind, default: Any, help: str, choices: Iterable[Any] | None = None, *,
-      required: bool = False, wizard: bool = True, minimum: int | None = None, maximum: int | None = None) -> FieldSpec:
-    return FieldSpec(key, kind, default, help, tuple(choices) if choices else None, required, wizard, minimum, maximum)
-
-
-PROFILE_SPEC: Final[dict[str, tuple[FieldSpec, ...]]] = {
-    "meta": (
-        F("name", "str", "", "Profile id (matches --profile)", required=True, wizard=False),
-        F("description", "str", "", "One-line summary", wizard=False),
-        F("suffix", "str", "", "LOCALVERSION suffix and pkgbase tail: linux-<suffix>", required=True, wizard=False),
-        F("priority", "int", 50, "Sort order in pickers", wizard=False),
-        F("tags", "list", [], "Free-form labels", wizard=False),
-        F("bare_metal_only", "bool", False, "Refuse to build inside a VM and strip guest paravirt code"),
-        F("portable_package", "bool", False, "Package targets another machine (forbids -march=native)"),
-        F("manifest_path", "str", "", "Path to target hardware manifest.json for remote builds", wizard=False),
-    ),
-    "release": (
-        F("channel", "str", "stable", "Upstream release channel", CHANNEL_CHOICES),
-        F("pin", "str", "", "Exact version pin (e.g. 7.2.3 or 7.3-rc2); empty = newest in channel"),
-        F("allow_rc", "bool", True, "Allow -rc snapshot tarballs (mainline)"),
-        F("min_version", "str", "7.2", "Hard floor; anything older is rejected", wizard=False),
-        F("require_signature", "bool", True, "Require PGP or SHA256 verification of release tarballs"),
-    ),
-    "scheduler": (
-        F("type", "str", "eevdf", "Base scheduler", SCHED_CHOICES),
-        F("scx", "str", "none", "sched_ext BPF scheduler daemon", SCX_CHOICES),
-        F("scx_flags", "str", "", "Flags passed to the scx daemon (e.g. --autopilot)"),
-        F("scx_enable_class", "bool", True, "Compile CONFIG_SCHED_CLASS_EXT (+BTF/BPF JIT)"),
-        F("require_patch", "bool", False, "Fail the build if the scheduler patch cannot be applied"),
-        F("allow_vanilla_fallback", "bool", True, "Fall back to EEVDF when the patch fails"),
-        F("autogroup", "bool", True, "SCHED_AUTOGROUP (per-session fairness)"),
-        F("rt_group", "bool", False, "RT_GROUP_SCHED bandwidth control"),
-        F("sched_core", "bool", False, "SCHED_CORE core scheduling (SMT side-channel isolation; overhead)"),
-        F("patch_sources", "list", ["cachyos", "upstream_author", "tkg"], "Ordered patch resolvers", wizard=False),
-    ),
-    "cache": (
-        F("sched_cache", "bool", True, "CONFIG_SCHED_CACHE Cache-Aware Scheduling (LLC affinity)"),
-        F("llc_aggr_tolerance", "int", 1, "LLC aggregation tolerance written to debugfs at boot", minimum=0, maximum=100),
-        F("llc_aggr_cap", "int", -1, "LLC aggregation capacity percent (-1 = kernel default)", minimum=-1, maximum=100),
-    ),
-    "rseq": (
-        F("slice_extension", "bool", True, "RSEQ time-slice extension (CONFIG_RSEQ_SLICE_EXTENSION)"),
-        F("slice_ext_nsec", "int", 10000, "Requested slice extension in nanoseconds", minimum=1000, maximum=100000),
-    ),
-    "dusky": (
-        F("enhanced", "bool", False, "Desktop heuristics (nowatchdog, faster fbcon takeover)"),
-        F("patch_sched_inline", "bool", True, "Inline finish_task_switch() (~8.6%-35% context switch speedup)"),
-        F("patch_evdev_rcu", "bool", True, "Asynchronous evdev detach (eliminates 27s input close stalls)"),
-        F("patch_pci_pme", "bool", True, "Clear Linux 4000ms PCI PME polling timeout (reduces wakeups/saves power)"),
-        F("hostname", "str", "", "KBUILD_BUILD_HOST (empty = system hostname)", wizard=False),
-        F("user", "str", "", "KBUILD_BUILD_USER (empty = dynamic active user)", wizard=False),
-        F("reproducible", "bool", True, "Fixed KBUILD_BUILD_TIMESTAMP / SOURCE_DATE_EPOCH", wizard=False),
-        F("seed", "str", "auto", "Seed .config source", SEED_CHOICES),
-        F("extra_config", "table", {}, "Arbitrary Kconfig overrides: SYMBOL = true|false|\"m\"|int|\"string\""),
-    ),
-    "cpu": (
-        F("arch", "str", "native", "Target micro-architecture", CPU_ARCHES),
-        F("march", "str", "", "Extra -march/-mtune override appended to KCFLAGS", wizard=False),
-        F("governor", "str", "schedutil", "Default cpufreq governor", GOV_CHOICES),
-        F("amd_pstate", "str", "active", "AMD P-State operation mode", PSTATE_CHOICES),
-        F("epp", "str", "balance_performance", "Energy Performance Preference hint applied at boot", EPP_CHOICES),
-        F("mitigations", "str", "on", "Speculative-execution mitigations", MITIGATION_CHOICES),
-        F("nr_cpus", "int", 0, "CONFIG_NR_CPUS (0 = host thread count rounded up to 8)", minimum=0, maximum=8192),
-        F("smt", "bool", True, "Keep SMT/Hyper-Threading enabled"),
-        F("mce", "bool", True, "Machine Check Exception handling"),
-        F("prefcore", "bool", True, "AMD preferred-core / Intel ITMT priority (SCHED_MC_PRIO)"),
-        F("compat32", "bool", True, "IA32_EMULATION (Steam, Wine, 32-bit binaries)"),
-    ),
-    "timing": (
-        F("hz", "int", 1000, "Timer tick frequency", HZ_CHOICES),
-        F("tickless", "str", "idle", "Tickless mode", TICKLESS_CHOICES),
-        F("preempt", "str", "lazy", "Preemption model", PREEMPT_CHOICES),
-        F("preempt_dynamic", "bool", True, "PREEMPT_DYNAMIC (preempt= boot switch)"),
-    ),
-    "memory": (
-        F("footprint", "str", "standard", "Memory footprint tier (bundles many small Kconfig cuts)", FOOTPRINT_CHOICES),
-        F("thp", "str", "madvise", "Transparent Hugepages mode", THP_CHOICES),
-        F("thp_defrag", "str", "defer+madvise", "THP defrag strategy", THP_DEFRAG_CHOICES),
-        F("thp_shmem", "str", "never", "THP for shmem/tmpfs", THP_SHMEM_CHOICES),
-        F("mglru", "bool", True, "Multi-Gen LRU"),
-        F("mglru_mask", "int", 7, "lru_gen/enabled bitmask", minimum=0, maximum=7),
-        F("mglru_min_ttl_ms", "int", 1000, "lru_gen/min_ttl_ms anti-thrash threshold", minimum=0, maximum=60000),
-        F("swap_backend", "str", "zram", "Compressed swap backend", SWAP_BACKEND_CHOICES),
-        F("zram_algo", "str", "zstd", "Primary ZRAM compressor", ZRAM_ALGO_CHOICES),
-        F("zram_recomp_algo", "str", "zstd", "ZRAM recompression algorithm for idle pages (multi-comp)", ZRAM_ALGO_CHOICES),
-        F("zram_size_pct", "int", 100, "ZRAM size as percent of RAM", minimum=10, maximum=400),
-        F("zram_multi_comp", "bool", True, "CONFIG_ZRAM_MULTI_COMP (multi-algorithm swap compression in kernel)"),
-        F("zswap_compressor", "str", "zstd", "zswap compressor", ZSWAP_COMP_CHOICES),
-        F("zswap_max_pool_pct", "int", 25, "zswap.max_pool_percent", minimum=5, maximum=80),
-        F("swappiness", "int", 0, "vm.swappiness (0 = auto: 180 zram, 100 zswap, 60 none)", minimum=0, maximum=200),
-        F("vfs_cache_pressure", "int", 0, "vm.vfs_cache_pressure (0 = auto by footprint)", minimum=0, maximum=1000),
-        F("watermark_scale_factor", "int", 125, "vm.watermark_scale_factor", minimum=10, maximum=3000),
-        F("watermark_boost_factor", "int", 0, "vm.watermark_boost_factor (0 recommended with zram)", minimum=0, maximum=30000),
-        F("compaction_proactiveness", "int", 0, "vm.compaction_proactiveness (0 = auto: 20 with THP, 0 without)", minimum=0, maximum=100),
-        F("dirty_bytes_mb", "int", 0, "vm.dirty_bytes in MiB (0 = kernel ratio defaults)", minimum=0, maximum=65536),
-        F("slub_tiny", "bool", False, "CONFIG_SLUB_TINY minimal allocator (sacrifices SMP scalability)"),
-        F("slab_buckets", "bool", False, "CONFIG_SLAB_BUCKETS hardening buckets (slightly more memory)"),
-        F("per_vma_lock", "bool", True, "CONFIG_PER_VMA_LOCK"),
-        F("numa", "bool", True, "NUMA topology support"),
-        F("numa_balancing", "bool", False, "Automatic NUMA balancing"),
-        F("nodes_shift", "int", 2, "CONFIG_NODES_SHIFT", minimum=0, maximum=10),
-        F("ksm", "bool", True, "Kernel Samepage Merging support"),
-        F("ksm_run", "bool", False, "Activate ksmd at boot (only merges MADV_MERGEABLE/prctl opted-in memory)"),
-        F("damon", "bool", False, "DAMON monitoring + DAMON_RECLAIM proactive reclaim"),
-        F("page_reporting", "bool", False, "Free page reporting to the hypervisor (VM guests)"),
-        F("hugetlbfs", "bool", True, "hugetlbfs / HugeTLB pages"),
-        F("kallsyms_all", "bool", True, "KALLSYMS_ALL (all symbols incl. data; ~1-2 MiB)"),
-        F("memcg", "bool", True, "cgroup v2 memory controller (systemd MemoryMax, oomd)"),
-        F("base_small", "bool", False, "BASE_SMALL: shrink core hash tables (embedded)"),
-        F("log_buf_shift", "int", 0, "CONFIG_LOG_BUF_SHIFT (0 = 17 standard / 16 lean / 15 minimal)", minimum=0, maximum=25),
-        F("tracing", "str", "auto", "ftrace/kprobes/uprobes surface", TRACING_CHOICES),
-        F("kexec", "bool", True, "kexec + crash dump support"),
-        F("ikconfig", "bool", True, "Embed .config (/proc/config.gz)"),
-        F("trim_unused_ksyms", "bool", False, "TRIM_UNUSED_KSYMS (breaks out-of-tree modules; only with headers=never)"),
-        F("dead_code_elimination", "bool", False, "LD_DEAD_CODE_DATA_ELIMINATION (inert on upstream x86-64)"),
-    ),
-    "compiler": (
-        F("toolchain", "str", "llvm", "Toolchain", TOOLCHAIN_CHOICES),
-        F("optimize", "str", "o2", "Optimization level", OPT_CHOICES),
-        F("polly", "bool", False, "Clang Polly loop optimizer (CONFIG_POLLY_CLANG)"),
-        F("lto", "str", "thin", "Link-time optimization", LTO_CHOICES),
-        F("thinlto_cache", "bool", True, "Persist the ThinLTO cache across builds"),
-        F("thinlto_cache_size_gb", "int", 20, "Prune the ThinLTO cache above this size", minimum=1, maximum=500),
-        F("fdo", "str", "none", "Feedback-directed optimization", FDO_CHOICES),
-        F("fdo_profile_dir", "str", "", "Directory holding kernel.afdo / propeller_* profiles"),
-        F("kcfi", "bool", False, "Clang kCFI (CONFIG_CFI) + FineIBT auto"),
-        F("debug_info", "str", "reduced", "Debug info level", DEBUG_CHOICES),
-        F("module_compress", "str", "zstd", "Module compression", COMPRESS_CHOICES),
-        F("rust", "bool", True, "Rust support (auto-disabled when LTO + BTF are both required)"),
-        F("jobs", "int", 0, "Parallel jobs (0 = auto from CPU threads and RAM)", minimum=0, maximum=1024),
-        F("headers", "str", "auto", "Headers package policy", HEADERS_CHOICES),
-        F("modversions", "bool", False, "MODVERSIONS symbol CRCs (needs GENDWARFKSYMS with Rust)"),
-        F("ccache", "bool", True, "Enable ccache compiler cache if available on the host"),
-    ),
-    "security": (
-        F("profile", "str", "balanced", "Hardening bundle", SECURITY_PROFILES),
-        F("init_on_alloc", "bool", True, "Zero memory on allocation"),
-        F("init_on_free", "bool", False, "Zero memory on free (expensive)"),
-        F("hardened_usercopy", "bool", True, "Hardened usercopy bounds checks"),
-        F("stackprotector", "str", "strong", "Stack protector", STACKPROTECTOR_CHOICES),
-        F("slab_freelist_hardened", "bool", True, "SLAB freelist pointer obfuscation"),
-        F("slab_freelist_random", "bool", True, "Randomized freelists"),
-        F("randomize_kstack", "bool", True, "Randomize kernel stack offset per syscall"),
-        F("ubsan_bounds", "bool", True, "UBSAN array-bounds instrumentation"),
-        F("apparmor", "bool", False, "Build AppArmor and place it in the default LSM order"),
-        F("selinux", "bool", False, "Build SELinux (kept out of the default LSM order)"),
-        F("lockdown_early", "bool", False, "SECURITY_LOCKDOWN_LSM_EARLY"),
-        F("acknowledge_risk", "bool", False, "Acknowledge extreme profile / mitigations=off risks"),
-    ),
-    "gaming": (
-        F("ntsync", "bool", True, "In-tree NTSync driver (CONFIG_NTSYNC=m)"),
-        F("uclamp", "bool", True, "UCLAMP_TASK utilization clamping"),
-        F("max_map_count", "int", 2147483642, "vm.max_map_count", minimum=65530, maximum=2147483642),
-        F("split_lock_mitigate", "bool", False, "Split-lock detection penalty (off = better emulator/game frametimes)"),
-        F("controllers", "bool", True, "Keep controller/HID drivers (xpad, playstation, nintendo, steam, uinput)"),
-    ),
-    "storage": (
-        F("nvme_poll_queues", "int", 0, "nvme.poll_queues (IOPOLL) count", minimum=0, maximum=128),
-        F("io_scheduler", "str", "none", "NVMe I/O scheduler udev default", IOSCHED_CHOICES),
-        F("blk_wbt", "bool", True, "Block writeback throttling"),
-        F("iocost", "bool", False, "BLK_CGROUP_IOCOST proportional I/O control"),
-        F("extra_filesystems", "list", [], "Additional filesystems to keep as modules (e.g. xfs, f2fs)"),
-    ),
-    "power": (
-        F("wq_power_efficient", "bool", False, "Power-efficient unbound workqueues"),
-        F("cpu_idle_governor", "str", "teo", "cpuidle governor", IDLE_GOV_CHOICES),
-        F("rcu_lazy", "bool", False, "RCU lazy callbacks on all CPUs (battery)"),
-        F("energy_model", "bool", False, "Energy model / EAS"),
-        F("suspend", "bool", True, "Suspend-to-idle/RAM"),
-        F("hibernation", "bool", True, "Hibernation (zstd compressed image)"),
-        F("pcie_aspm", "str", "default", "Default PCIe ASPM policy", PCIE_ASPM_CHOICES),
-        F("hda_power_save", "int", 0, "SND_HDA_POWER_SAVE_DEFAULT seconds (0 = off)", minimum=0, maximum=3600),
-    ),
-    "network": (
-        F("congestion", "str", "bbr", "TCP congestion control", CONG_CHOICES),
-        F("qdisc", "str", "fq", "Root queueing discipline", QDISC_CHOICES),
-        F("mptcp", "bool", True, "Multipath TCP"),
-        F("xdp", "bool", False, "AF_XDP sockets"),
-        F("nf_conntrack_procfs", "bool", False, "Legacy /proc/net/nf_conntrack"),
-        F("tcp_fastopen", "bool", True, "net.ipv4.tcp_fastopen=3"),
-    ),
-    "modules": (
-        F("mode", "str", "strict", "Pruning mode", MODULES_MODE_CHOICES),
-        F("modprobed_db", "bool", True, "Use modprobed.db as LSMOD"),
-        F("modprobed_db_path", "str", "", "Custom modprobed.db path (imported bundles)"),
-        F("allow_lsmod_fallback", "bool", False, "Strict mode may fall back to the live lsmod set"),
-        F("lmc_keep_extra", "list", [], "Extra LMC_KEEP paths (expanded mode)"),
-        F("keep_symbols", "list", [], "Kconfig symbols forced to =m after pruning (e.g. WIREGUARD, TUN)"),
-        F("localyesconfig", "bool", False, "Build pruned modules into the image (localyesconfig)"),
-        F("sig_force", "bool", False, "MODULE_SIG_FORCE (auto-generated key)"),
-    ),
-    "boot": (
-        F("cmdline", "str", "bake", "How flavor tuning reaches the kernel command line", CMDLINE_CHOICES),
-        F("cmdline_extra", "str", "", "Extra kernel parameters appended to the flavor tuning"),
-        F("write_entries", "bool", True, "Write/refresh systemd-boot entries for this flavor"),
-        F("nowatchdog", "bool", True, "Disable NMI/soft watchdog (nowatchdog nmi_watchdog=0)"),
-        F("acs_override", "bool", False, "PCIe ACS override for broken IOMMU groups (VFIO GPU passthrough; dangerous)"),
-    ),
-    "verify": (
-        F("strict", "bool", True, "Hard-fail when a non-optional Kconfig contract entry is unmet"),
-        F("optional_symbols", "list", [], "Extra symbols treated as soft in the contract", wizard=False),
-        F("require_ntsync", "bool", True, "Require NTSync when gaming.ntsync=true"),
-        F("require_btf", "bool", True, "Require BTF whenever sched_ext is compiled"),
-        F("require_sched_ext", "bool", True, "Require SCHED_CLASS_EXT when scx daemon != none"),
-    ),
-}
-
-
-@dataclass(frozen=True, slots=True)
-class WizardStep:
-    title: str
-    groups: tuple[tuple[str, tuple[str, ...]], ...]
-
-
-WIZARD_STEPS: Final[tuple[WizardStep, ...]] = (
-    WizardStep("Release", (("release", ("channel", "pin", "allow_rc", "require_signature")),)),
-    WizardStep("CPU", (("cpu", ("arch", "governor", "amd_pstate", "epp", "mitigations", "nr_cpus", "smt", "prefcore", "compat32", "mce")),)),
-    WizardStep("Scheduler", (("scheduler", ("type", "scx", "scx_flags", "scx_enable_class", "require_patch", "allow_vanilla_fallback", "autogroup", "rt_group", "sched_core")),
-                             ("cache", ("sched_cache", "llc_aggr_tolerance", "llc_aggr_cap")),
-                             ("rseq", ("slice_extension", "slice_ext_nsec")))),
-    WizardStep("Timing", (("timing", ("hz", "tickless", "preempt", "preempt_dynamic")),)),
-    WizardStep("Memory & Low-RAM", (("memory", ("footprint", "thp", "thp_defrag", "thp_shmem", "mglru", "mglru_mask", "mglru_min_ttl_ms", "swap_backend",
-                                                "zram_algo", "zram_recomp_algo", "zram_size_pct", "zram_multi_comp", "zswap_compressor", "zswap_max_pool_pct",
-                                                "swappiness", "vfs_cache_pressure", "watermark_scale_factor", "watermark_boost_factor", "compaction_proactiveness",
-                                                "dirty_bytes_mb", "slub_tiny", "slab_buckets", "per_vma_lock", "numa", "numa_balancing", "nodes_shift", "ksm", "ksm_run",
-                                                "damon", "page_reporting", "hugetlbfs", "kallsyms_all", "memcg", "base_small", "log_buf_shift", "tracing", "kexec",
-                                                "ikconfig", "trim_unused_ksyms", "dead_code_elimination")),)),
-    WizardStep("Compiler & Toolchain", (("compiler", ("toolchain", "optimize", "polly", "lto", "thinlto_cache", "thinlto_cache_size_gb", "kcfi", "fdo", "fdo_profile_dir",
-                                                       "debug_info", "module_compress", "rust", "jobs", "modversions")),
-                                        ("dusky", ("seed", "enhanced", "patch_sched_inline", "patch_evdev_rcu", "patch_pci_pme", "extra_config")))),
-    WizardStep("Security", (("security", ("profile", "init_on_alloc", "init_on_free", "hardened_usercopy", "stackprotector", "slab_freelist_hardened",
-                                          "slab_freelist_random", "randomize_kstack", "ubsan_bounds", "apparmor", "selinux", "lockdown_early", "acknowledge_risk")),)),
-    WizardStep("Gaming / Low-Latency", (("gaming", ("ntsync", "uclamp", "max_map_count", "split_lock_mitigate", "controllers")),)),
-    WizardStep("Storage & Power", (("storage", ("nvme_poll_queues", "io_scheduler", "blk_wbt", "iocost", "extra_filesystems")),
-                                   ("power", ("cpu_idle_governor", "rcu_lazy", "energy_model", "wq_power_efficient", "suspend", "hibernation", "pcie_aspm", "hda_power_save")))),
-    WizardStep("Network", (("network", ("congestion", "qdisc", "mptcp", "xdp", "nf_conntrack_procfs", "tcp_fastopen")),)),
-    WizardStep("Modules, Headers & Boot", (("modules", ("mode", "modprobed_db", "modprobed_db_path", "allow_lsmod_fallback", "lmc_keep_extra", "keep_symbols",
-                                                        "localyesconfig", "sig_force")),
-                                           ("compiler", ("headers",)),
-                                           ("boot", ("cmdline", "cmdline_extra", "write_entries", "nowatchdog", "acs_override")),
-                                           ("meta", ("bare_metal_only", "portable_package")),
-                                           ("verify", ("strict", "require_ntsync", "require_btf", "require_sched_ext")))),
-)
-
-# ---------------------------------------------------------------------------------------------------
-# Profile model
-# ---------------------------------------------------------------------------------------------------
-SECURITY_BUNDLES: Final[dict[str, dict[str, Any]]] = {
-    "balanced": {"init_on_alloc": True, "init_on_free": False, "hardened_usercopy": True, "stackprotector": "strong",
-                 "slab_freelist_hardened": True, "slab_freelist_random": True, "randomize_kstack": True, "ubsan_bounds": True, "lockdown_early": False},
-    "extreme": {"init_on_alloc": False, "init_on_free": False, "hardened_usercopy": False, "stackprotector": "regular",
-                "slab_freelist_hardened": False, "slab_freelist_random": False, "randomize_kstack": False, "ubsan_bounds": False, "lockdown_early": False},
-    "hardened": {"init_on_alloc": True, "init_on_free": True, "hardened_usercopy": True, "stackprotector": "strong",
-                 "slab_freelist_hardened": True, "slab_freelist_random": True, "randomize_kstack": True, "ubsan_bounds": True, "lockdown_early": True},
-}
-FOOTPRINT_RANK: Final = {name: i for i, name in enumerate(FOOTPRINT_CHOICES)}
+from kernel_profiles.schema import (
+    HZ_CHOICES,
+    HZ_UPSTREAM,
+    TICKLESS_CHOICES,
+    PREEMPT_CHOICES,
+    SCHED_CHOICES,
+    SCX_CHOICES,
+    CHANNEL_CHOICES,
+    LTO_CHOICES,
+    OPT_CHOICES,
+    FDO_CHOICES,
+    THP_CHOICES,
+    THP_DEFRAG_CHOICES,
+    THP_SHMEM_CHOICES,
+    SWAP_BACKEND_CHOICES,
+    ZRAM_ALGO_CHOICES,
+    ZSWAP_COMP_CHOICES,
+    FOOTPRINT_CHOICES,
+    TRACING_CHOICES,
+    GOV_CHOICES,
+    EPP_CHOICES,
+    PSTATE_CHOICES,
+    MITIGATION_CHOICES,
+    IDLE_GOV_CHOICES,
+    PCIE_ASPM_CHOICES,
+    CONG_CHOICES,
+    QDISC_CHOICES,
+    TOOLCHAIN_CHOICES,
+    HEADERS_CHOICES,
+    MODULES_MODE_CHOICES,
+    COMPRESS_CHOICES,
+    DEBUG_CHOICES,
+    SECURITY_PROFILES,
+    STACKPROTECTOR_CHOICES,
+    IOSCHED_CHOICES,
+    SEED_CHOICES,
+    CMDLINE_CHOICES,
+    CHOICE_HELP,
+    FieldSpec,
+    F,
+    PROFILE_SPEC,
+    WizardStep,
+    WIZARD_STEPS,
+    SECURITY_BUNDLES,
+    FOOTPRINT_RANK,
+ )
 
 
 @dataclass(slots=True)
@@ -1168,28 +692,12 @@ class KernelProfile:
 
 
 def _coerce_value(spec: FieldSpec, val: Any) -> Any:
-    match spec.kind:
-        case "bool":
-            if isinstance(val, bool):
-                return val
-            return str(val).strip().lower() in ("true", "1", "yes", "on", "y")
-        case "int":
-            if isinstance(val, bool):
-                return int(val)
-            if isinstance(val, int):
-                return val
-            try:
-                return int(str(val).strip())
-            except ValueError:
-                return spec.default
-        case "list":
-            if isinstance(val, str):
-                return [x.strip() for x in val.split(",") if x.strip()]
-            return [str(x) for x in (val or [])]
-        case "table":
-            return dict(val) if isinstance(val, Mapping) else {}
-        case _:
-            return "" if val is None else str(val)
+    expected = {"bool": bool, "int": int, "str": str, "list": list, "table": dict}[spec.kind]
+    if type(val) is not expected:
+        raise ProfileError(f"{spec.key}: expected {spec.kind}, got {type(val).__name__}")
+    if spec.kind == "list" and not all(isinstance(x, str) for x in val):
+        raise ProfileError(f"{spec.key}: list entries must be strings")
+    return val.copy() if isinstance(val, (list, dict)) else val
 
 
 def coerce(data: Mapping[str, Any], path: Path) -> tuple[Sections, set[tuple[str, str]]]:
@@ -1197,13 +705,15 @@ def coerce(data: Mapping[str, Any], path: Path) -> tuple[Sections, set[tuple[str
     explicit: set[tuple[str, str]] = set()
     for sec in data:
         if sec not in PROFILE_SPEC:
-            warn(f"{path.name}: unknown section [{sec}] ignored")
+            raise ProfileError(f"{path.name}: unknown section [{sec}]")
     for sec, fields in PROFILE_SPEC.items():
-        in_sec = data.get(sec, {}) or {}
+        in_sec = data.get(sec, {})
+        if not isinstance(in_sec, dict):
+            raise ProfileError(f"{path.name}: [{sec}] must be a table")
         known = {f.key for f in fields}
         for key in in_sec:
             if key not in known:
-                warn(f"{path.name}: unknown key {sec}.{key} ignored (typo?)")
+                raise ProfileError(f"{path.name}: unknown key {sec}.{key}")
         out: dict[str, Any] = {}
         for f in fields:
             if f.key in in_sec:
@@ -1217,7 +727,7 @@ def coerce(data: Mapping[str, Any], path: Path) -> tuple[Sections, set[tuple[str
 
 def apply_security_bundle(p: KernelProfile) -> None:
     """Security knobs not explicitly set in the TOML follow the selected hardening bundle."""
-    bundle = SECURITY_BUNDLES[p.g("security", "profile")]
+    bundle = SECURITY_BUNDLES.get(p.g("security", "profile"), {})
     for key, val in bundle.items():
         if ("security", key) not in p.explicit:
             p.sections["security"][key] = val
@@ -1236,6 +746,21 @@ def validate_profile(p: KernelProfile) -> None:
                     raise ProfileError(f"{p.path.name}: {sec}.{f.key}={val} below minimum {f.minimum}")
                 if f.maximum is not None and val > f.maximum:
                     raise ProfileError(f"{p.path.name}: {sec}.{f.key}={val} above maximum {f.maximum}")
+    if not re.fullmatch(r"none|scx_[A-Za-z0-9_]+", p.g("scheduler", "scx")):
+        raise ProfileError("scheduler.scx must be none or a scx_ executable name")
+    if not re.fullmatch(r"[A-Za-z0-9_.+-]+", p.g("cpu", "arch")):
+        raise ProfileError("cpu.arch must be a compiler CPU name")
+    try:
+        flags = shlex.split(p.g("cpu", "march"))
+        shlex.split(p.g("boot", "cmdline_extra"))
+        shlex.split(p.g("scheduler", "scx_flags"))
+    except ValueError as e:
+        raise ProfileError(f"Invalid quoting in profile: {e}") from e
+    if any(not re.fullmatch(r"-m(?:arch|tune)=[A-Za-z0-9_.+-]+", flag) for flag in flags):
+        raise ProfileError("cpu.march accepts only -march=CPU and -mtune=CPU flags")
+    for key, value in p.g("dusky", "extra_config").items():
+        if not re.fullmatch(r"(?:CONFIG_)?[A-Za-z0-9_]+", key) or type(value) not in (bool, int, str):
+            raise ProfileError(f"Invalid Kconfig override: {key}")
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", p.suffix):
         raise ProfileError(f"{p.path.name}: meta.suffix '{p.suffix}' must match [a-z0-9][a-z0-9-]*")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", p.name):
@@ -1265,6 +790,7 @@ def normalize_profile(p: KernelProfile) -> list[str]:
         force("scheduler", "scx", "none", "Project C replaces EEVDF; sched_ext unavailable")
         force("scheduler", "scx_enable_class", False, "Project C replaces EEVDF; sched_ext unavailable")
     if s["scheduler"]["scx"] != "none":
+        force("memory", "tracing", "full", "sched_ext daemon probes need function tracing")
         force("scheduler", "scx_enable_class", True, "a BPF scheduler daemon needs SCHED_CLASS_EXT")
     if s["memory"]["swap_backend"] != "zram":
         force("memory", "zram_multi_comp", False, "no zram device configured")
@@ -1290,8 +816,13 @@ def normalize_profile(p: KernelProfile) -> list[str]:
 
 def cross_validate(p: KernelProfile, facts: "HostFacts | None" = None, *, force: bool = False) -> None:
     s = p.sections
-    if s["meta"]["portable_package"] and s["cpu"]["arch"] == "native":
-        raise ProfileError("portable_package=true forbids cpu.arch=native (use generic_v3/znver4/...)")
+    remote = bool(s["meta"]["portable_package"] or s["meta"]["manifest_path"])
+    if remote and s["cpu"]["arch"] == "native":
+        raise ProfileError("Remote/portable builds require an explicit target CPU, never native")
+    if remote:
+        extra = {str(key).removeprefix("CONFIG_"): value for key, value in s["dusky"]["extra_config"].items()}
+        if extra.get("X86_NATIVE_CPU") in (True, "y", "m"):
+            raise ProfileError("Remote/portable builds cannot enable CONFIG_X86_NATIVE_CPU")
     if s["modules"]["mode"] == "strict" and not s["modules"]["modprobed_db"] and not s["modules"]["allow_lsmod_fallback"]:
         raise ProfileError("modules.mode=strict needs modprobed_db=true (or allow_lsmod_fallback=true)")
     if s["security"]["profile"] == "extreme" or s["cpu"]["mitigations"] == "off":
@@ -1299,13 +830,24 @@ def cross_validate(p: KernelProfile, facts: "HostFacts | None" = None, *, force:
             raise ProfileError("security.profile=extreme / cpu.mitigations=off require security.acknowledge_risk=true")
     if s["timing"]["hz"] not in HZ_CHOICES:
         raise ProfileError(f"timing.hz={s['timing']['hz']} unsupported")
+    floor = KVer.parse(s["release"]["min_version"])
+    if floor is None:
+        raise ProfileError("release.min_version must be a kernel version")
     if s["release"]["pin"]:
         pinned = KVer.parse(s["release"]["pin"])
         if pinned is None:
             raise ProfileError(f"release.pin '{s['release']['pin']}' is not a kernel version")
-        if pinned.key() < KVer(*MIN_KERNEL).key():
+        if pinned.key() < max(floor.key(), KVer(*MIN_KERNEL).key()):
             raise ProfileError(f"release.pin {s['release']['pin']} is below the {MIN_KERNEL[0]}.{MIN_KERNEL[1]} floor")
+        if pinned.rc is not None and not s["release"]["allow_rc"]:
+            raise ProfileError("release.pin selects an RC but release.allow_rc=false")
+    if remote and "native" in s["cpu"]["march"]:
+        raise ProfileError("remote/portable builds cannot use native CPU flags")
+    if s["cpu"]["nr_cpus"] == 1:
+        raise ProfileError("This SMP kernel requires nr_cpus >= 2, or 0 for automatic sizing")
     if facts is not None:
+        if s["memory"]["numa"] and s["memory"]["nodes_shift"] and 2 ** s["memory"]["nodes_shift"] < facts.numa_nodes:
+            raise ProfileError("memory.nodes_shift is too small for the target; use 0 for automatic sizing")
         if s["meta"]["bare_metal_only"] and not force:
             _det, _reason = _virt_guest(facts)
             if _det:
@@ -1416,7 +958,7 @@ def ensure_profiles_exist() -> list[KernelProfile]:
     if profiles:
         return profiles
     warn(f"No profiles found in {', '.join(str(d) for d in profile_dirs())}")
-    if interactive() and ask_yes("Write the built-in default profiles now?", True):
+    if interactive() and ask_yes("Write the profile template now?", True):
         do_write_defaults(argparse.Namespace())
         return discover_profiles()
     raise ProfileError("No profiles available; run --write-default-profiles")
@@ -1436,20 +978,8 @@ def print_profile_table(profiles: Sequence[KernelProfile], facts: "HostFacts | N
 
 
 def recommend_profile(profiles: Sequence[KernelProfile], facts: "HostFacts") -> KernelProfile | None:
-    names = {p.name: p for p in profiles}
-    if facts.virt != "none" and "vm_guest" in names:
-        return names["vm_guest"]
-    if facts.mem_gib <= 4.5:
-        for cand in ("minimal_strict", "embedded_lowram", "low_ram"):
-            if cand in names:
-                return names[cand]
-    if facts.mem_gib <= 8.5 and "low_ram" in names:
-        return names["low_ram"]
-    if facts.battery and "battery_efficiency" in names:
-        return names["battery_efficiency"]
-    if facts.vendor == "amd" and facts.uarch in ("znver4", "znver5") and "zen4_zen5" in names:
-        return names["zen4_zen5"]
-    return names.get("dusky_personal") or (profiles[0] if profiles else None)
+    # Priority is owned by TOML, never by a hardcoded profile name.
+    return min(profiles, key=lambda p: (p.priority, p.name)) if profiles else None
 
 
 def select_profile(profiles: Sequence[KernelProfile], wanted: str | None, facts: "HostFacts | None" = None) -> KernelProfile:
@@ -1502,7 +1032,7 @@ class Overrides:
             modules_mode=getattr(args, "modules_mode", None) or env("DUSKY_MODULES_MODE"),
             toolchain=getattr(args, "toolchain", None) or env("DUSKY_TOOLCHAIN"),
             lto=getattr(args, "lto", None) or env("DUSKY_LTO"),
-            jobs=getattr(args, "jobs", None) or (int(jobs_env) if jobs_env and jobs_env.isdigit() else None),
+            jobs=getattr(args, "jobs", None) if getattr(args, "jobs", None) is not None else (int(jobs_env) if jobs_env and re.fullmatch(r"-?\d+", jobs_env) else None),
             pin=getattr(args, "pin", None) or env("DUSKY_PIN"),
             channel=getattr(args, "channel", None) or env("DUSKY_CHANNEL"),
             scheduler=getattr(args, "scheduler", None) or env("DUSKY_SCHEDULER"),
@@ -1530,7 +1060,7 @@ def apply_overrides(p: KernelProfile, o: Overrides) -> list[str]:
         put("compiler", "toolchain", o.toolchain)
     if o.lto:
         put("compiler", "lto", o.lto)
-    if o.jobs:
+    if o.jobs is not None:
         put("compiler", "jobs", o.jobs)
     if o.pin:
         put("release", "pin", o.pin)
@@ -1560,7 +1090,7 @@ def field_relevant(s: Sections, sec: str, key: str) -> bool:
             return s["scheduler"]["scx"] != "none"
         case ("scheduler", "require_patch") | ("scheduler", "allow_vanilla_fallback"):
             return s["scheduler"]["type"] != "eevdf"
-        case ("cache", "llc_aggr_tolerance") | ("cache", "llc_aggr_cap"):
+        case ("cache", "llc_aggr_tolerance") | ("cache", "llc_overaggr_pct"):
             return bool(s["cache"]["sched_cache"])
         case ("rseq", "slice_ext_nsec"):
             return bool(s["rseq"]["slice_extension"])
@@ -1687,9 +1217,6 @@ def prompt_field(p: KernelProfile, sec: str, spec: FieldSpec, facts: "HostFacts 
     if spec.choices:
         for i, ch in enumerate(spec.choices, 1):
             ctx = help_map.get(str(ch), "")
-            if (sec, spec.key) == ("cpu", "arch") and str(ch) in UARCH_INFO and str(ch) not in help_map:
-                level, sym = UARCH_INFO[str(ch)]
-                ctx = f"-march={ch} via KCFLAGS (psABI v{level}; {sym} when the more-uarches patch is present)"
             marker = "●" if ch == current else "○"
             say(f"    {marker} {i:>2}) {C.BOLD}{ch}{C.RESET}  {C.DIM}{ctx}{C.RESET}")
         if (sec, spec.key) == ("cpu", "arch") and facts is not None:
@@ -2105,8 +1632,7 @@ class Privilege:
 
     def stop(self) -> None:
         self._stop.set()
-        if self.tool == "sudo":
-            subprocess.run(["sudo", "-k"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 
 
 PRIV: Final = Privilege()
@@ -2411,17 +1937,15 @@ def _read(path: str | Path, default: str = "") -> str:
 
 
 def _cpuinfo_flags() -> frozenset[str]:
-    for line in _read("/proc/cpuinfo").splitlines():
-        if line.startswith("flags"):
-            return frozenset(line.split(":", 1)[1].split())
-    return frozenset()
+    flags = [set(line.split(":", 1)[1].split()) for line in _read("/proc/cpuinfo").splitlines() if line.startswith("flags")]
+    return frozenset(set.intersection(*flags)) if flags else frozenset()
 
 
 def psabi_level(flags: frozenset[str]) -> int:
     v2 = {"cx16", "lahf_lm", "popcnt", "sse4_1", "sse4_2", "ssse3"}
     v3 = {"avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "abm", "movbe", "xsave"}
     v4 = {"avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl"}
-    if v4 <= flags and v3 <= flags:
+    if v4 <= flags and v3 <= flags and v2 <= flags:
         return 4
     if v3 <= flags and v2 <= flags:
         return 3
@@ -2443,14 +1967,8 @@ def detect_native_uarch() -> str:
         m = re.search(r"-march=\s+(\S+)", cp.stdout or "")
         if m:
             candidates.append(m.group(1).lower())
-    aliases = {"icelake": "icelake-client", "skylake-avx512": "skylake-avx512", "cascadelake": "skylake-avx512", "cooperlake": "skylake-avx512",
-               "goldmont-plus": "generic_v2", "tremont": "generic_v2", "gracemont": "alderlake", "sierraforest": "alderlake", "pantherlake": "lunarlake",
-               "diamondrapids": "graniterapids", "znver6": "znver5", "x86-64": "generic", "x86-64-v2": "generic_v2", "x86-64-v3": "generic_v3", "x86-64-v4": "generic_v4"}
-    for c in candidates:
-        c = aliases.get(c, c)
-        if c in CPU_ARCHES:
-            return c
-    return ""
+    aliases = {"x86-64": "generic", "x86-64-v2": "generic_v2", "x86-64-v3": "generic_v3", "x86-64-v4": "generic_v4"}
+    return aliases.get(candidates[0], candidates[0]) if candidates else ""
 
 
 def _sys_llc() -> tuple[int, int]:
@@ -2488,14 +2006,14 @@ def _mounted_filesystems() -> tuple[tuple[str, ...], str]:
         if len(parts) < 3:
             continue
         mnt, fstype = parts[1], parts[2]
-        if fstype in ("ext4", "btrfs", "xfs", "f2fs", "vfat", "exfat", "ntfs3", "fuse", "fuseblk", "overlay", "nfs", "nfs4", "cifs", "smb3", "erofs", "zfs", "bcachefs"):
+        if fstype in ("ext4", "btrfs", "xfs", "f2fs", "vfat", "exfat", "ntfs", "ntfs3", "virtiofs", "fuse", "fuseblk", "overlay", "nfs", "nfs4", "cifs", "smb3", "erofs", "zfs", "bcachefs"):
             if fstype not in fstypes:
                 fstypes.append(fstype)
             if mnt == "/":
                 root_fs = fstype
     for line in _read("/etc/fstab").splitlines():
         parts = line.split()
-        if len(parts) >= 3 and not line.lstrip().startswith("#") and parts[2] not in fstypes and parts[2] in ("ext4", "btrfs", "xfs", "f2fs", "vfat", "exfat", "ntfs3", "nfs", "nfs4", "cifs"):
+        if len(parts) >= 3 and not line.lstrip().startswith("#") and parts[2] not in fstypes and parts[2] in ("ext4", "btrfs", "xfs", "f2fs", "vfat", "exfat", "ntfs", "ntfs3", "virtiofs", "nfs", "nfs4", "cifs"):
             fstypes.append(parts[2])
     return tuple(fstypes), root_fs
 
@@ -2531,7 +2049,7 @@ def _bootloaders() -> tuple[tuple[str, ...], str, str]:
                 has_sdboot_efivars = any(efivars.glob("LoaderInfo-*")) or any(efivars.glob("LoaderEntry*"))
         except Exception:
             pass
-        if cp.returncode == 0 or has_sdboot_efivars or esp:
+        if cp.returncode == 0 or has_sdboot_efivars:
             found.append("systemd-boot")
     if "systemd-boot" not in found:
         for cand in ("/boot/loader/entries", "/efi/loader/entries", "/boot/efi/loader/entries"):
@@ -2605,6 +2123,17 @@ class HostFacts:
         return d
 
 
+def possible_cpu_count() -> int:
+    ranges = _read("/sys/devices/system/cpu/possible").strip().split(",")
+    slots = 0
+    for item in ranges:
+        if not item:
+            continue
+        lo, _, hi = item.partition("-")
+        slots = max(slots, int(hi or lo) + 1)
+    return slots or os.cpu_count() or 1
+
+
 @functools.cache
 def host_facts() -> HostFacts:
     cpuinfo = _read("/proc/cpuinfo")
@@ -2621,7 +2150,7 @@ def host_facts() -> HostFacts:
     swaps = [line.split()[0] for line in _read("/proc/swaps").splitlines()[1:] if line.strip()]
     virt = "none"
     if have("systemd-detect-virt"):
-        cp = run(["systemd-detect-virt"], check=False, timeout=10)
+        cp = run(["systemd-detect-virt", "--vm"], check=False, timeout=10)
         virt = (cp.stdout or "none").strip() if cp.returncode == 0 else "none"
     llc_domains, llc_kib = _sys_llc()
     fstypes, root_fs = _mounted_filesystems()
@@ -2635,7 +2164,7 @@ def host_facts() -> HostFacts:
     root_luks = any(line.split()[0].startswith("/dev/mapper/") for line in _read("/proc/mounts").splitlines() if len(line.split()) > 1 and line.split()[1] == "/")
     return HostFacts(
         vendor=vendor, model=(model_m.group(1).strip() if model_m else platform.processor() or "unknown"), flags=flags,
-        threads=os.process_cpu_count() or os.cpu_count() or 1, cores=cores, llc_domains=llc_domains, llc_kib=llc_kib,
+        threads=possible_cpu_count(), cores=cores, llc_domains=llc_domains, llc_kib=llc_kib,
         mem_gib=mem_kib("MemTotal") / 1048576.0, swap_gib=mem_kib("SwapTotal") / 1048576.0,
         disk_swap=any(not s.startswith("/dev/zram") for s in swaps),
         numa_nodes=len(list(Path("/sys/devices/system/node").glob("node[0-9]*"))) or 1, virt=virt, gpus=_gpu_vendors(),
@@ -2671,78 +2200,69 @@ def _virt_guest(facts: HostFacts) -> tuple[bool, str]:
 
 
 def _is_virt_target(p: KernelProfile, f: HostFacts) -> tuple[bool, str]:
-    if p.name == "vm_guest" or "vm" in p.sections.get("meta", {}).get("tags", []):
+    if "vm" in p.sections.get("meta", {}).get("tags", []):
         return True, "vm_guest"
     return _virt_guest(f)
 
 
 def resolve_profile_manifest(p: KernelProfile) -> Path | None:
-    p_man = p.g("meta", "manifest_path")
-    if p_man:
-        path = Path(p_man).expanduser()
-        if path.is_file():
-            return path
-    tags = p.g("meta", "tags")
-    if "remote" in tags:
-        for tag in tags:
-            if tag != "remote":
-                cand = IMPORT_DIR / tag / "manifest.json"
-                if cand.is_file():
-                    return cand
-    if p.name.startswith("remote_"):
-        hname = p.name.removeprefix("remote_")
-        cand = IMPORT_DIR / hname / "manifest.json"
-        if cand.is_file():
-            return cand
-    return None
+    value = p.g("meta", "manifest_path")
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = p.path.parent / path
+    if not path.is_file():
+        raise ProfileError(f"Target manifest missing: {path}; re-import the hardware bundle")
+    return path
 
 
 def target_facts_for_profile(p: KernelProfile, host: HostFacts) -> HostFacts:
-    manifest_file = resolve_profile_manifest(p)
-    if manifest_file is None:
-        if p.name == "vm_guest" or "vm" in p.sections.get("meta", {}).get("tags", []):
-            return replace(
-                host,
-                virt="kvm" if host.virt == "none" else host.virt,
-                gpus=(*host.gpus, "virtio", "bochs") if not any(g in host.gpus for g in ("virtio", "bochs", "qxl")) else host.gpus,
-            )
+    path = resolve_profile_manifest(p)
+    if path is None:
         return host
     try:
-        data = json.loads(manifest_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        warn(f"Could not read bundle manifest {manifest_file}: {e}")
-        return host
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("format") != "dusky_bundle_v3":
+            raise ValueError("re-export the target using this script (bundle v3 required)")
+        values = {key: data[key] for key in HostFacts.__slots__}
+        for key in ("threads", "cores", "llc_domains", "llc_kib", "numa_nodes", "psabi_level"):
+            if type(values[key]) is not int or values[key] < (0 if key == "llc_kib" else 1):
+                raise ValueError(f"invalid target {key}")
+        if values["psabi_level"] not in (1, 2, 3, 4):
+            raise ValueError("invalid target ISA level")
+        for key in ("mem_gib", "swap_gib"):
+            if type(values[key]) not in (int, float) or not 0 <= values[key] < 1_000_000:
+                raise ValueError(f"invalid target {key}")
+        for key in ("flags", "gpus", "filesystems", "dkms_modules", "bootloaders"):
+            if not isinstance(values[key], list) or any(not isinstance(x, str) for x in values[key]):
+                raise ValueError(f"invalid target {key}")
+        for key in ("disk_swap", "root_luks", "has_nvme", "rotational", "battery", "sched_ext_live", "microcode_hook"):
+            if type(values[key]) is not bool:
+                raise ValueError(f"invalid target {key}")
+        if not isinstance(values["tools"], dict) or any(not isinstance(x, str) for pair in values["tools"].items() for x in pair):
+            raise ValueError("invalid target tool versions")
+        for key in ("vendor", "model", "virt", "uarch", "kernel", "cmdline", "root_fs", "esp", "xbootldr", "initrd_compression"):
+            if not isinstance(values[key], str):
+                raise ValueError(f"invalid target {key}")
+        values["flags"] = frozenset(values["flags"])
+        for key in ("gpus", "filesystems", "dkms_modules", "bootloaders"):
+            values[key] = tuple(values[key])
+        return HostFacts(**values)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise ProfileError(f"Invalid target manifest {path}: {e}") from e
 
-    flags = frozenset(data.get("flags", [])) or host.flags
-    return replace(
-        host,
-        vendor=data.get("vendor", host.vendor),
-        model=data.get("model", host.model),
-        flags=flags,
-        threads=int(data.get("threads", host.threads)),
-        cores=int(data.get("cores", host.cores)),
-        mem_gib=float(data.get("mem_gib", host.mem_gib)),
-        virt=data.get("virt", host.virt),
-        gpus=tuple(data.get("gpus", host.gpus)),
-        psabi_level=int(data.get("psabi_level", host.psabi_level)),
-        uarch=data.get("uarch", host.uarch),
-        cmdline=data.get("cmdline", host.cmdline),
-        filesystems=tuple(data.get("filesystems", host.filesystems)),
-        root_fs=data.get("root_fs", host.root_fs),
-        root_luks=bool(data.get("root_luks", host.root_luks)),
-        has_nvme=bool(data.get("has_nvme", host.has_nvme)),
-        rotational=bool(data.get("rotational", host.rotational)),
-        battery=bool(data.get("battery", host.battery)),
-        dkms_modules=tuple(data.get("dkms_modules", host.dkms_modules)),
-        bootloaders=tuple(data.get("bootloaders", host.bootloaders)),
-        initrd_compression=data.get("initrd_compression", host.initrd_compression),
-        microcode_hook=bool(data.get("microcode_hook", host.microcode_hook)),
-    )
+
+def broad_hardware(p: KernelProfile) -> bool:
+    return p.g("meta", "portable_package") and not p.g("meta", "manifest_path")
 
 
 def auto_jobs(facts: HostFacts, lto: str) -> int:
     per_job_gib = 1.5 if lto == "full" else 1.0
-    return max(2, min(facts.threads, int(facts.mem_gib // per_job_gib) or 2))
+    available = re.search(r"^MemAvailable:\s+(\d+)", _read("/proc/meminfo"), re.M)
+    memory = min(facts.mem_gib, int(available[1]) / 1048576) if available else facts.mem_gib
+    return max(1, min(os.process_cpu_count() or facts.threads, facts.threads,
+                      int(max(1, memory - 2 - RAM_RESERVE_GIB) // per_job_gib)))
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -2825,7 +2345,7 @@ def fetch_releases() -> list[Release]:
 def candidates_for(releases: Sequence[Release], channel: str, allow_rc: bool, min_ver: str) -> list[Release]:
     floor = KVer.parse(min_ver) or KVer(*MIN_KERNEL)
     floor = max(floor, KVer(*MIN_KERNEL), key=lambda k: k.key())
-    effective_allow_rc = allow_rc or (channel == "mainline")
+    effective_allow_rc = allow_rc
     cands: list[Release] = []
     for r in releases:
         if r.is_rc and not effective_allow_rc:
@@ -2953,7 +2473,7 @@ def verify_pgp(tarball: Path, pgp_url: str) -> bool | None:
         _unregister(pg1)
         _unregister(pg2)
     fprs = {m.group(1) for m in re.finditer(r"\[GNUPG:\] VALIDSIG (\w+)", out or "")}
-    if gpg.returncode != 0 or not fprs:
+    if xz.returncode != 0 or gpg.returncode != 0 or not fprs:
         return False
     return bool(fprs & KERNEL_SIGNING_FPRS)
 
@@ -3037,6 +2557,8 @@ def unpack(tarball: Path, rel: Release, patchset: str, fresh: bool) -> Path:
         if dest.exists():
             shutil.rmtree(dest)
         inner[0].rename(dest)
+        (dest / ".dusky").mkdir(exist_ok=True)
+        (dest / ".dusky" / "source-epoch").write_text(str(int((dest / "Makefile").stat().st_mtime)))
     kv = KVer.parse(tree_version(dest).split("-dusky")[0])
     if kv is None or kv.key() < KVer(*MIN_KERNEL).key():
         raise ProfileError(f"Extracted tree reports {tree_version(dest)}, below the {MIN_KERNEL[0]}.{MIN_KERNEL[1]} floor")
@@ -3079,9 +2601,6 @@ def resolve_patch_urls(sched: str, mm: str, is_rc: bool, sources: Sequence[str])
                     except (NetworkError, ValueError, KeyError):
                         continue
             case ("bore", "tkg"):
-                local_tkg = Path(f"/mnt/zram1/linux-tkg-master/linux-tkg-patches/{mm}/0001-bore.patch")
-                if local_tkg.is_file():
-                    urls.append(("tkg", str(local_tkg)))
                 urls.append(("tkg", f"https://raw.githubusercontent.com/Frogging-Family/linux-tkg/master/linux-tkg-patches/{mm}/0001-bore.patch"))
             case ("bmq", "cachyos"):
                 urls += [("cachyos", f"{CACHYOS_RAW}/{mm}/sched/0001-prjc.patch"), ("cachyos", f"{CACHYOS_RAW}/{mm}/sched/0001-prjc-cachy.patch")]
@@ -3097,7 +2616,7 @@ def resolve_patch_urls(sched: str, mm: str, is_rc: bool, sources: Sequence[str])
 
 
 def fetch_patch(url: str, sched: str, mm: str) -> Path | None:
-    dest = PATCH_CACHE / sched / mm / Path(urllib.parse.urlparse(url).path).name
+    dest = PATCH_CACHE / sched / mm / (hashlib.sha256(url.encode()).hexdigest()[:12] + "-" + Path(urllib.parse.urlparse(url).path).name)
     if dest.is_file() and dest.stat().st_size > 0:
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -3150,12 +2669,9 @@ def apply_scheduler_patch(tree: Path, p: KernelProfile, rel: Release) -> str:
             continue
         dry = run(["patch", "-p1", "-N", "--dry-run", "-F0", "-i", str(pf)], cwd=tree, check=False)
         if dry.returncode != 0:
-            dry = run(["patch", "-p1", "-N", "--dry-run", "-i", str(pf)], cwd=tree, check=False)
-            if dry.returncode != 0:
-                warn(f"{origin}: {pf.name} does not apply cleanly to Linux {mm}; trying the next source")
-                continue
-            warn(f"{origin}: {pf.name} applies with fuzz")
-        run(["patch", "-p1", "-N", "-i", str(pf)], cwd=tree)
+            warn(f"{origin}: {pf.name} does not apply exactly to Linux {mm}; trying the next source")
+            continue
+        run(["patch", "--batch", "-p1", "-N", "-F0", "-i", str(pf)], cwd=tree)
         state.setdefault("applied", []).append(sched)
         state[sched] = {"url": url, "file": pf.name, "applied_at": datetime.now(UTC).isoformat()}
         _save_patch_state(tree, state)
@@ -3173,677 +2689,6 @@ def apply_scheduler_patch(tree: Path, p: KernelProfile, rel: Release) -> str:
 # ---------------------------------------------------------------------------------------------------
 # Built-in kernel enhancement patches (Linux 7.2 / 7.3+)
 # ---------------------------------------------------------------------------------------------------
-BUILTIN_PATCH_SCHED_INLINE: Final = r"""diff --git a/arch/arm/include/asm/mmu_context.h b/arch/arm/include/asm/mmu_context.h
-index db2cb06aa..bebde469f 100644
---- a/arch/arm/include/asm/mmu_context.h
-+++ b/arch/arm/include/asm/mmu_context.h
-@@ -80,7 +80,7 @@ static inline void check_and_switch_context(struct mm_struct *mm,
- #ifndef MODULE
- #define finish_arch_post_lock_switch \
- 	finish_arch_post_lock_switch
--static inline void finish_arch_post_lock_switch(void)
-+static __always_inline void finish_arch_post_lock_switch(void)
- {
- 	struct mm_struct *mm = current->mm;
- 
-diff --git a/arch/riscv/include/asm/sync_core.h b/arch/riscv/include/asm/sync_core.h
-index 9153016da..2fe6b7fe6 100644
---- a/arch/riscv/include/asm/sync_core.h
-+++ b/arch/riscv/include/asm/sync_core.h
-@@ -6,7 +6,7 @@
-  * RISC-V implements return to user-space through an xRET instruction,
-  * which is not core serializing.
-  */
--static inline void sync_core_before_usermode(void)
-+static __always_inline void sync_core_before_usermode(void)
- {
- 	asm volatile ("fence.i" ::: "memory");
- }
-diff --git a/arch/s390/include/asm/mmu_context.h b/arch/s390/include/asm/mmu_context.h
-index bd1ef5e2d..95d03be2c 100644
---- a/arch/s390/include/asm/mmu_context.h
-+++ b/arch/s390/include/asm/mmu_context.h
-@@ -93,7 +93,7 @@ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
- }
- 
- #define finish_arch_post_lock_switch finish_arch_post_lock_switch
--static inline void finish_arch_post_lock_switch(void)
-+static __always_inline void finish_arch_post_lock_switch(void)
- {
- 	struct task_struct *tsk = current;
- 	struct mm_struct *mm = tsk->mm;
-diff --git a/arch/sparc/include/asm/mmu_context_64.h b/arch/sparc/include/asm/mmu_context_64.h
-index 78bbacc14..d1967214e 100644
---- a/arch/sparc/include/asm/mmu_context_64.h
-+++ b/arch/sparc/include/asm/mmu_context_64.h
-@@ -160,7 +160,7 @@ static inline void arch_start_context_switch(struct task_struct *prev)
- }
- 
- #define finish_arch_post_lock_switch	finish_arch_post_lock_switch
--static inline void finish_arch_post_lock_switch(void)
-+static __always_inline void finish_arch_post_lock_switch(void)
- {
- 	/* Restore the state of MCDPER register for the new process
- 	 * just switched to.
-diff --git a/arch/x86/include/asm/sync_core.h b/arch/x86/include/asm/sync_core.h
-index 96bda4353..4b55fa353 100644
---- a/arch/x86/include/asm/sync_core.h
-+++ b/arch/x86/include/asm/sync_core.h
-@@ -93,7 +93,7 @@ static __always_inline void sync_core(void)
-  * to user-mode. x86 implements return to user-space through sysexit,
-  * sysrel, and sysretq, which are not core serializing.
-  */
--static inline void sync_core_before_usermode(void)
-+static __always_inline void sync_core_before_usermode(void)
- {
- 	/* With PTI, we unconditionally serialize before running user code. */
- 	if (static_cpu_has(X86_FEATURE_PTI))
-diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
-index 48d851fbd..7c1dac8da 100644
---- a/include/linux/perf_event.h
-+++ b/include/linux/perf_event.h
-@@ -1632,7 +1632,7 @@ static inline void perf_event_task_migrate(struct task_struct *task)
- 		task->sched_migrated = 1;
- }
- 
--static inline void perf_event_task_sched_in(struct task_struct *prev,
-+static __always_inline void perf_event_task_sched_in(struct task_struct *prev,
- 					    struct task_struct *task)
- {
- 	if (static_branch_unlikely(&perf_sched_events))
-diff --git a/include/linux/sched/mm.h b/include/linux/sched/mm.h
-index 95d0040df..4a279ee2d 100644
---- a/include/linux/sched/mm.h
-+++ b/include/linux/sched/mm.h
-@@ -44,7 +44,7 @@ static inline void smp_mb__after_mmgrab(void)
- 
- extern void __mmdrop(struct mm_struct *mm);
- 
--static inline void mmdrop(struct mm_struct *mm)
-+static __always_inline void mmdrop(struct mm_struct *mm)
- {
- 	/*
- 	 * The implicit full barrier implied by atomic_dec_and_test() is
-@@ -71,14 +71,14 @@ static inline void __mmdrop_delayed(struct rcu_head *rhp)
-  * Invoked from finish_task_switch(). Delegates the heavy lifting on RT
-  * kernels via RCU.
-  */
--static inline void mmdrop_sched(struct mm_struct *mm)
-+static __always_inline void mmdrop_sched(struct mm_struct *mm)
- {
- 	/* Provides a full memory barrier. See mmdrop() */
- 	if (atomic_dec_and_test(&mm->mm_count))
- 		call_rcu(&mm->delayed_drop, __mmdrop_delayed);
- }
- #else
--static inline void mmdrop_sched(struct mm_struct *mm)
-+static __always_inline void mmdrop_sched(struct mm_struct *mm)
- {
- 	mmdrop(mm);
- }
-@@ -104,7 +104,7 @@ static inline void mmdrop_lazy_tlb(struct mm_struct *mm)
- 	}
- }
- 
--static inline void mmdrop_lazy_tlb_sched(struct mm_struct *mm)
-+static __always_inline void mmdrop_lazy_tlb_sched(struct mm_struct *mm)
- {
- 	if (IS_ENABLED(CONFIG_MMU_LAZY_TLB_REFCOUNT))
- 		mmdrop_sched(mm);
-@@ -532,7 +532,7 @@ enum {
- #include <asm/membarrier.h>
- #endif
- 
--static inline void membarrier_mm_sync_core_before_usermode(struct mm_struct *mm)
-+static __always_inline void membarrier_mm_sync_core_before_usermode(struct mm_struct *mm)
- {
- 	/*
- 	 * The atomic_read() below prevents CSE. The following should
-diff --git a/include/linux/tick.h b/include/linux/tick.h
-index 1cf4651f0..2f91eccd2 100644
---- a/include/linux/tick.h
-+++ b/include/linux/tick.h
-@@ -173,7 +173,7 @@ extern cpumask_var_t tick_nohz_full_mask;
- #ifdef CONFIG_NO_HZ_FULL
- extern bool tick_nohz_full_running;
- 
--static inline bool tick_nohz_full_enabled(void)
-+static __always_inline bool tick_nohz_full_enabled(void)
- {
- 	if (!context_tracking_enabled())
- 		return false;
-@@ -297,7 +297,7 @@ static inline void __tick_nohz_task_switch(void) { }
- static inline void tick_nohz_full_setup(cpumask_var_t cpumask) { }
- #endif
- 
--static inline void tick_nohz_task_switch(void)
-+static __always_inline void tick_nohz_task_switch(void)
- {
- 	if (tick_nohz_full_enabled())
- 		__tick_nohz_task_switch();
-diff --git a/include/linux/vtime.h b/include/linux/vtime.h
-index 82825e775..28234dda2 100644
---- a/include/linux/vtime.h
-+++ b/include/linux/vtime.h
-@@ -26,12 +26,12 @@ static inline void vtime_guest_exit(struct task_struct *tsk) { }
- static inline void vtime_init_idle(struct task_struct *tsk, int cpu) { }
- #endif
- 
--static inline bool vtime_generic_enabled_cpu(int cpu)
-+static __always_inline bool vtime_generic_enabled_cpu(int cpu)
- {
- 	return context_tracking_enabled_cpu(cpu);
- }
- 
--static inline bool vtime_generic_enabled_this_cpu(void)
-+static __always_inline bool vtime_generic_enabled_this_cpu(void)
- {
- 	return context_tracking_enabled_this_cpu();
- }
-@@ -89,24 +89,24 @@ static __always_inline void vtime_account_guest_exit(void)
-  * For now vtime state is tied to context tracking. We might want to decouple
-  * those later if necessary.
-  */
--static inline bool vtime_accounting_enabled(void)
-+static __always_inline bool vtime_accounting_enabled(void)
- {
- 	return context_tracking_enabled();
- }
- 
--static inline bool vtime_accounting_enabled_cpu(int cpu)
-+static __always_inline bool vtime_accounting_enabled_cpu(int cpu)
- {
- 	return vtime_generic_enabled_cpu(cpu);
- }
- 
--static inline bool vtime_accounting_enabled_this_cpu(void)
-+static __always_inline bool vtime_accounting_enabled_this_cpu(void)
- {
- 	return vtime_generic_enabled_this_cpu();
- }
- 
- extern void vtime_task_switch_generic(struct task_struct *prev);
- 
--static inline void vtime_task_switch(struct task_struct *prev)
-+static __always_inline void vtime_task_switch(struct task_struct *prev)
- {
- 	if (vtime_accounting_enabled_this_cpu())
- 		vtime_task_switch_generic(prev);
-diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index 96226707c..6014cc8fb 100644
---- a/kernel/sched/core.c
-+++ b/kernel/sched/core.c
-@@ -5074,7 +5074,7 @@ static inline void prepare_task(struct task_struct *next)
- 	WRITE_ONCE(next->on_cpu, 1);
- }
- 
--static inline void finish_task(struct task_struct *prev)
-+static __always_inline void finish_task(struct task_struct *prev)
- {
- 	/*
- 	 * This must be the very last reference to @prev from this CPU. After
-@@ -5118,7 +5118,7 @@ static void zap_balance_callbacks(struct rq *rq)
- 	rq->balance_callback = found ? &balance_push_callback : NULL;
- }
- 
--static void do_balance_callbacks(struct rq *rq, struct balance_callback *head)
-+static __always_inline void do_balance_callbacks(struct rq *rq, struct balance_callback *head)
- {
- 	void (*func)(struct rq *rq);
- 	struct balance_callback *next;
-@@ -5153,7 +5153,7 @@ struct balance_callback balance_push_callback = {
- 	.func = balance_push,
- };
- 
--static inline struct balance_callback *
-+static __always_inline struct balance_callback *
- __splice_balance_callbacks(struct rq *rq, bool split)
- {
- 	struct balance_callback *head = rq->balance_callback;
-@@ -5183,7 +5183,7 @@ struct balance_callback *splice_balance_callbacks(struct rq *rq)
- 	return __splice_balance_callbacks(rq, true);
- }
- 
--void __balance_callbacks(struct rq *rq, struct rq_flags *rf)
-+__always_inline void __balance_callbacks(struct rq *rq, struct rq_flags *rf)
- {
- 	if (rf)
- 		rq_unpin_lock(rq, rf);
-@@ -5227,7 +5227,7 @@ prepare_lock_switch(struct rq *rq, struct task_struct *next, struct rq_flags *rf
- 	__acquire(__rq_lockp(this_rq()));
- }
- 
--static inline void finish_lock_switch(struct rq *rq)
-+static __always_inline void finish_lock_switch(struct rq *rq)
- 	__releases(__rq_lockp(rq))
- {
- 	/*
-@@ -5261,7 +5261,7 @@ static inline void kmap_local_sched_out(void)
- #endif
- }
- 
--static inline void kmap_local_sched_in(void)
-+static __always_inline void kmap_local_sched_in(void)
- {
- #ifdef CONFIG_KMAP_LOCAL
- 	if (unlikely(current->kmap_ctrl.idx))
-@@ -5315,7 +5315,7 @@ prepare_task_switch(struct rq *rq, struct task_struct *prev,
-  * past. 'prev == current' is still correct but we need to recalculate this_rq
-  * because prev may have moved to another CPU.
-  */
--static struct rq *finish_task_switch(struct task_struct *prev)
-+static __always_inline struct rq *finish_task_switch(struct task_struct *prev)
- 	__releases(__rq_lockp(this_rq()))
- {
- 	struct rq *rq = this_rq();
-diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index 56acf502b..b8e75cdc2 100644
---- a/kernel/sched/sched.h
-+++ b/kernel/sched/sched.h
-@@ -1457,12 +1457,12 @@ static inline struct cpumask *sched_group_span(struct sched_group *sg);
- 
- DECLARE_STATIC_KEY_FALSE(__sched_core_enabled);
- 
--static inline bool sched_core_enabled(struct rq *rq)
-+static __always_inline bool sched_core_enabled(struct rq *rq)
- {
- 	return static_branch_unlikely(&__sched_core_enabled) && rq->core_enabled;
- }
- 
--static inline bool sched_core_disabled(void)
-+static __always_inline bool sched_core_disabled(void)
- {
- 	return !static_branch_unlikely(&__sched_core_enabled);
- }
-@@ -1471,7 +1471,7 @@ static inline bool sched_core_disabled(void)
-  * Be careful with this function; not for general use. The return value isn't
-  * stable unless you actually hold a relevant rq->__lock.
-  */
--static inline raw_spinlock_t *rq_lockp(struct rq *rq)
-+static __always_inline raw_spinlock_t *rq_lockp(struct rq *rq)
- {
- 	if (sched_core_enabled(rq))
- 		return &rq->core->__lock;
-@@ -1479,7 +1479,7 @@ static inline raw_spinlock_t *rq_lockp(struct rq *rq)
- 	return &rq->__lock;
- }
- 
--static inline raw_spinlock_t *__rq_lockp(struct rq *rq)
-+static __always_inline raw_spinlock_t *__rq_lockp(struct rq *rq)
- 	__returns_ctx_lock(rq_lockp(rq)) /* alias them */
- {
- 	if (rq->core_enabled)
-@@ -1582,12 +1582,12 @@ static inline bool sched_core_disabled(void)
- 	return true;
- }
- 
--static inline raw_spinlock_t *rq_lockp(struct rq *rq)
-+static __always_inline raw_spinlock_t *rq_lockp(struct rq *rq)
- {
- 	return &rq->__lock;
- }
- 
--static inline raw_spinlock_t *__rq_lockp(struct rq *rq)
-+static __always_inline raw_spinlock_t *__rq_lockp(struct rq *rq)
- 	__returns_ctx_lock(rq_lockp(rq)) /* alias them */
- {
- 	return &rq->__lock;
-@@ -1647,26 +1647,26 @@ extern void raw_spin_rq_lock_nested(struct rq *rq, int subclass)
- extern bool raw_spin_rq_trylock(struct rq *rq)
- 	__cond_acquires(true, __rq_lockp(rq));
- 
--static inline void raw_spin_rq_lock(struct rq *rq)
-+static __always_inline void raw_spin_rq_lock(struct rq *rq)
- 	__acquires(__rq_lockp(rq))
- {
- 	raw_spin_rq_lock_nested(rq, 0);
- }
- 
--static inline void raw_spin_rq_unlock(struct rq *rq)
-+static __always_inline void raw_spin_rq_unlock(struct rq *rq)
- 	__releases(__rq_lockp(rq))
- {
- 	raw_spin_unlock(rq_lockp(rq));
- }
- 
--static inline void raw_spin_rq_lock_irq(struct rq *rq)
-+static __always_inline void raw_spin_rq_lock_irq(struct rq *rq)
- 	__acquires(__rq_lockp(rq))
- {
- 	local_irq_disable();
- 	raw_spin_rq_lock(rq);
- }
- 
--static inline void raw_spin_rq_unlock_irq(struct rq *rq)
-+static __always_inline void raw_spin_rq_unlock_irq(struct rq *rq)
- 	__releases(__rq_lockp(rq))
- {
- 	raw_spin_rq_unlock(rq);
-"""
-
-BUILTIN_PATCH_EVDEV_RCU: Final = r"""diff --git a/drivers/input/evdev.c b/drivers/input/evdev.c
-index c7325226c..4f18a50ea 100644
---- a/drivers/input/evdev.c
-+++ b/drivers/input/evdev.c
-@@ -46,6 +46,7 @@ struct evdev_client {
- 	struct fasync_struct *fasync;
- 	struct evdev *evdev;
- 	struct list_head node;
-+	struct rcu_head rcu;
- 	enum input_clock_type clk_type;
- 	bool revoked;
- 	unsigned long *evmasks[EV_CNT];
-@@ -368,13 +369,22 @@ static void evdev_attach_client(struct evdev *evdev,
- 	spin_unlock(&evdev->client_lock);
- }
- 
-+static void evdev_reclaim_client(struct rcu_head *rp)
-+{
-+	struct evdev_client *client = container_of(rp, struct evdev_client, rcu);
-+	unsigned int i;
-+	for (i = 0; i < EV_CNT; ++i)
-+		bitmap_free(client->evmasks[i]);
-+	kvfree(client);
-+}
-+
- static void evdev_detach_client(struct evdev *evdev,
- 				struct evdev_client *client)
- {
- 	spin_lock(&evdev->client_lock);
- 	list_del_rcu(&client->node);
- 	spin_unlock(&evdev->client_lock);
--	synchronize_rcu();
-+	call_rcu(&client->rcu, evdev_reclaim_client);
- }
- 
- static int evdev_open_device(struct evdev *evdev)
-@@ -427,7 +437,6 @@ static int evdev_release(struct inode *inode, struct file *file)
- {
- 	struct evdev_client *client = file->private_data;
- 	struct evdev *evdev = client->evdev;
--	unsigned int i;
- 
- 	mutex_lock(&evdev->mutex);
- 
-@@ -439,11 +448,6 @@ static int evdev_release(struct inode *inode, struct file *file)
- 
- 	evdev_detach_client(evdev, client);
- 
--	for (i = 0; i < EV_CNT; ++i)
--		bitmap_free(client->evmasks[i]);
--
--	kvfree(client);
--
- 	evdev_close_device(evdev);
- 
- 	return 0;
-@@ -486,7 +490,6 @@ static int evdev_open(struct inode *inode, struct file *file)
- 
-  err_free_client:
- 	evdev_detach_client(evdev, client);
--	kvfree(client);
- 	return error;
- }
- 
-"""
-
-BUILTIN_PATCH_PCI_PME: Final = r"""diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
---- a/drivers/pci/pci.c
-+++ b/drivers/pci/pci.c
-@@ -62,7 +62,7 @@ struct pci_pme_device {
- 	struct pci_dev *dev;
- };
- 
--#define PME_TIMEOUT 1000 /* How long between PME checks */
-+#define PME_TIMEOUT 4000 /* How long between PME checks */
- 
- static void pci_dev_d3_sleep(struct pci_dev *dev)
- {
-"""
-
-BUILTIN_PATCH_CLANG_POLLY: Final = r"""diff --git a/Makefile b/Makefile
---- a/Makefile
-+++ b/Makefile
-@@ -870,6 +870,23 @@ endif
- KBUILD_RUSTFLAGS += -Cdebug-assertions=$(if $(CONFIG_RUST_DEBUG_ASSERTIONS),y,n)
- KBUILD_RUSTFLAGS += -Coverflow-checks=$(if $(CONFIG_RUST_OVERFLOW_CHECKS),y,n)
- 
-+ifdef CONFIG_POLLY_CLANG
-+KBUILD_CFLAGS	+= -fplugin=LLVMPolly.so \
-+		   -mllvm -polly \
-+		   -mllvm -polly-ast-use-context \
-+		   -mllvm -polly-invariant-load-hoisting \
-+		   -mllvm -polly-loopfusion-greedy \
-+		   -mllvm -polly-run-inliner \
-+		   -mllvm -polly-vectorizer=stripmine
-+# Polly may optimise loops with dead paths beyound what the linker
-+# can understand. This may negate the effect of the linker's DCE
-+# so we tell Polly to perfom proven DCE on the loops it optimises
-+# in order to preserve the overall effect of the linker's DCE.
-+ifdef CONFIG_LD_DEAD_CODE_DATA_ELIMINATION
-+KBUILD_CFLAGS	+= -mllvm -polly-run-dce
-+endif
-+endif
-+
- # Tell gcc to never replace conditional load with a non-conditional one
- ifdef CONFIG_CC_IS_GCC
- # gcc-10 renamed --param=allow-store-data-races=0 to
-diff --git a/init/Kconfig b/init/Kconfig
---- a/init/Kconfig
-+++ b/init/Kconfig
-@@ -251,6 +251,19 @@ config BUILD_SALT
- 	  This is mostly useful for distributions which want to ensure the
- 	  build is unique between builds. It's safe to leave the default.
- 
-+config POLLY_CLANG
-+	bool "Use Clang Polly optimizations"
-+	depends on CC_IS_CLANG && $(cc-option,-mllvm -polly -fplugin=LLVMPolly.so)
-+	depends on !COMPILE_TEST
-+	help
-+	  This option enables Clang's polyhedral loop optimizer known as
-+	  Polly. Polly is able to optimize various loops throughout the
-+	  kernel for cache locality. This requires a Clang toolchain
-+	  compiled with support for Polly. More information can be found
-+	  from Polly's website:
-+
-+	    https://polly.llvm.org
-+
- config HAVE_KERNEL_GZIP
- 	bool
- """
-
-BUILTIN_PATCH_OPTIMIZE_O3: Final = r"""diff --git a/Makefile b/Makefile
---- a/Makefile
-+++ b/Makefile
-@@ -929,16 +929,25 @@ KBUILD_CFLAGS	+= -fno-delete-null-pointer-checks
- ifdef CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE
- KBUILD_CFLAGS += -O2
- KBUILD_RUSTFLAGS += -Copt-level=2
-+else ifdef CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3
-+KBUILD_CFLAGS += -O3
-+KBUILD_RUSTFLAGS += -Copt-level=3
- else ifdef CONFIG_CC_OPTIMIZE_FOR_SIZE
- KBUILD_CFLAGS += -Os
- KBUILD_RUSTFLAGS += -Copt-level=s
- endif
- 
-+# Perform swing modulo scheduling immediately before the first scheduling pass.
-+# This pass looks at innermost loops and reorders their instructions by
-+# overlapping different iterations.
-+KBUILD_CFLAGS += $(call cc-option,-fmodulo-sched -fmodulo-sched-allow-regmoves -fivopts)
-+KBUILD_CFLAGS += $(call cc-option,-mllvm -enable-pipeliner)
-+
- # Always set `debug-assertions` and `overflow-checks` because their default
- # depends on `opt-level` and `debug-assertions`, respectively.
- KBUILD_RUSTFLAGS += -Cdebug-assertions=$(if $(CONFIG_RUST_DEBUG_ASSERTIONS),y,n)
- KBUILD_RUSTFLAGS += -Coverflow-checks=$(if $(CONFIG_RUST_OVERFLOW_CHECKS),y,n)
- 
- # Tell gcc to never replace conditional load with a non-conditional one
- ifdef CONFIG_CC_IS_GCC
- # gcc-10 renamed --param=allow-store-data-races=0 to
-@@ -1154,11 +1179,6 @@ KBUILD_CFLAGS	+= -fno-strict-overflow
- # Make sure -fstack-check isn't enabled (like gentoo apparently did)
- KBUILD_CFLAGS  += -fno-stack-check
- 
--# conserve stack if available
--ifdef CONFIG_CC_IS_GCC
--KBUILD_CFLAGS   += -fconserve-stack
--endif
--
- # Ensure compilers do not transform certain loops into calls to wcslen()
- KBUILD_CFLAGS += -fno-builtin-wcslen
- 
- diff --git a/arch/x86/Makefile b/arch/x86/Makefile
---- a/arch/x86/Makefile
-+++ b/arch/x86/Makefile
-@@ -73,7 +73,7 @@ export BITS
- #
- #    https://gcc.gnu.org/bugzilla/show_bug.cgi?id=53383
- #
--KBUILD_CFLAGS += -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx -mno-sse4a
-+KBUILD_CFLAGS += -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx -mno-sse4a -mno-avx2 -fno-tree-vectorize
- KBUILD_RUSTFLAGS += --target=$(objtree)/scripts/target.json
- KBUILD_RUSTFLAGS += -Ctarget-feature=-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2
- 
-diff --git a/init/Kconfig b/init/Kconfig
---- a/init/Kconfig
-+++ b/init/Kconfig
-@@ -1613,6 +1613,12 @@ config CC_OPTIMIZE_FOR_PERFORMANCE
- 	  with the "-O2" compiler flag for best performance and most
- 	  helpful compile-time warnings.
- 
-+config CC_OPTIMIZE_FOR_PERFORMANCE_O3
-+	bool "Optimize more for performance (-O3)"
-+	help
-+	  Choosing this option will pass "-O3" to your compiler to optimize
-+	  the kernel yet more for performance.
-+
- config CC_OPTIMIZE_FOR_SIZE
- 	bool "Optimize for size (-Os)"
- 	help
-"""
-
-BUILTIN_PATCH_ACS_OVERRIDE: Final = r"""diff --git a/drivers/pci/quirks.c b/drivers/pci/quirks.c
-index 4700d24e5d55..8f7a3d7fd9c1 100644
---- a/drivers/pci/quirks.c
-+++ b/drivers/pci/quirks.c
-@@ -3372,6 +3372,106 @@ static void quirk_no_bus_reset(struct pci_dev *dev)
- 	dev->dev_flags |= PCI_DEV_FLAGS_NO_BUS_RESET;
- }
- 
-+static bool acs_on_downstream;
-+static bool acs_on_multifunction;
-+
-+#define NUM_ACS_IDS 16
-+struct acs_on_id {
-+	unsigned short vendor;
-+	unsigned short device;
-+};
-+static struct acs_on_id acs_on_ids[NUM_ACS_IDS];
-+static u8 max_acs_id;
-+
-+static __init int pcie_acs_override_setup(char *p)
-+{
-+	if (!p)
-+		return -EINVAL;
-+
-+	while (*p) {
-+		if (!strncmp(p, "downstream", 10))
-+			acs_on_downstream = true;
-+		if (!strncmp(p, "multifunction", 13))
-+			acs_on_multifunction = true;
-+		if (!strncmp(p, "id:", 3)) {
-+			char opt[5];
-+			int ret;
-+			long val;
-+
-+			if (max_acs_id >= NUM_ACS_IDS - 1) {
-+				pr_warn("Out of PCIe ACS override slots (%d)\n",
-+						NUM_ACS_IDS);
-+				goto next;
-+			}
-+
-+			p += 3;
-+			snprintf(opt, 5, "%s", p);
-+			ret = kstrtol(opt, 16, &val);
-+			if (ret) {
-+				pr_warn("PCIe ACS ID parse error %d\n", ret);
-+				goto next;
-+			}
-+			acs_on_ids[max_acs_id].vendor = val;
-+
-+			p += strcspn(p, ":");
-+			if (*p != ':') {
-+				pr_warn("PCIe ACS invalid ID\n");
-+				goto next;
-+			}
-+
-+			p++;
-+			snprintf(opt, 5, "%s", p);
-+			ret = kstrtol(opt, 16, &val);
-+			if (ret) {
-+				pr_warn("PCIe ACS ID parse error %d\n", ret);
-+				goto next;
-+			}
-+			acs_on_ids[max_acs_id].device = val;
-+			max_acs_id++;
-+		}
-+next:
-+		p += strcspn(p, ",");
-+		if (*p == ',')
-+			p++;
-+	}
-+
-+	if (acs_on_downstream || acs_on_multifunction || max_acs_id)
-+		pr_warn("Warning: PCIe ACS overrides enabled; This may allow non-IOMMU protected peer-to-peer DMA\n");
-+
-+	return 0;
-+}
-+early_param("pcie_acs_override", pcie_acs_override_setup);
-+
-+static int pcie_acs_overrides(struct pci_dev *dev, u16 acs_flags)
-+{
-+	int i;
-+
-+	/* Never override ACS for legacy devices or devices with ACS caps */
-+	if (!pci_is_pcie(dev) ||
-+		pci_find_ext_capability(dev, PCI_EXT_CAP_ID_ACS))
-+			return -ENOTTY;
-+
-+	for (i = 0; i < max_acs_id; i++)
-+		if (acs_on_ids[i].vendor == dev->vendor &&
-+			acs_on_ids[i].device == dev->device)
-+				return 1;
-+
-+	switch (pci_pcie_type(dev)) {
-+	case PCI_EXP_TYPE_DOWNSTREAM:
-+	case PCI_EXP_TYPE_ROOT_PORT:
-+		if (acs_on_downstream)
-+			return 1;
-+		break;
-+	case PCI_EXP_TYPE_ENDPOINT:
-+	case PCI_EXP_TYPE_UPSTREAM:
-+	case PCI_EXP_TYPE_LEG_END:
-+	case PCI_EXP_TYPE_RC_END:
-+		if (acs_on_multifunction && dev->multifunction)
-+			return 1;
-+	}
-+
-+	return -ENOTTY;
-+}
- /*
-  * Some Atheros AR9xxx and QCA988x chips do not behave after a bus reset.
-  * The device will throw a Link Down error on AER-capable systems and
-@@ -5102,6 +5102,7 @@
- 	{ PCI_VENDOR_ID_ZHAOXIN, PCI_ANY_ID, pci_quirk_zhaoxin_pcie_ports_acs },
- 	/* Wangxun nics */
- 	{ PCI_VENDOR_ID_WANGXUN, PCI_ANY_ID, pci_quirk_wangxun_nic_acs },
-+	{ PCI_ANY_ID, PCI_ANY_ID, pcie_acs_overrides },
- 	{ 0 }
- };
- 
-
-"""
 
 
 def apply_patch_content(tree: Path, name: str, patch_text: str) -> bool:
@@ -3859,24 +2704,14 @@ def apply_patch_content(tree: Path, name: str, patch_text: str) -> bool:
     pfile.write_text(patch_text, encoding="utf-8")
 
     dry = run(["patch", "-p1", "-N", "--dry-run", "-F0", "-i", str(pfile)], cwd=tree, check=False)
-    fuzz = False
     if dry.returncode != 0:
-        dry = run(["patch", "-p1", "-N", "--dry-run", "-i", str(pfile)], cwd=tree, check=False)
-        if dry.returncode != 0:
-            rev_dry = run(["patch", "-p1", "-R", "--dry-run", "-i", str(pfile)], cwd=tree, check=False)
-            if rev_dry.returncode == 0:
-                state.setdefault("applied", []).append(name)
-                state[name] = {"builtin": True, "applied_at": datetime.now(UTC).isoformat(), "note": "already present in tree"}
-                _save_patch_state(tree, state)
-                ok(f"Patch '{name}' already present in source tree")
-                return True
-            warn(f"Patch '{name}' does not apply cleanly to Linux {tree.name}; skipping")
+        rev = run(["patch", "--batch", "-p1", "-R", "--dry-run", "-F0", "-i", str(pfile)], cwd=tree, check=False)
+        if rev.returncode != 0:
+            warn(f"Patch '{name}' does not apply exactly to {tree.name}; skipped")
             return False
-        fuzz = True
-
-    if fuzz:
-        warn(f"Patch '{name}' applies with fuzz")
-    run(["patch", "-p1", "-N", "-i", str(pfile)], cwd=tree)
+        ok(f"Patch '{name}' already present in source tree")
+        return True
+    run(["patch", "--batch", "-p1", "-N", "-F0", "-i", str(pfile)], cwd=tree)
     state.setdefault("applied", []).append(name)
     state[name] = {"builtin": True, "applied_at": datetime.now(UTC).isoformat()}
     _save_patch_state(tree, state)
@@ -3890,78 +2725,29 @@ def apply_enhancement_patches(tree: Path, p: KernelProfile, rel: Release, facts:
     applied_count = 0
 
     if p.g("dusky", "patch_sched_inline"):
-        if apply_patch_content(tree, "sched_inline", BUILTIN_PATCH_SCHED_INLINE):
+        if apply_patch_content(tree, "sched_inline", (SCRIPT_DIR / "patches" / "sched_inline.patch").read_text(encoding="utf-8")):
             applied_count += 1
 
     if p.g("dusky", "patch_evdev_rcu"):
-        if apply_patch_content(tree, "evdev_rcu", BUILTIN_PATCH_EVDEV_RCU):
+        if apply_patch_content(tree, "evdev_rcu", (SCRIPT_DIR / "patches" / "evdev_rcu.patch").read_text(encoding="utf-8")):
             applied_count += 1
 
     if p.g("dusky", "patch_pci_pme"):
-        if apply_patch_content(tree, "pci_pme", BUILTIN_PATCH_PCI_PME):
+        if apply_patch_content(tree, "pci_pme", (SCRIPT_DIR / "patches" / "pci_pme.patch").read_text(encoding="utf-8")):
             applied_count += 1
 
     if p.g("compiler", "polly") and p.g("compiler", "toolchain") == "llvm":
-        if apply_patch_content(tree, "clang_polly", BUILTIN_PATCH_CLANG_POLLY):
-            applied_count += 1
-
-    if p.g("compiler", "optimize") == "o3":
-        if apply_patch_content(tree, "optimize_o3", BUILTIN_PATCH_OPTIMIZE_O3):
+        if apply_patch_content(tree, "clang_polly", (SCRIPT_DIR / "patches" / "clang_polly.patch").read_text(encoding="utf-8")):
             applied_count += 1
 
     if p.g("boot", "acs_override"):
-        if apply_patch_content(tree, "acs_override", BUILTIN_PATCH_ACS_OVERRIDE):
+        if apply_patch_content(tree, "acs_override", (SCRIPT_DIR / "patches" / "acs_override.patch").read_text(encoding="utf-8")):
             applied_count += 1
 
     if applied_count == 0:
         info("No additional enhancement patches selected for this profile")
     else:
         ok(f"Applied/verified {applied_count} enhancement patch(es)")
-
-
-def inject_dkms_march_in_makefile(tree: Path, march: str, mtune: str) -> bool:
-    """Injects microarchitecture flags into the top-level Makefile so out-of-tree and DKMS
-    modules built against this kernel/headers tree inherit target CPU optimizations."""
-    if not march and not mtune:
-        return False
-    makefile = tree / "Makefile"
-    if not makefile.is_file():
-        return False
-    txt = makefile.read_text(encoding="utf-8")
-    marker = "# Injected by Dusky: propagate target CPU architecture to DKMS/modules"
-    if marker in txt:
-        return False
-
-    cflags: list[str] = []
-    if march:
-        cflags.append(f"-march={march}")
-    if mtune:
-        cflags.append(f"-mtune={mtune}")
-    flags_str = " ".join(cflags)
-
-    injection = (
-        f"\n{marker}\n"
-        f"KBUILD_CFLAGS   += {flags_str}\n"
-        f"KBUILD_CPPFLAGS += {flags_str}\n"
-    )
-    if march:
-        injection += f"KBUILD_RUSTFLAGS += -Ctarget-cpu={march}\n"
-    injection += "\n"
-
-    target_pattern = r"(KBUILD_CPPFLAGS\s*\+=\s*\$\(KCPPFLAGS\))"
-    if re.search(target_pattern, txt):
-        new_txt = re.sub(target_pattern, injection + r"\1", txt, count=1)
-    else:
-        target_pattern2 = r"(KBUILD_CFLAGS\s*\+=\s*\$\(KCFLAGS\))"
-        if re.search(target_pattern2, txt):
-            new_txt = re.sub(target_pattern2, injection + r"\1", txt, count=1)
-        else:
-            warn("Could not find KCPPFLAGS/KCFLAGS anchor in Makefile; skipping DKMS march injection")
-            return False
-
-    makefile.write_text(new_txt, encoding="utf-8")
-    ok(f"Injected DKMS microarchitecture flags ({flags_str}) into top-level Makefile")
-    return True
 
 
 def ensure_hz_choice(tree: Path, hz: int) -> bool:
@@ -4025,8 +2811,10 @@ def seed_config(tree: Path, p: KernelProfile, env: Mapping[str, str], override: 
         override.copy(dest)
         ok(f"Seeded from {override}")
         return str(override)
-    order = {"auto": ("snapshot", "arch", "running", "headers", "defconfig")}.get(p.g("dusky", "seed"), (p.g("dusky", "seed"),))
+    order = {"auto": ("arch", "running", "headers", "snapshot", "defconfig")}.get(p.g("dusky", "seed"), (p.g("dusky", "seed"),))
     for src in order:
+        if p.g("meta", "manifest_path") and src in ("running", "headers"):
+            continue
         match src:
             case "snapshot":
                 snap = snapshot_path(p)
@@ -4098,9 +2886,13 @@ def ensure_modprobed_db(p: KernelProfile) -> Path | None:
     if not p.g("modules", "modprobed_db"):
         return None
     custom = p.g("modules", "modprobed_db_path")
-    if not custom and have("modprobed-db"):
+    if custom and not Path(custom).expanduser().is_absolute():
+        custom = str((p.path.parent / custom).resolve())
+    if not custom and not p.g("meta", "manifest_path") and have("modprobed-db"):
         ensure_modprobed_db_service(prompt=False)
-        ensure_modprobed_compat_link()
+
+    if p.g("meta", "manifest_path") and not custom:
+        raise ProfileError("Remote target requires modules.modprobed_db_path")
     db = resolve_modprobed_db(custom if custom else None)
     if db is not None:
         count = count_db_modules(db)
@@ -4110,12 +2902,6 @@ def ensure_modprobed_db(p: KernelProfile) -> Path | None:
                 warn("modprobed.db is small; use the system for a few days (USB devices, VPN, printers...) before trusting strict mode")
             return db
     if not custom:
-        for fallback_db in (Path("/mnt/zram1/linux-tkg-master/linux-tkg-config/7.3/minimal-modprobed.db"),
-                            Path("/mnt/zram1/linux-tkg-master/linux-tkg-config/7.2/minimal-modprobed.db")):
-            if _is_usable_db(fallback_db):
-                count = count_db_modules(fallback_db)
-                ok(f"modprobed.db: using bundled fallback {fallback_db.name} ({count} modules)")
-                return fallback_db
         searched = ", ".join(str(c) for c in modprobed_db_candidates())
         warn(f"modprobed.db missing (searched: {searched}; install from AUR: paru -S modprobed-db; modprobed-db store)")
     else:
@@ -4162,6 +2948,8 @@ def _generate_modprobed_db_from_lsmod() -> Path | None:
 
 def localmodconfig(tree: Path, p: KernelProfile, db: Path | None, env: Mapping[str, str]) -> None:
     mode = p.g("modules", "mode")
+    if p.g("meta", "manifest_path") and db is None:
+        raise ProfileError("Remote pruning requires a usable module census from the target")
     rule(f"Module pruning ({mode})")
     lm_env = dict(env)
     if db is not None:
@@ -4198,11 +2986,13 @@ _KCONFIG_SYM_RE: Final = re.compile(r"^\s*(?:menu)?config\s+([A-Za-z0-9_]+)\s*$"
 class KconfigIndex:
     symbols: frozenset[str]
     x86_64_version_max: int
+    types: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def scan(cls, tree: Path) -> Self:
         syms: set[str] = set()
-        skip_dirs = {".git", ".dusky", ".thinlto-cache", "Documentation", "tools", "samples", "LICENSES", "usr", "pacman", "scripts"}
+        types: dict[str, str] = {}
+        skip_dirs = {".git", ".dusky", ".thinlto-cache", "Documentation", "tools", "samples", "LICENSES", "pacman"}
         for root, dirs, files in tree.walk():
             if root == tree / "arch":
                 dirs[:] = [d for d in dirs if d == "x86"]
@@ -4210,13 +3000,19 @@ class KconfigIndex:
                 dirs[:] = [d for d in dirs if d not in skip_dirs]
             for fn in files:
                 if fn == "Kconfig" or fn.startswith("Kconfig."):
-                    syms.update(_KCONFIG_SYM_RE.findall(_read(root / fn)))
+                    text = _read(root / fn)
+                    syms.update(_KCONFIG_SYM_RE.findall(text))
+                    for block in re.split(r"(?m)^[ \t]*(?:menu)?config[ \t]+", text)[1:]:
+                        name = block.split()[0]
+                        kind = re.search(r"(?m)^[ \t]+(bool|tristate|int|hex|string)\b", block)
+                        if kind:
+                            types[name] = kind.group(1)
         vmax = 3
         cpu_kconfig = _read(tree / "arch" / "x86" / "Kconfig.cpu")
         m = re.search(r"config X86_64_VERSION\n(?:.*\n)*?\s*range\s+(\d+)\s+(\d+)", cpu_kconfig)
         if m:
             vmax = int(m.group(2))
-        return cls(frozenset(syms), vmax)
+        return cls(frozenset(syms), vmax, types)
 
     def has(self, sym: str) -> bool:
         """An empty index (no tree scanned yet) is permissive so dry-runs can print the full matrix."""
@@ -4359,11 +3155,7 @@ def derive(p: KernelProfile, facts: HostFacts, idx: KconfigIndex, tree: Path, sc
         warn("CONFIG_NTSYNC is not present in this tree")
 
     arch = s["cpu"]["arch"]
-    custom_march = s["cpu"]["march"].strip()
-    if custom_march:
-        march = custom_march
-        mtune = custom_march
-    elif arch == "native":
+    if arch == "native":
         march = "native"
         mtune = "native"
     elif arch == "generic":
@@ -4379,6 +3171,12 @@ def derive(p: KernelProfile, facts: HostFacts, idx: KconfigIndex, tree: Path, sc
     else:
         march = arch
         mtune = arch
+
+    overrides = dict(flag.split("=", 1) for flag in shlex.split(s["cpu"]["march"]))
+    if "-march" in overrides:
+        march = overrides["-march"]
+        mtune = "generic" if march.startswith("x86-64") else march
+    mtune = overrides.get("-mtune", mtune)
 
     return Derived(facts=facts, idx=idx, tree=tree, version=tree_version(tree), sched=sched, toolchain=toolchain, lto=lto, btf=btf,
                    tracing=tracing, rust=rust, rust_reason=reason, fdo=fdo, fdo_reason=fdo_reason, march=march, mtune=mtune)
@@ -4437,60 +3235,29 @@ def flavor_cmdline(p: KernelProfile, facts: HostFacts) -> list[str]:
 # ---------------------------------------------------------------------------------------------------
 def _ops_uarch(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     arch = p.g("cpu", "arch")
-    for sym in GRAYSKY_SYMBOLS:
-        mx.n(sym, optional=True)
-    mx.n("X86_NATIVE_CPU", optional=True)
-    if arch == "native":
-        if d.idx.has("X86_NATIVE_CPU"):
-            mx.y("X86_NATIVE_CPU", why="-march=native")
-            if d.rust:
-                d.krustflags.append("-Ctarget-cpu=native")
-            return
-        if d.facts.vendor == "intel" and d.idx.has("MNATIVE_INTEL"):
-            mx.y("MNATIVE_INTEL", why="Graysky native Intel optimization")
-            if d.rust:
-                d.krustflags.append("-Ctarget-cpu=native")
-            return
-        if d.facts.vendor == "amd" and d.idx.has("MNATIVE_AMD"):
-            mx.y("MNATIVE_AMD", why="Graysky native AMD optimization")
-            if d.rust:
-                d.krustflags.append("-Ctarget-cpu=native")
-            return
-        uarch = d.facts.uarch
-        if uarch and uarch in UARCH_INFO:
-            _, gsym = UARCH_INFO[uarch]
-            if gsym != "GENERIC_CPU" and d.idx.has(gsym):
-                mx.y(gsym, why=f"Graysky detected host uarch ({uarch}) via {gsym}")
-                if d.rust:
-                    d.krustflags.append(f"-Ctarget-cpu={uarch}")
-                return
+    native = arch == "native" and not p.g("cpu", "march")
+    mx.flag("X86_NATIVE_CPU", native, why="native CPU code generation")
+    if not native:
         mx.y("GENERIC_CPU", optional=True)
-        mx.val("X86_64_VERSION", min(d.facts.psabi_level, d.idx.x86_64_version_max), optional=True)
-        d.kcflags += ["-march=native", "-mtune=native"]
+        level = {"generic": 1, "generic_v2": 2, "generic_v3": 3, "generic_v4": 4}.get(arch, 1)
+        mx.val("X86_64_VERSION", min(level, d.idx.x86_64_version_max), optional=True)
+        d.kcflags += [f"-march={d.march}", f"-mtune={d.mtune}"]
         if d.rust:
-            d.krustflags.append("-Ctarget-cpu=native")
-        return
-    level, gsym = UARCH_INFO[arch]
-    if gsym != "GENERIC_CPU" and d.idx.has(gsym):
-        mx.y(gsym, why=f"more-uarches patch present: {gsym}")
-        return
-    mx.y("GENERIC_CPU", optional=True)
-    mx.val("X86_64_VERSION", min(level, d.idx.x86_64_version_max), optional=True, why=f"psABI level for {arch}")
-    if not arch.startswith("generic"):
-        d.kcflags += [f"-march={arch}", f"-mtune={arch}"]
-        if d.rust:
-            d.krustflags.append(f"-Ctarget-cpu={arch}")
+            d.krustflags += [f"-Ctarget-cpu={d.march}", f"-Ztune-cpu={d.mtune}"]
 
 
 def _ops_core(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     s, f = p.sections, d.facts
     lean = p.lean("lean")
+    mx.y("SMP")
+    mx.y("X86_64")
+    mx.y("DEBUG_FS")
     for sym in ("EXPERT", "MULTIUSER", "POSIX_MQUEUE", "SYSVIPC", "NAMESPACES", "USER_NS", "PID_NS", "NET_NS", "UTS_NS", "IPC_NS", "TIME_NS",
                 "CGROUPS", "CGROUP_BPF", "CGROUP_SCHED", "FAIR_GROUP_SCHED", "CFS_BANDWIDTH", "CGROUP_FREEZER", "CGROUP_PIDS", "CGROUP_DEVICE",
                 "CGROUP_CPUACCT", "CGROUP_PERF", "CGROUP_MISC", "CPUSETS", "SECCOMP", "SECCOMP_FILTER", "SECURITY", "SECURITYFS", "SECURITY_LANDLOCK",
                 "SECURITY_YAMA", "SECURITY_LOCKDOWN_LSM", "LOCK_DOWN_KERNEL_FORCE_NONE", "EPOLL", "SIGNALFD", "TIMERFD", "EVENTFD", "FHANDLE",
                 "INOTIFY_USER", "FANOTIFY", "FANOTIFY_ACCESS_PERMISSIONS", "IO_URING", "ADVISE_SYSCALLS", "MEMBARRIER", "RSEQ", "KCMP", "FUTEX", "FUTEX_PI",
-                "DEVTMPFS", "DEVTMPFS_MOUNT", "TMPFS", "TMPFS_POSIX_ACL", "TMPFS_XATTR", "TMPFS_INODE64", "PROC_FS", "PROC_SYSCTL", "PROC_PAGE_MONITOR",
+                "DEVTMPFS", "DEVTMPFS_MOUNT", "TMPFS", "TMPFS_POSIX_ACL", "TMPFS_XATTR", "TMPFS_INODE64", "PROC_FS", "PROC_PAGE_MONITOR",
                 "SYSFS", "CONFIGFS_FS", "EFIVAR_FS", "EFI", "EFI_STUB", "EFI_HANDOVER_PROTOCOL", "BLK_DEV_INITRD", "RD_ZSTD", "RD_GZIP", "MODULES",
                 "MODULE_UNLOAD", "KERNEL_ZSTD", "RELOCATABLE", "RANDOMIZE_BASE", "RANDOMIZE_MEMORY", "MICROCODE", "DMI", "DMIID", "ACPI",
                 "PCI", "PCI_MSI", "PCIEPORTBUS", "PCIEAER", "PCIEASPM", "HOTPLUG_PCI", "HOTPLUG_PCI_PCIE", "VT", "VT_CONSOLE", "UNIX98_PTYS", "FW_LOADER",
@@ -4555,7 +3322,6 @@ def _ops_sched(mx: Matrix, p: KernelProfile, d: Derived) -> None:
         for sym in ("BPF", "BPF_SYSCALL", "BPF_JIT", "BPF_JIT_ALWAYS_ON", "BPF_JIT_DEFAULT_ON", "SCHED_CLASS_EXT", "DEBUG_INFO_BTF", "DEBUG_INFO_BTF_MODULES",
                     "BPF_UNPRIV_DEFAULT_OFF", "CGROUP_BPF"):
             mx.y(sym, why="sched_ext")
-        mx.y("PAHOLE_HAS_SPLIT_BTF", optional=True)
         mx.n("MODULE_ALLOW_BTF_MISMATCH")
     else:
         mx.n("SCHED_CLASS_EXT")
@@ -4582,13 +3348,12 @@ def _ops_cpu(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     _ops_uarch(mx, p, d)
     if c["nr_cpus"]:
         nr = c["nr_cpus"]
-    elif s["meta"]["portable_package"]:
+    elif broad_hardware(p):
         nr = 512
     else:
-        # Default to at least 64 CPUs so hybrid P+E architectures (e.g. 14-24 cores),
-        # offlined cores, and re-enabled SMT/Hyper-Threading are never dropped by the kernel.
-        nr = max(64, ((f.threads + 7) // 8) * 8)
-    portable = s["meta"]["portable_package"]
+        # Exported possible-CPU slots include offline CPUs and sparse logical IDs.
+        nr = max(2, f.threads)
+    portable = broad_hardware(p)
     mx.val("NR_CPUS", nr)
     mx.n("MAXSMP")
     mx.flag("CPUMASK_OFFSTACK", nr > 512)
@@ -4760,11 +3525,11 @@ def _ops_memory(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     mx.flag("KSM", m["ksm"])
     for sym in ("DAMON", "DAMON_VADDR", "DAMON_PADDR", "DAMON_SYSFS", "DAMON_RECLAIM", "DAMON_LRU_SORT"):
         mx.flag(sym, m["damon"])
-    mx.flag("PAGE_REPORTING", m["page_reporting"])
+    mx.flag("PAGE_REPORTING", m["page_reporting"], optional=True, why="also selected by retained balloon drivers")
     if m["numa"]:
         mx.y("NUMA")
         mx.y("X86_64_ACPI_NUMA")
-        mx.val("NODES_SHIFT", m["nodes_shift"])
+        mx.val("NODES_SHIFT", m["nodes_shift"] or max(1, (f.numa_nodes - 1).bit_length()))
         mx.flag("NUMA_BALANCING", m["numa_balancing"])
         mx.flag("NUMA_BALANCING_DEFAULT_ENABLED", m["numa_balancing"])
         mx.n("NUMA_EMU")
@@ -4780,12 +3545,10 @@ def _ops_memory(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     log_shift = m["log_buf_shift"] or (15 if minimal else 16 if lean else 17)
     mx.val("LOG_BUF_SHIFT", log_shift)
     mx.val("LOG_CPU_MAX_BUF_SHIFT", 12)
-    mx.val("PRINTK_SAFE_LOG_BUF_SHIFT", 13)
     mx.flag("KALLSYMS_ALL", m["kallsyms_all"])
     mx.flag("IKCONFIG", m["ikconfig"])
     mx.flag("IKCONFIG_PROC", m["ikconfig"])
     mx.flag("BASE_SMALL", m["base_small"])
-    mx.flag("BASE_FULL", not m["base_small"])
     mx.flag("KEXEC", m["kexec"])
     mx.flag("KEXEC_FILE", m["kexec"], optional=True)
     mx.flag("KEXEC_HANDOVER", m["kexec"], optional=True, why="selects KEXEC_FILE in Linux 7.2+")
@@ -4812,7 +3575,6 @@ def _ops_memory(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     mx.n("UBSAN_BOOL")
     mx.n("UBSAN_ENUM")
     mx.n("UBSAN_ALIGNMENT")
-    mx.flag("UBSAN_SANITIZE_ALL", sec["ubsan_bounds"], optional=True)
 
 
 def _ops_compiler(mx: Matrix, p: KernelProfile, d: Derived) -> None:
@@ -4828,7 +3590,9 @@ def _ops_compiler(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     if bool(c.get("polly", False)) and d.toolchain == "llvm":
         mx.y("POLLY_CLANG", optional=True, why="Clang Polly loop optimizer")
     if d.toolchain == "llvm":
-        mx.choice(("LTO_NONE", "LTO_CLANG_THIN", "LTO_CLANG_FULL"), {"none": "LTO_NONE", "thin": "LTO_CLANG_THIN", "full": "LTO_CLANG_FULL"}[d.lto], why=f"lto={d.lto}")
+        mx.choice(("LTO_NONE", "LTO_CLANG_THIN", "LTO_CLANG_THIN_DIST", "LTO_CLANG_FULL"), {"none": "LTO_NONE", "thin": "LTO_CLANG_THIN", "thin_dist": "LTO_CLANG_THIN_DIST", "full": "LTO_CLANG_FULL"}[d.lto], why=f"lto={d.lto}")
+    if d.toolchain == "gcc":
+        mx.choice(("LTO_NONE", "LTO_CLANG_THIN", "LTO_CLANG_THIN_DIST", "LTO_CLANG_FULL"), "LTO_NONE")
     cfi_sym = "CFI" if d.idx.has("CFI") else "CFI_CLANG"
     cfi = bool(c["kcfi"]) and d.toolchain == "llvm"
     mx.flag(cfi_sym, cfi, why="kCFI")
@@ -4973,7 +3737,7 @@ def _ops_gaming(mx: Matrix, p: KernelProfile, d: Derived) -> None:
 FS_SYMBOLS: Final[dict[str, tuple[str, ...]]] = {
     "ext4": ("EXT4_FS", "EXT4_FS_POSIX_ACL", "EXT4_FS_SECURITY"), "btrfs": ("BTRFS_FS", "BTRFS_FS_POSIX_ACL"), "xfs": ("XFS_FS", "XFS_POSIX_ACL"),
     "f2fs": ("F2FS_FS", "F2FS_FS_POSIX_ACL", "F2FS_FS_SECURITY"), "vfat": ("VFAT_FS", "FAT_FS", "NLS_CODEPAGE_437", "NLS_ISO8859_1", "FAT_DEFAULT_UTF8"),
-    "exfat": ("EXFAT_FS",), "ntfs": ("NTFS_FS", "NTFS_FS_POSIX_ACL"), "ntfs3": ("NTFS3_FS", "NTFS3_LZX_XPRESS", "NTFS3_FS_POSIX_ACL"),
+    "virtiofs": ("FUSE_FS", "VIRTIO_FS"), "exfat": ("EXFAT_FS",), "ntfs": ("NTFS_FS", "NTFS_FS_POSIX_ACL"), "ntfs3": ("NTFS3_FS", "NTFS3_LZX_XPRESS", "NTFS3_FS_POSIX_ACL"),
     "fuse": ("FUSE_FS",), "fuseblk": ("FUSE_FS",), "overlay": ("OVERLAY_FS",),
     "nfs": ("NFS_FS", "NFS_V4"), "nfs4": ("NFS_FS", "NFS_V4"), "cifs": ("CIFS",), "smb3": ("CIFS",), "erofs": ("EROFS_FS",), "bcachefs": ("BCACHEFS_FS",),
 }
@@ -4982,7 +3746,7 @@ FS_SYMBOLS: Final[dict[str, tuple[str, ...]]] = {
 def _ops_storage(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     s, f = p.sections, d.facts
     st = s["storage"]
-    portable = s["meta"]["portable_package"]
+    portable = broad_hardware(p)
     lean = p.lean("lean")
     if f.has_nvme or st["nvme_poll_queues"] or portable:
         mx.y("BLK_DEV_NVME")
@@ -5033,7 +3797,9 @@ def _ops_power(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     mx.flag("SUSPEND", pw["suspend"])
     mx.flag("HIBERNATION", pw["hibernation"])
     if pw["hibernation"]:
-        mx.choice(("HIBERNATION_COMP_LZO", "HIBERNATION_COMP_LZ4", "HIBERNATION_COMP_ZSTD"), "HIBERNATION_COMP_ZSTD", optional=True)
+        codec = pw["hibernation_compress"].upper()
+        mx.y(f"CRYPTO_{codec}")
+        mx.choice(("HIBERNATION_COMP_LZO", "HIBERNATION_COMP_LZ4"), f"HIBERNATION_COMP_{codec}")
     mx.n("PM_AUTOSLEEP")
     mx.n("PM_WAKELOCKS")
     mx.n("PM_DEBUG")
@@ -5053,15 +3819,15 @@ def _ops_power(mx: Matrix, p: KernelProfile, d: Derived) -> None:
 def _ops_network(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     n = p.sections["network"]
     mx.y("TCP_CONG_ADVANCED")
-    mx.y("TCP_CONG_CUBIC")
-    mx.flag("TCP_CONG_BBR", True)
+    mx.flag("TCP_CONG_CUBIC", n["congestion"] == "cubic")
+    mx.flag("TCP_CONG_BBR", n["congestion"] == "bbr")
     mx.flag("TCP_CONG_RENO", n["congestion"] == "reno", optional=True)
     cong = {"bbr": "DEFAULT_BBR", "cubic": "DEFAULT_CUBIC", "reno": "DEFAULT_RENO"}
     mx.choice(cong.values(), cong[n["congestion"]], why=f"congestion={n['congestion']}")
     mx.y("NET_SCHED")
-    mx.y("NET_SCH_FQ")
-    mx.y("NET_SCH_FQ_CODEL")
-    mx.flag("NET_SCH_CAKE", True)
+    mx.flag("NET_SCH_FQ", n["qdisc"] == "fq")
+    mx.flag("NET_SCH_FQ_CODEL", n["qdisc"] in ("fq_codel", "cake"))
+    mx.flag("NET_SCH_CAKE", n["qdisc"] == "cake")
     mx.flag("NET_SCH_FQ_PIE", n["qdisc"] == "fq_pie" or not p.lean("lean"))
     qd = {"fq": "DEFAULT_FQ", "fq_codel": "DEFAULT_FQ_CODEL", "fq_pie": "DEFAULT_FQ_PIE", "pfifo_fast": "DEFAULT_PFIFO_FAST", "cake": "DEFAULT_FQ_CODEL"}
     mx.y("NET_SCH_DEFAULT")
@@ -5090,9 +3856,13 @@ def _ops_virt(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     virt_detected, virt_reason = _is_virt_target(p, f)
     if virt_detected:
         for sym in ("HYPERVISOR_GUEST", "PARAVIRT", "PARAVIRT_SPINLOCKS", "KVM_GUEST", "VIRTIO_MENU", "VIRTIO_PCI", "VIRTIO_BLK", "VIRTIO_NET", "VIRTIO_CONSOLE",
-                    "VIRTIO_BALLOON", "VIRTIO_INPUT", "VIRTIO_FS", "VSOCKETS", "VIRTIO_VSOCKETS", "VIRTIO_MEM", "SCSI_VIRTIO", "HW_RANDOM_VIRTIO", "MEMORY_BALLOON",
-                    "BALLOON_COMPACTION", "PAGE_REPORTING", "PTP_1588_CLOCK_KVM", "X86_HV_CALLBACK_VECTOR"):
+                    "VIRTIO_BALLOON", "VIRTIO_INPUT", "VSOCKETS", "VIRTIO_VSOCKETS", "VIRTIO_MEM", "SCSI_VIRTIO", "HW_RANDOM_VIRTIO", "PAGE_REPORTING", "PTP_1588_CLOCK_KVM", "X86_HV_CALLBACK_VECTOR"):
             mx.y(sym, why=f"virtualized guest ({virt_reason})", optional=sym in ("PTP_1588_CLOCK_KVM", "X86_HV_CALLBACK_VECTOR", "VIRTIO_MEM"))
+        if f.root_fs == "virtiofs":
+            mx.y("FUSE_FS")
+            mx.y("VIRTIO_FS")
+        else:
+            mx.m("VIRTIO_FS")
         if f.virt in ("microsoft", "hyperv"):
             for sym in ("HYPERV", "HYPERV_STORAGE", "HYPERV_NET", "HYPERV_BALLOON", "HYPERV_UTILS"):
                 mx.m(sym)
@@ -5103,7 +3873,7 @@ def _ops_virt(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     if p.g("meta", "bare_metal_only"):
         for sym in ("HYPERVISOR_GUEST", "PARAVIRT", "KVM_GUEST", "XEN", "VIRTIO_MENU", "HYPERV", "VMWARE_VMCI", "VBOXGUEST"):
             mx.n(sym, why="bare_metal_only")
-    elif p.g("meta", "portable_package"):
+    elif broad_hardware(p):
         for sym in ("HYPERVISOR_GUEST", "PARAVIRT", "PARAVIRT_SPINLOCKS", "KVM_GUEST", "VIRTIO_MENU", "VIRTIO_PCI", "VIRTIO_BLK", "VIRTIO_NET", "VIRTIO_CONSOLE"):
             mx.y(sym, why="portable_package paravirt/virtio support", optional=True)
 
@@ -5131,7 +3901,7 @@ def _gpu_hide_active() -> bool:
 def _ops_gpu(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     f = d.facts
     gpus = set(f.gpus)
-    portable = p.g("meta", "portable_package")
+    portable = broad_hardware(p)
     if "amd" in gpus or portable:
         mx.m("DRM_AMDGPU", why="AMD GPU present/portable")
         mx.y("DRM_AMD_DC", optional=True)
@@ -5141,10 +3911,20 @@ def _ops_gpu(mx: Matrix, p: KernelProfile, d: Derived) -> None:
         mx.m("HSA_AMD", optional=True)
         mx.y("AMD_PRIVATE_COLOR", optional=True, why="enable AMD KMS color management for Gamescope/HDR")
     if "intel" in gpus or portable:
-        mx.m("DRM_I915", why="Intel GPU present/portable")
-        mx.m("DRM_XE", why="Intel GPU present/portable")
-        mx.y("DRM_XE_DISPLAY", optional=True)
-    if _gpu_hide_active() and not portable:
+        drivers = ("DRM_I915", "DRM_XE")
+        pruned = parse_dotconfig(_read(d.tree / ".config"))
+        retained = [sym for sym in drivers if pruned.get(sym) in ("y", "m")]
+        if p.g("modules", "mode") == "strict" and not portable and (d.tree / ".config").is_file():
+            explicit = {str(sym).removeprefix("CONFIG_") for sym in p.g("modules", "keep_symbols")}
+            explicit.update(str(sym).removeprefix("CONFIG_") for sym, value in p.g("dusky", "extra_config").items() if value in (True, "y", "m"))
+            drivers = tuple(sym for sym in drivers if sym in retained or sym in explicit)
+            if not drivers:
+                raise ProfileError("Intel GPU detected but target census retained neither i915 nor xe; collect the target driver or add it to modules.keep_symbols")
+        for sym in drivers:
+            mx.m(sym, why="Intel GPU census/target")
+        if "DRM_XE" in drivers:
+            mx.y("DRM_XE_DISPLAY", optional=True)
+    if not p.g("meta", "manifest_path") and _gpu_hide_active() and not portable:
         warn("gpu-disable-toggle looks ACTIVE (state=disabled or vfio-pci.ids on cmdline): "
              "PCI telemetry may be blind to the NVIDIA card, so this kernel may omit its "
              "driver. If you want the dGPU in this kernel, --enable it first and re-run "
@@ -5165,8 +3945,8 @@ def _ops_gpu(mx: Matrix, p: KernelProfile, d: Derived) -> None:
         else:
             debug(f"skipping DRM_NOUVEAU: NVIDIA + {', '.join(f.dkms_modules)} on stable "
                   f"{d.version} (proprietary covers the card)")
-    if (gpus & {"virtio", "qxl", "bochs", "vmware"}) or portable or p.name == "vm_guest" or _is_virt_target(p, f)[0]:
-        for sym in ("DRM_VIRTIO_GPU", "DRM_QXL", "DRM_BOCHS", "DRM_VMWGFX"):
+    for gpu, sym in (("virtio", "DRM_VIRTIO_GPU"), ("qxl", "DRM_QXL"), ("bochs", "DRM_BOCHS"), ("vmware", "DRM_VMWGFX")):
+        if gpu in gpus or portable:
             mx.m(sym, optional=True)
     mx.m("DRM", why="modular DRM core (mkinitcpio kms hook ships it in the initramfs)")
     mx.m("DRM_SIMPLEDRM", why="early firmware framebuffer console")
@@ -5178,6 +3958,12 @@ def _ops_gpu(mx: Matrix, p: KernelProfile, d: Derived) -> None:
 
 
 def _ops_extra(mx: Matrix, p: KernelProfile, d: Derived) -> None:
+    for sym in p.g("modules", "keep_symbols"):
+        symbol = str(sym).removeprefix("CONFIG_")
+        if d.idx.types.get(symbol) == "bool":
+            mx.y(symbol, why="modules.keep_symbols")
+        else:
+            mx.m(symbol, why="modules.keep_symbols")
     for sym, val in p.g("dusky", "extra_config").items():
         symbol = str(sym).removeprefix("CONFIG_")
         match val:
@@ -5193,8 +3979,6 @@ def _ops_extra(mx: Matrix, p: KernelProfile, d: Derived) -> None:
                 mx.n(symbol, why="dusky.extra_config")
             case str():
                 mx.s(symbol, val, why="dusky.extra_config")
-    for sym in p.g("modules", "keep_symbols"):
-        mx.m(str(sym).removeprefix("CONFIG_"), why="modules.keep_symbols")
     mx.s("LOCALVERSION", p.localversion())
     mx.n("LOCALVERSION_AUTO")
     mx.s("DEFAULT_HOSTNAME", "(none)")
@@ -5205,6 +3989,10 @@ def build_config_matrix(p: KernelProfile, d: Derived) -> Matrix:
     for builder in (_ops_core, _ops_sched, _ops_cpu, _ops_timing, _ops_memory, _ops_compiler, _ops_security, _ops_gaming, _ops_storage,
                     _ops_power, _ops_network, _ops_virt, _ops_gpu, _ops_extra):
         builder(mx, p, d)
+    if p.g("modules", "localyesconfig"):
+        for op in list(mx.ops):
+            if op.action == "m":
+                mx.add(replace(op, action="y"))
     return mx
 
 # ---------------------------------------------------------------------------------------------------
@@ -5240,7 +4028,7 @@ def apply_matrix(tree: Path, mx: Matrix) -> None:
 def finalize_config(tree: Path, env: Mapping[str, str]) -> None:
     rule("Resolve dependencies (olddefconfig)")
     run(["make", "olddefconfig"], cwd=tree, env=env)
-    run(["make", "syncconfig"], cwd=tree, env=env, check=False)
+    run(["make", "syncconfig"], cwd=tree, env=env)
     ok(".config resolved")
 
 
@@ -5267,7 +4055,7 @@ VERIFY_HINTS: Final[dict[str, str]] = {
     "CFI_CLANG": "kCFI needs clang -fsanitize=kcfi",
     "AUTOFDO_CLANG": "requires clang >= 17 and CLANG_AUTOFDO_PROFILE",
     "PROPELLER_CLANG": "requires clang >= 19 and CLANG_PROPELLER_PROFILE_PREFIX",
-    "X86_NATIVE_CPU": "tree lacks X86_NATIVE_CPU; KCFLAGS -march=native is used instead",
+    "X86_NATIVE_CPU": "native targeting requires this tree to provide X86_NATIVE_CPU",
     "LD_DEAD_CODE_DATA_ELIMINATION": "x86-64 does not select HAS_LD_DEAD_CODE_DATA_ELIMINATION upstream (inert without out-of-tree patches)",
     "NTSYNC": "in-tree ntsync requires Linux >= 6.14 without BROKEN",
     "SLUB_CPU_PARTIAL": "unavailable under PREEMPT_RT or SLUB_TINY",
@@ -5309,11 +4097,14 @@ def verify_config(tree: Path, p: KernelProfile, mx: Matrix, d: Derived) -> Verif
     extra_soft = {str(s).removeprefix("CONFIG_") for s in p.g("verify", "optional_symbols")}
     hard: list[tuple[Op, str | None]] = []
     soft: list[tuple[Op, str | None]] = []
-    for op in mx.ops:
+    requested = {str(k).removeprefix("CONFIG_") for k in p.g("dusky", "extra_config")} | {str(k).removeprefix("CONFIG_") for k in p.g("modules", "keep_symbols")}
+    for op in [*mx.ops, *mx.skipped]:
+        if op in mx.skipped and op.symbol not in requested:
+            op = replace(op, optional=True)
         actual = cfg.get(op.symbol)
         match op.action:
             case "y":
-                good = actual in ("y", "m")
+                good = actual == "y"
             case "m":
                 good = actual in ("m", "y")
             case "n":
@@ -5332,7 +4123,11 @@ def verify_config(tree: Path, p: KernelProfile, mx: Matrix, d: Derived) -> Verif
 
     require(s["verify"]["require_ntsync"] and s["gaming"]["ntsync"], "NTSYNC", "y|m", "verify.require_ntsync")
     require(s["verify"]["require_btf"] and d.scx_class and s["scheduler"]["scx_enable_class"], "DEBUG_INFO_BTF", "y", "verify.require_btf")
-    require(s["verify"]["require_sched_ext"] and s["scheduler"]["scx"] != "none", "SCHED_CLASS_EXT", "y", "verify.require_sched_ext")
+    require(s["verify"]["require_sched_ext"] and s["scheduler"]["scx_enable_class"], "SCHED_CLASS_EXT", "y", "verify.require_sched_ext")
+    require(s["cpu"]["arch"] == "native" and not s["cpu"]["march"], "X86_NATIVE_CPU", "y", "native CPU targeting")
+    require(s["cache"]["sched_cache"], "SCHED_CACHE", "y", "cache-aware scheduling")
+    require(s["rseq"]["slice_extension"], "RSEQ_SLICE_EXTENSION", "y", "rseq slice extension")
+    require(s["power"]["rcu_lazy"], "RCU_LAZY", "y", "lazy RCU")
     require(True, "HZ", str(s["timing"]["hz"]), "timer frequency")
     require(True, "LOCALVERSION", p.localversion(), "LOCALVERSION")
     facts_out = [
@@ -5380,53 +4175,38 @@ def kernelrelease(tree: Path, env: Mapping[str, str]) -> str:
         txt = krel.read_text(encoding="utf-8").strip()
         if txt:
             return txt
-    cp = run(["make", "-s", "kernelrelease"], cwd=tree, env=env, check=False)
+    cp = run(["make", "-s", "kernelrelease"], cwd=tree, env=env)
     lines = [ln.strip() for ln in (cp.stdout or "").splitlines() if ln.strip() and not ln.startswith(("make", "scripts/"))]
-    return lines[-1] if lines else ""
+    if not lines:
+        raise BuildError("Kbuild did not report a kernel release")
+    return lines[-1]
 
 
 # ---------------------------------------------------------------------------------------------------
 # ThinLTO persistent cache
 # ---------------------------------------------------------------------------------------------------
-def prune_thinlto_cache(cache: Path, limit_bytes: int) -> None:
-    files = [f for f in cache.rglob("*") if f.is_file()]
-    total = sum(f.stat().st_size for f in files)
-    if total <= limit_bytes:
-        return
-    files.sort(key=lambda f: f.stat().st_mtime)
-    target = int(limit_bytes * 0.8)
-    for f in files:
-        if total <= target:
-            break
-        size = f.stat().st_size
-        try:
-            f.unlink()
-            total -= size
-        except OSError:
-            pass
-    info(f"ThinLTO cache pruned to {fmt_bytes(total)}")
-
-
 def link_thinlto_cache(tree: Path, p: KernelProfile, d: Derived) -> None:
-    link = tree / ".thinlto-cache"
-    if d.lto != "thin" or not p.g("compiler", "thinlto_cache"):
+    """Ask LLD to manage its cache; never walk/delete a live cache from Python."""
+    if d.lto != "thin":
+        return
+    jobs = p.g("compiler", "jobs") or auto_jobs(host_facts(), d.lto)
+    flags = f"--thinlto-jobs={jobs}"
+    if p.g("compiler", "thinlto_cache"):
+        cache = (THINLTO_CACHE_DIR / p.name).resolve()
+        cache.mkdir(parents=True, exist_ok=True)
+        link = tree / ".thinlto-cache"
         if link.is_symlink():
             link.unlink()
-        return
-    cache = THINLTO_CACHE_DIR / p.name
-    cache.mkdir(parents=True, exist_ok=True)
-    if link.is_symlink():
-        if link.resolve() == cache.resolve():
-            pass
-        else:
-            link.unlink()
-            link.symlink_to(cache, target_is_directory=True)
-    else:
-        if link.is_dir():
-            shutil.rmtree(link)
+        elif link.exists():
+            raise BuildError(f"Expected a cache symlink, found {link}; use --fresh")
         link.symlink_to(cache, target_is_directory=True)
-    prune_thinlto_cache(cache, int(p.g("compiler", "thinlto_cache_size_gb")) << 30)
-    ok(f"ThinLTO cache: {cache} (kbuild --thinlto-cache-dir=.thinlto-cache -> persistent symlink)")
+        size = p.g("compiler", "thinlto_cache_size_gb")
+        flags += f" --thinlto-cache-dir=.thinlto-cache --thinlto-cache-policy=cache_size=0:cache_size_bytes={size}g"
+    makefile = tree / "Makefile"
+    marker = "\n# Dusky LLD cache and parallelism\n"
+    text = makefile.read_text().split(marker)[0]
+    makefile.write_text(text + marker + f"ifndef KBUILD_EXTMOD\nifeq ($(CONFIG_LTO_CLANG_THIN),y)\nKBUILD_LDFLAGS += {flags}\nendif\nendif\n")
+    ok(f"LLD ThinLTO jobs={jobs}, cache={'enabled' if p.g('compiler', 'thinlto_cache') else 'disabled'}")
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -5446,16 +4226,20 @@ def resolve_build_headers(p: KernelProfile, facts: HostFacts) -> bool:
             return needs_headers(facts)
 
 
+@functools.cache
+def compiler_has_flag(compiler: str, flag: str) -> bool:
+    return run([compiler, flag, "-Werror", "-x", "c", "-fsyntax-only", "/dev/null"], check=False).returncode == 0
+
+
 def build_env(p: KernelProfile, d: Derived, facts: HostFacts, epoch: float) -> dict[str, str]:
-    env = os.environ.copy()
-    for key in ("LOCALVERSION", "MAKEFLAGS", "KCFLAGS", "KRUSTFLAGS", "LLVM", "LLVM_IAS", "CC", "LD", "AR", "NM", "OBJCOPY", "STRIP", "HOSTCC", "HOSTLD"):
-        env.pop(key, None)
+    env = toolchain_env(p)
     env["LANG"] = env["LC_ALL"] = "C.UTF-8"
     kbuild_user = (p.g("dusky", "user") or "").strip() or os.environ.get("KBUILD_BUILD_USER") or os.environ.get("SUDO_USER") or os.environ.get("USER") or os.environ.get("LOGNAME") or Path.home().name or "builduser"
     kbuild_host = (p.g("dusky", "hostname") or "").strip() or os.environ.get("KBUILD_BUILD_HOST") or platform.node() or "archlinux"
     env["KBUILD_BUILD_USER"] = kbuild_user
     env["KBUILD_BUILD_HOST"] = kbuild_host
     if p.g("dusky", "reproducible"):
+        env["KBUILD_BUILD_VERSION"] = "1"
         env["KBUILD_BUILD_TIMESTAMP"] = datetime.fromtimestamp(epoch, UTC).strftime("%a %b %d %H:%M:%S UTC %Y")
         env["SOURCE_DATE_EPOCH"] = str(int(epoch))
     if d.toolchain == "llvm":
@@ -5465,19 +4249,27 @@ def build_env(p: KernelProfile, d: Derived, facts: HostFacts, epoch: float) -> d
         env["CC"] = "gcc"
         env["HOSTCC"] = "gcc"
         env["LD"] = "ld.bfd"
-    if bool(p.g("compiler", "ccache", True)) and Path("/usr/lib/ccache/bin").is_dir():
-        env["PATH"] = f"/usr/lib/ccache/bin:{env.get('PATH', '')}"
-        env.setdefault("CCACHE_SLOPPINESS", "file_macro,time_macros,include_file_mtime")
-        env.setdefault("CCACHE_BASEDIR", str(SRC_DIR))
-        env.setdefault("CCACHE_NOHASHDIR", "1")
+    if p.g("compiler", "ccache") and have("ccache"):
+        env["CC"] = "ccache clang" if d.toolchain == "llvm" else "ccache gcc"
+        env["CCACHE_BASEDIR"] = str(SRC_DIR)
+        env["CCACHE_DIR"] = str(CCACHE_DIR)
     kcflags = list(d.kcflags)
     if p.g("compiler", "optimize") == "o3":
         kcflags.append("-O3")
-    kcflags += shlex.split(p.g("cpu", "march"))
+    # Preserve x86 kernel no-FPU contract when explicit -march enables vector features.
+    if kcflags:
+        kcflags += ["-mno-sse", "-mno-sse2", "-mno-mmx", "-mno-avx", "-mno-avx2"]
+        # Match upstream X86_NATIVE_CPU: general kernel code cannot use APX EGPR yet.
+        compiler = "clang" if d.toolchain == "llvm" else "gcc"
+        if compiler_has_flag(compiler, "-mno-apx-features=egpr"):
+            kcflags.append("-mno-apx-features=egpr")
     if kcflags:
         env["KCFLAGS"] = " ".join(kcflags)
-    if d.rust and d.krustflags:
-        env["KRUSTFLAGS"] = " ".join(d.krustflags)
+    rustflags = list(d.krustflags)
+    if d.rust and p.g("compiler", "optimize") == "o3":
+        rustflags.append("-Copt-level=3")
+    if d.rust and rustflags:
+        env["KRUSTFLAGS"] = " ".join(rustflags)
     if d.fdo != "none":
         pdir = Path(p.g("compiler", "fdo_profile_dir")).expanduser() if p.g("compiler", "fdo_profile_dir") else STATE_DIR / "fdo" / p.name
         env["CLANG_AUTOFDO_PROFILE"] = str(pdir / "kernel.afdo")
@@ -5490,14 +4282,17 @@ def build_env(p: KernelProfile, d: Derived, facts: HostFacts, epoch: float) -> d
     return env
 
 
-def check_disk_space(lto: str) -> None:
-    BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    free = shutil.disk_usage(BUILD_DIR).free
-    need = (30 if lto == "full" else 22) << 30
-    if free < (8 << 30):
-        raise BuildError(f"Only {fmt_bytes(free)} free in {BUILD_DIR}; a kernel build needs >= {fmt_bytes(need)}")
-    if free < need:
-        warn(f"{fmt_bytes(free)} free in {BUILD_DIR}; builds with debug info can exceed {fmt_bytes(need)}")
+def check_disk_space(lto: str, *, installing: bool = False, building: bool = True) -> None:
+    if building:
+        BUILD_DIR.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(BUILD_DIR).free
+        need = (30 if lto == "full" else 22) << 30
+        if free < (8 << 30):
+            raise BuildError(f"Only {fmt_bytes(free)} free in {BUILD_DIR}; a kernel build needs >= {fmt_bytes(need)}")
+        if free < need:
+            warn(f"{fmt_bytes(free)} free in {BUILD_DIR}; builds with debug info can exceed {fmt_bytes(need)}")
+    if not installing:
+        return
     boot = Path("/boot")
     if boot.exists():
         try:
@@ -5549,25 +4344,37 @@ def check_pacman_preflight(require_install: bool = True) -> None:
 def check_dependencies(p: KernelProfile, facts: HostFacts, d_toolchain: str, want_rust: bool) -> None:
     if os.geteuid() == 0:
         raise DependencyError("makepkg refuses to run as root; run this tool as a regular user (sudo is requested only for installation)")
-    reqs = [("make", "base-devel"), ("makepkg", "pacman"), ("fakeroot", "base-devel"), ("bc", "bc"), ("tar", "tar"), ("xz", "xz"), ("zstd", "zstd"), ("kmod", "kmod"),
-            ("cpio", "cpio"), ("perl", "perl"), ("flex", "flex"), ("bison", "bison"), ("patch", "patch"), ("pahole", "pahole"), ("python3", "python")]
-    if d_toolchain == "llvm":
-        reqs += [("clang", "clang"), ("ld.lld", "lld"), ("llvm-ar", "llvm"), ("llvm-objcopy", "llvm")]
-    else:
-        reqs += [("gcc", "gcc"), ("ld.bfd", "binutils")]
+    if platform.machine() != "x86_64":
+        raise DependencyError("This engine targets x86-64 Arch Linux")
+    if not have("pacman"):
+        raise DependencyError("Arch Linux with pacman is required")
+    packages = {"base-devel", "bc", "cpio", "kmod", "pahole", "python", "rsync", "libelf", "openssl", "gettext", "tar", "xz", "zstd", "curl", "git", "gnupg"}
+    packages.update({"clang", "lld", "llvm"} if d_toolchain == "llvm" else {"gcc", "binutils"})
+    if p.g("compiler", "ccache"):
+        packages.add("ccache")
     if want_rust:
-        reqs += [("rustc", "rust"), ("bindgen", "rust-bindgen")]
-    if not have("curl") and not have("aria2c"):
-        reqs.append(("curl", "curl"))
-    missing = [(cmd, pkg) for cmd, pkg in reqs if not have(cmd)]
+        packages.update({"rust", "rust-src", "rust-bindgen"})
+    if p.g("compiler", "polly"):
+        packages.add("polly")
+    missing = [pkg for pkg in sorted(packages) if run(["pacman", "-Q", pkg], check=False).returncode]
     if missing:
-        pkgs = sorted({pkg for _, pkg in missing})
-        warn("Missing tools: " + ", ".join(cmd for cmd, _ in missing))
-        if interactive() and ask_yes(f"Install now with pacman -S --needed {' '.join(pkgs)}?", True):
-            PRIV.run(["pacman", "-S", "--needed", "--noconfirm", *pkgs], capture=False)
-            missing = [(cmd, pkg) for cmd, pkg in missing if not have(cmd)]
-        if missing:
-            raise DependencyError("Install: pacman -S --needed " + " ".join(pkgs))
+        if not (interactive() or ASSUME_YES):
+            raise DependencyError("Install dependencies interactively or use --yes: " + ", ".join(missing))
+        if not ask_yes("Install missing build dependencies: " + ", ".join(missing) + "?", True):
+            raise DependencyError("Missing dependencies: " + ", ".join(missing))
+        PRIV.run(["pacman", "-S", "--needed", "--noconfirm", *missing], capture=False)
+        if any(run(["pacman", "-Q", pkg], check=False).returncode for pkg in missing):
+            raise DependencyError("Dependency installation incomplete")
+    if p.g("modules", "modprobed_db") and not p.g("modules", "modprobed_db_path") and not p.g("meta", "manifest_path") and not have("modprobed-db"):
+        if not (interactive() or ASSUME_YES):
+            raise DependencyError("Install modprobed-db interactively or use --yes")
+        if ask_yes("Install modprobed-db from AUR to collect this machine's modules?", True):
+            if not install_aur_package("modprobed-db"):
+                raise DependencyError("Could not install modprobed-db")
+    if d_toolchain == "llvm" and version_tuple(tool_version(["clang", "--version"])) < (21,):
+        raise DependencyError("Clang 21+ required; update the Arch toolchain")
+    if p.g("compiler", "ccache") and have("ccache"):
+        note("ccache available")
     if p.g("compiler", "polly") and d_toolchain == "llvm":
         polly_found = any(Path(loc).is_file() for loc in [
             "/usr/lib/LLVMPolly.so",
@@ -5598,8 +4405,90 @@ def rust_probe(tree: Path, env: Mapping[str, str]) -> tuple[bool, str]:
     return cp.returncode == 0, cp.stdout or ""
 
 
+def prepare_extmod_build(tree: Path, d: Derived, env: Mapping[str, str]) -> None:
+    """Keep the selected target/toolchain in the headers for future DKMS builds."""
+    path = tree / "Makefile"
+    text = path.read_text()
+    start = "# Dusky external-module toolchain\n"
+    end = "# End Dusky external-module toolchain\n"
+    if start in text:
+        a = text.index(start); b = text.index(end, a) + len(end)
+        text = text[:a] + text[b:]
+    anchor = "export KBUILD_EXTMOD\n"
+    if anchor not in text:
+        raise BuildError("Kbuild external-module layout changed; cannot prepare headers")
+    toolchain = "LLVM ?= 1\n" if d.toolchain == "llvm" else "CC = gcc\nLD = ld.bfd\n"
+    text = text.replace(anchor, anchor + start + "ifdef KBUILD_EXTMOD\n" + toolchain + "endif\n" + end, 1)
+    marker = "\n# Dusky external-module CPU flags\n"
+    text = text.split(marker)[0]
+    block = marker + "ifdef KBUILD_EXTMOD\n"
+    if env.get("KCFLAGS"):
+        block += f"KBUILD_CFLAGS += {env['KCFLAGS']}\n"
+    if env.get("KRUSTFLAGS"):
+        block += f"KBUILD_RUSTFLAGS += {env['KRUSTFLAGS']}\n"
+    path.write_text(text + block + "endif\n")
+
+
+def stage_runtime_package(tree: Path, p: KernelProfile, d: Derived) -> None:
+    """Attach the resolved profile and boot services to upstream's kernel package."""
+    stage = tree / ".dusky" / "runtime"
+    stage.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(SCRIPT_DIR / "kernel_runtime.py", stage / "runtime.py")
+    (stage / "profile.json").write_text(json.dumps({"kernelrelease": d.kernelrelease, "profile": p.sections}, indent=2) + "\n")
+    base = f"/usr/lib/dusky-kernel/{p.pkgbase}"
+    unit = f"{p.pkgbase}-tuning.service"
+    body = (f"[Unit]\nDescription=Kernel tuning for {p.pkgbase}\nConditionKernelVersion={d.kernelrelease}\n"
+            "After=systemd-sysctl.service systemd-modules-load.service swap.target sys-kernel-debug.mount\n"
+            f"[Service]\nType=oneshot\nExecStart=/usr/bin/python {base}/runtime.py {base}/profile.json\nRemainAfterExit=yes\n")
+    units = []
+    if p.g("runtime", "enabled"):
+        (stage / unit).write_text(body)
+        units.append(unit)
+    if p.g("runtime", "enabled") and p.g("scheduler", "scx") != "none":
+        unit = f"{p.pkgbase}-scheduler.service"
+        (stage / unit).write_text(
+            f"[Unit]\nDescription=Kernel scheduler for {p.pkgbase}\nConditionKernelVersion={d.kernelrelease}\n"
+            f"After={p.pkgbase}-tuning.service\nConflicts=scx.service scx_loader.service\n"
+            f"[Service]\nExecStart=/usr/bin/python {base}/runtime.py {base}/profile.json --scheduler\n")
+        units.append(unit)
+    pkgbuild = tree / "scripts/package/PKGBUILD"
+    text = pkgbuild.read_text()
+    marker = "\n# Dusky runtime package integration\n"
+    end_marker = "# End Dusky runtime package integration\n"
+    if marker in text:
+        start = text.index(marker)
+        end = text.index(end_marker, start) + len(end_marker)
+        text = text[:start] + text[end:]
+    # Rename the upstream implementation, keeping its internal body untouched.
+    # Evaluated after upstream declares package_<pkgbase>, which calls _package dynamically.
+    extra = marker + "eval \"$(declare -f _package | sed '1s/_package/_dusky_upstream_package/')\"\n"
+    extra += '_package() {\n  _dusky_upstream_package\n'
+    if p.g("runtime", "enabled"):
+        extra += '  depends+=(python systemd util-linux kmod)\n'
+    if p.g("runtime", "enabled") and p.g("scheduler", "scx") != "none":
+        extra += '  depends+=(scx-scheds)\n'
+    if p.g("runtime", "enabled"):
+        extra += f'  install -Dm644 "${{srctree}}/.dusky/runtime/runtime.py" "${{pkgdir}}{base}/runtime.py"\n'
+    extra += f'  install -Dm644 "${{srctree}}/.dusky/runtime/profile.json" "${{pkgdir}}{base}/profile.json"\n'
+    for unit in units:
+        extra += f'  install -Dm644 "${{srctree}}/.dusky/runtime/{unit}" "${{pkgdir}}/usr/lib/systemd/system/{unit}"\n'
+        extra += '  install -dm755 "${pkgdir}/usr/lib/systemd/system/multi-user.target.wants"\n'
+        extra += f'  ln -sf "../{unit}" "${{pkgdir}}/usr/lib/systemd/system/multi-user.target.wants/{unit}"\n'
+    extra += '}\n'
+    if resolve_build_headers(p, d.facts):
+        extra += "eval \"$(declare -f _package-headers | sed '1s/_package-headers/_dusky_upstream_headers/')\"\n"
+        dependencies = "clang lld llvm" if d.toolchain == "llvm" else "gcc binutils"
+        extra += f"_package-headers() {{\n  _dusky_upstream_headers\n  depends+=({dependencies})\n}}\n"
+    extra += end_marker
+    anchor = 'for _p in "${pkgname[@]}"; do'
+    if anchor not in text:
+        raise BuildError("Upstream PKGBUILD layout changed; cannot attach runtime files")
+    pkgbuild.write_text(text.replace(anchor, extra + anchor, 1))
+
+
 def compile_kernel(tree: Path, p: KernelProfile, d: Derived, env: Mapping[str, str], facts: HostFacts) -> list[Path]:
     rule("Compile kernel & build pacman packages")
+    stage_runtime_package(tree, p, d)
     jobs = p.g("compiler", "jobs") or auto_jobs(facts, d.lto)
     pkgdest = PKGDEST_DIR / p.name
     pkgdest.mkdir(parents=True, exist_ok=True)
@@ -5614,6 +4503,7 @@ def compile_kernel(tree: Path, p: KernelProfile, d: Derived, env: Mapping[str, s
     b_env["PACKAGER"] = packager_val
     b_env["PACMAN_EXTRAPACKAGES"] = "headers" if resolve_build_headers(p, d.facts) else ""
     b_env["MAKEFLAGS"] = f"-j{jobs}"
+    b_env["MAKEPKGOPTS"] = "--force"
     b_env["ZSTD_CLEVEL"] = "9"
     info(f"pkgbase={p.pkgbase} jobs={jobs} lto={d.lto} toolchain={d.toolchain} headers={'yes' if b_env['PACMAN_EXTRAPACKAGES'] else 'no'} rust={'yes' if d.rust else 'no'}")
     if d.lto == "full":
@@ -5636,7 +4526,7 @@ def compile_kernel(tree: Path, p: KernelProfile, d: Derived, env: Mapping[str, s
         for line in (errors or tail)[-20:]:
             say(f"    {C.RED}{line}{C.RESET}")
         raise BuildError(f"make pacman-pkg failed (exit {ret}); full log: {JOURNAL.path}")
-    pkgs = sorted((f for f in pkgdest.glob(f"{p.pkgbase}*.pkg.tar*") if f.stat().st_mtime >= start_wall - 5), key=lambda f: f.name)
+    pkgs = sorted((f for f in pkgdest.glob(f"{p.pkgbase}*.pkg.tar*") if not f.name.endswith(".sig") and f.stat().st_mtime >= start_wall - 5 and _pkg_file_pkgbase(f) == p.pkgbase), key=lambda f: f.name)
     if not pkgs:
         raise BuildError(f"No packages produced in {pkgdest}")
     ok(f"Built in {fmt_duration(duration)} ({steps:,} kbuild steps):")
@@ -5666,64 +4556,11 @@ def _kernelreleases_for_pkgbases(pkgbases: set[str]) -> dict[str, str]:
     return found
 
 
-def ensure_acpi_call_dkms_for_custom_kernel() -> bool:
-    """Migrate regular acpi_call -> acpi_call-dkms when building a custom dusky kernel.
-
-    Rationale: the regular 'acpi_call' package ships a prebuilt module only for
-    the exact stock 'linux' version (e.g. /usr/lib/modules/7.2.4-arch1-2/...).
-    It can never work after rebooting into linux-dusky-*. Only the DKMS variant
-    rebuilds via the -headers pacman hook for every kernelrelease.
-
-    This is intentionally based on "a custom kernel is being compiled" (this
-    script always builds linux-dusky-*), NOT on "a custom kernel is currently
-    running". First builds always run on stock, but need DKMS for the *target*
-    kernel after reboot. Best-effort: warns, never raises.
-    """
-    try:
-        has_dkms_variant = run(["pacman", "-Q", "acpi_call-dkms"], check=False, timeout=20).returncode == 0
-    except DuskyError:
-        has_dkms_variant = False
-    if has_dkms_variant:
-        debug("acpi_call-dkms already present; no migration needed")
-        return True
-    try:
-        has_regular = run(["pacman", "-Q", "acpi_call"], check=False, timeout=20).returncode == 0
-    except DuskyError:
-        return True
-    if not has_regular:
-        debug("regular acpi_call not installed; no migration needed")
-        return True
-    info("Custom kernel build with regular acpi_call detected -- migrating to acpi_call-dkms (prebuilt cannot work on linux-dusky-*)")
-    try:
-        PRIV.ensure()
-    except DuskyError as e:
-        warn(f"acpi_call migration skipped (no privilege): {e}")
-        return False
-    # Two-step: regular and -dkms conflict, and 'pacman -S --noconfirm' answers
-    # No to the remove-conflict prompt. Remove first, then install DKMS variant
-    # (which pulls 'dkms' via Depends).
-    rm = PRIV.run(["pacman", "-R", "--noconfirm", "acpi_call"], check=False)
-    if rm.returncode != 0:
-        debug(f"pacman -R acpi_call exited {rm.returncode}; continuing to install -dkms anyway")
-    ins = PRIV.run(["pacman", "-S", "--needed", "--noconfirm", "acpi_call-dkms"], check=False)
-    if ins.returncode != 0:
-        warn("Failed to install acpi_call-dkms; after reboot 'modprobe acpi_call' will fail on the dusky kernel. Fix with: sudo pacman -S acpi_call-dkms")
-        return False
-    try:
-        host_facts.cache_clear()  # type: ignore[attr-defined]
-    except (AttributeError, TypeError):
-        pass
-    ok("Migrated acpi_call -> acpi_call-dkms; DKMS hook will build it for the new kernelrelease")
-    return True
-
-
 def audit_dkms(pkgbases: set[str]) -> bool:
-    """Force-rebuild DKMS modules that are not 'installed' for the given pkgbases.
+    """Ensure registered modules exist for each installed target kernel.
 
-    Catches same-version reinstall staleness: `dkms status` reports e.g.
-    "nvidia/610.57.04, 7.2.4-dusky-battery: built" and modprobe then fails with
-    "Exec format error / struct module size must match". Best-effort: warns,
-    never raises.
+    Missing target entries are covered by autoinstall; non-installed entries are
+    retried explicitly. Failures block boot promotion.
     """
     if not have("dkms"):
         return True
@@ -5732,13 +4569,21 @@ def audit_dkms(pkgbases: set[str]) -> bool:
     except OSError:
         targets = {}
     if not targets:
-        note("DKMS audit skipped: no installed module dirs match " + ", ".join(sorted(pkgbases)))
-        return True
+        warn("No installed kernel module directories match " + ", ".join(sorted(pkgbases)))
+        return False
+    PRIV.ensure()
+    for krel in sorted(targets):
+        if PRIV.run(["dkms", "autoinstall", "-k", krel], check=False).returncode:
+            warn(f"DKMS autoinstall failed for {krel}")
+            return False
     try:
         cp = run(["dkms", "status"], check=False, timeout=60)
+        if cp.returncode:
+            warn("dkms status failed; installed module state could not be verified")
+            return False
     except DuskyError as e:
-        warn(f"DKMS audit skipped (dkms status failed): {e}")
-        return True
+        warn(f"DKMS status failed: {e}")
+        return False
     stale: list[tuple[str, str, str, str]] = []
     for line in (cp.stdout or "").splitlines():
         m = _DKMS_STATUS_RE.match(line.strip())
@@ -5764,8 +4609,20 @@ def audit_dkms(pkgbases: set[str]) -> bool:
     return True
 
 
+def ensure_install_dependencies(p: KernelProfile) -> None:
+    packages = ["mkinitcpio", "python", "systemd", "util-linux", "kmod"]
+    if p.g("scheduler", "scx") != "none" and p.g("runtime", "enabled"):
+        packages.append("scx-scheds")
+    missing = [pkg for pkg in packages if run(["pacman", "-Q", pkg], check=False).returncode]
+    if missing:
+        if not (interactive() or ASSUME_YES) or not ask_yes("Install kernel runtime dependencies: " + ", ".join(missing) + "?", True):
+            raise DependencyError("Missing installation dependencies: " + ", ".join(missing))
+        PRIV.run(["pacman", "-S", "--needed", "--noconfirm", *missing], capture=False)
+
+
 def install_packages(pkgs: Sequence[Path], profile: KernelProfile) -> None:
     rule("Install packages (pacman -U)")
+    ensure_install_dependencies(profile)
     PRIV.ensure()
     # Ensure /etc/mkinitcpio.d/<pkgbase>.preset exists so the pacman mkinitcpio hook runs for this kernel
     preset_path = Path(f"/etc/mkinitcpio.d/{profile.pkgbase}.preset")
@@ -5782,7 +4639,8 @@ def install_packages(pkgs: Sequence[Path], profile: KernelProfile) -> None:
         PRIV.write_files({preset_path: (preset_content, "0644")})
         ok(f"Created mkinitcpio preset: {preset_path}")
 
-    PRIV.run(["pacman", "-U", "--noconfirm", "--overwrite", "*", *[str(x) for x in pkgs]], capture=False)
+    install_started = time.time()
+    PRIV.run(["pacman", "-U", "--noconfirm", *[str(x) for x in pkgs]], capture=False)
     ok("Kernel packages installed (mkinitcpio and DKMS pacman hooks have run)")
     # Fresh-install path: (re)assert the modprobed-db writer so future
     # strict localmodconfig builds keep accumulating modules. User unit -> no sudo.
@@ -5791,23 +4649,24 @@ def install_packages(pkgs: Sequence[Path], profile: KernelProfile) -> None:
     # Same-version reinstalls can leave DKMS objects stale ("built" instead of
     # "installed", then Exec format error at modprobe). Audit and force-rebuild.
     if not audit_dkms({profile.pkgbase}):
-        warn("Some DKMS modules failed to rebuild; fix manually, e.g.: sudo dkms install --force <module>/<version> -k <kernelrelease>")
+        raise BuildError("Kernel installed, but DKMS failed; boot configuration was not promoted. Review DKMS logs before rebooting.")
 
-    # Build initramfs if missing
+    # DKMS repairs happen after pacman hooks: include their resulting modules.
+    # Also regenerate stale images when an alpm hook failed or did not run.
     initramfs_img = Path(f"/boot/initramfs-{profile.pkgbase}.img")
-    if not initramfs_img.is_file() and have("mkinitcpio"):
+    if have("dkms") or not initramfs_img.is_file() or initramfs_img.stat().st_mtime < install_started:
         info(f"Generating initramfs for {profile.pkgbase} via mkinitcpio -p...")
         PRIV.run(["mkinitcpio", "-p", profile.pkgbase], capture=False)
 
 # ---------------------------------------------------------------------------------------------------
 # Bootloader integration
 # ---------------------------------------------------------------------------------------------------
-def base_cmdline_tokens(facts: HostFacts) -> list[str]:
+def base_cmdline_tokens(facts: HostFacts, *, drop_managed: bool = True) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for tok in shlex.split(facts.cmdline):
         key = tok.split("=", 1)[0]
-        if key in ("BOOT_IMAGE", "initrd", "initrdefi") or key in MANAGED_CMDLINE_KEYS:
+        if key in ("BOOT_IMAGE", "initrd", "initrdefi") or (drop_managed and key in MANAGED_CMDLINE_KEYS):
             continue
         if tok not in seen:
             seen.add(tok)
@@ -5836,7 +4695,7 @@ def write_bls_entries(p: KernelProfile, facts: HostFacts, d: Derived) -> None:
     if Path(root).resolve() != Path("/boot").resolve():
         warn(f"Kernel images live in /boot but systemd-boot reads {root}; switch mkinitcpio to UKI or mount XBOOTLDR at /boot")
         return
-    params = base_cmdline_tokens(facts)
+    params = base_cmdline_tokens(facts, drop_managed=p.g("boot", "cmdline") != "print")
     if p.g("boot", "cmdline") == "entry":
         params += flavor_cmdline(p, facts)
     ucode: list[str] = []
@@ -5863,7 +4722,9 @@ def write_bls_entries(p: KernelProfile, facts: HostFacts, d: Derived) -> None:
     PRIV.write_files(files)
     ok(f"systemd-boot entries written: {', '.join(f.name for f in files)}")
 
-    # Update loader.conf directly so systemd-boot defaults to this entry
+    if not p.g("boot", "set_default"):
+        return
+    # Update loader.conf only when explicitly selected in the profile.
     loader_conf = Path(root) / "loader" / "loader.conf"
     if loader_conf.is_file():
         txt = loader_conf.read_text(encoding="utf-8")
@@ -5888,14 +4749,14 @@ def refresh_boot(p: KernelProfile, facts: HostFacts, d: Derived, *, kernel_insta
     rule("Bootloader refresh")
     PRIV.ensure()
     if "grub" in facts.bootloaders and have("grub-mkconfig"):
-        PRIV.run(["grub-mkconfig", "-o", "/boot/grub/grub.cfg"], check=False, capture=False)
+        PRIV.run(["grub-mkconfig", "-o", "/boot/grub/grub.cfg"], capture=False)
         ok("GRUB configuration regenerated")
     if "refind" in facts.bootloaders:
         if not Path("/boot/refind_linux.conf").is_file() and have("mkrlconf"):
             PRIV.run(["mkrlconf"], check=False)
         ok("rEFInd auto-detects /boot/vmlinuz-* (options in /boot/refind_linux.conf)")
     if "limine" in facts.bootloaders and have("limine-update"):
-        PRIV.run(["limine-update"], check=False, capture=False)
+        PRIV.run(["limine-update"], capture=False)
         ok("Limine entries updated")
     write_bls_entries(p, facts, d)
     if kernel_install and have("kernel-install") and d.kernelrelease:
@@ -5912,27 +4773,32 @@ def refresh_boot(p: KernelProfile, facts: HostFacts, d: Derived, *, kernel_insta
 # ---------------------------------------------------------------------------------------------------
 # Cross-machine hardware bundles
 # ---------------------------------------------------------------------------------------------------
-def do_export_bundle(dest: Path | None) -> Path:
+def do_export_bundle(dest: Path | None, profile_name: str | None = None) -> Path:
     banner()
     rule("Export hardware bundle")
     facts = host_facts()
+    if not facts.uarch:
+        if have("pacman") and (interactive() or ASSUME_YES) and ask_yes("Install clang to identify the target CPU precisely before exporting?", True):
+            PRIV.run(["pacman", "-S", "--needed", "--noconfirm", "clang"], capture=False)
+            host_facts.cache_clear()
+            facts = host_facts()
+        if not facts.uarch:
+            warn("Precise CPU name unavailable; export will use the target ISA baseline. Install a current compiler on the target and re-export for exact CPU tuning.")
     hname = re.sub(r"[^a-z0-9]+", "_", platform.node().lower()).strip("_") or "machine"
     out = dest or (Path.home() / f"dusky_bundle_{hname}.tar.gz")
     out.parent.mkdir(parents=True, exist_ok=True)
     if have("modprobed-db"):
         run(["modprobed-db", "store"], check=False, timeout=60)
-        ensure_modprobed_compat_link()
+
     db_src = resolve_modprobed_db()
-    manifest = {"format": "dusky_bundle_v2", "hostname": hname, "created_at": datetime.now(UTC).isoformat(), "app_version": APP_VERSION,
-                "uarch": facts.uarch, "psabi_level": facts.psabi_level, "vendor": facts.vendor, "model": facts.model, "threads": facts.threads,
-                "mem_gib": round(facts.mem_gib, 2), "gpus": list(facts.gpus), "filesystems": list(facts.filesystems), "root_fs": facts.root_fs,
-                "root_luks": facts.root_luks, "has_nvme": facts.has_nvme, "rotational": facts.rotational, "virt": facts.virt, "battery": facts.battery,
-                "dkms_modules": list(facts.dkms_modules), "bootloaders": list(facts.bootloaders), "initrd_compression": facts.initrd_compression,
-                "microcode_hook": facts.microcode_hook,
-                "kernel": facts.kernel, "cmdline": facts.cmdline, "flags": sorted(facts.flags)}
+    manifest = facts.as_json() | {"format": "dusky_bundle_v3", "hostname": hname,
+                                 "created_at": datetime.now(UTC).isoformat(), "app_version": APP_VERSION}
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         (tmp / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        if profile_name:
+            selected = select_profile(ensure_profiles_exist(), profile_name, facts)
+            (tmp / "profile.toml").write_text(render_profile_toml(selected.sections))
         if db_src is not None and _is_usable_db(db_src):
             try:
                 shutil.copy2(db_src, tmp / "modprobed.db")
@@ -5957,21 +4823,24 @@ def do_export_bundle(dest: Path | None) -> Path:
     return out
 
 
-def do_import_bundle(src: Path) -> str:
+def do_import_bundle(src: Path, profile_name: str | None = None) -> str:
     banner()
     rule("Import hardware bundle")
     if not src.is_file():
         raise DuskyError(f"Bundle not found: {src}")
+    bundled_profile = None
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         with tarfile.open(src, "r:*") as tar:
             tar.extractall(tmp, filter="data")
+        if (tmp / "profile.toml").is_file():
+            bundled_profile = load_profile(tmp / "profile.toml")
         mf = tmp / "manifest.json"
         if not mf.is_file():
             raise DuskyError("Invalid bundle: manifest.json missing")
         manifest = json.loads(mf.read_text(encoding="utf-8"))
         hname = re.sub(r"[^a-z0-9]+", "_", str(manifest.get("hostname", "remote"))).strip("_") or "remote"
-        import_dir = IMPORT_DIR / hname
+        import_dir = IMPORT_DIR / (hname + "-" + sha256_file(src)[:12])
         import_dir.mkdir(parents=True, exist_ok=True)
         db_path = ""
         mods: set[str] = set()
@@ -5996,34 +4865,37 @@ def do_import_bundle(src: Path) -> str:
         else:
             warn("bundle contained neither a usable modprobed.db nor a parseable lsmod.txt")
         shutil.copy2(tmp / "manifest.json", import_dir / "manifest.json")
-    arch = manifest.get("uarch") or f"generic_v{int(manifest.get('psabi_level', 3))}"
-    if arch not in CPU_ARCHES or arch == "native":
-        arch = f"generic_v{min(3, int(manifest.get('psabi_level', 3)))}"
-    mem = float(manifest.get("mem_gib", 16))
-    manifest_path = str(import_dir / "manifest.json")
-    tweaks: dict[str, dict[str, Any]] = {
-        "meta": {"portable_package": True, "bare_metal_only": False, "tags": ["remote", hname], "manifest_path": manifest_path},
-        "release": {"channel": "stable"},
-        "scheduler": {"type": "eevdf", "scx": "scx_bpfland" if mem > 6 and not is_virt else "none", "scx_flags": "", "scx_enable_class": mem > 6 and not is_virt},
-        "cpu": {"arch": arch, "nr_cpus": int(manifest.get("threads", 8)), "amd_pstate": "active" if manifest.get("vendor") == "amd" else "undefined", "mitigations": "on"},
-        "power": {"cpu_idle_governor": "haltpoll" if is_virt else "teo"},
-        "memory": {"footprint": suggest_footprint(mem), "swap_backend": "zram", "page_reporting": is_virt},
-        "compiler": {"toolchain": "llvm", "lto": "thin", "headers": "always" if manifest.get("dkms_modules") else "never", "rust": False},
-        "storage": {"extra_filesystems": [fs for fs in manifest.get("filesystems", []) if fs in FS_SYMBOLS]},
-        "modules": {"mode": "strict" if db_path else "expanded", "modprobed_db": bool(db_path), "modprobed_db_path": db_path},
-        "security": {"profile": "balanced"},
-        "gaming": {"ntsync": not is_virt, "controllers": not is_virt},
-        "boot": {"write_entries": False},
-        "verify": {"require_ntsync": not is_virt},
-    }
-    if is_virt:
-        tweaks["modules"]["keep_symbols"] = ["VIRTIO_MENU", "VIRTIO_PCI", "VIRTIO_BLK", "VIRTIO_NET", "DRM_VIRTIO_GPU", "DRM_BOCHS"]
-        tweaks["dusky"] = {"extra_config": {"CONFIG_VIRTIO_MENU": "y", "CONFIG_VIRTIO_PCI": "m", "CONFIG_VIRTIO_BLK": "y", "CONFIG_VIRTIO_NET": "m", "CONFIG_DRM_VIRTIO_GPU": "m", "CONFIG_DRM_BOCHS": "m"}}
-    pname = f"remote_{hname}"
-    prof = profile_from_tweaks(pname, f"Remote bundle for {hname}: {manifest.get('model', 'unknown CPU')}, {mem:.0f} GiB, {', '.join(manifest.get('gpus', [])) or 'no GPU info'}",
-                               f"dusky-{hname.replace('_', '-')}"[:40], tweaks, priority=90)
+    if manifest.get("format") != "dusky_bundle_v3":
+        raise ProfileError("Re-export the target with this version; bundle v3 required")
+    if not db_path:
+        raise ProfileError("No target module census; collect modules on the target and export again")
+    prof = (bundled_profile if bundled_profile is not None and profile_name is None else
+            select_profile(ensure_profiles_exist(), profile_name, host_facts())).clone()
+    arch = manifest.get("uarch") or {1: "generic", 2: "generic_v2", 3: "generic_v3", 4: "generic_v4"}[manifest["psabi_level"]]
+    target_suffix = prof.suffix + "-" + hname.replace("_", "-")
+    pname = f"remote_{hname}_{prof.name}"
+    prof.set("meta", "name", pname)
+    prof.set("meta", "description", f"{prof.description}; target {hname}")
+    prof.set("meta", "suffix", target_suffix if len(target_suffix) <= 40 else target_suffix[:31] + "-" + hashlib.sha256(target_suffix.encode()).hexdigest()[:8])
+    prof.set("meta", "portable_package", True)
+    prof.set("meta", "manifest_path", str(import_dir / "manifest.json"))
+    prof.set("cpu", "arch", arch)
+    prof.set("cpu", "march", "")
+    prof.set("cpu", "nr_cpus", 0)
+    prof.set("modules", "modprobed_db", True)
+    prof.set("modules", "modprobed_db_path", db_path)
+    prof.set("modules", "allow_lsmod_fallback", False)
+    # Boot-entry preference belongs to the target. do_build never installs remote builds.
+    validate_profile(prof)
+    cross_validate(prof, target_facts_for_profile(prof, host_facts()), force=True)
     dest_dir = PROFILES_DIR if os.access(PROFILES_DIR, os.W_OK) or not PROFILES_DIR.exists() else USER_PROFILES_DIR
     dest_dir.mkdir(parents=True, exist_ok=True)
+    original_name = pname
+    serial = 2
+    while (dest_dir / f"{pname}.toml").exists():
+        pname = f"{original_name}_{serial}"
+        serial += 1
+    prof.set("meta", "name", pname)
     (dest_dir / f"{pname}.toml").write_text(render_profile_toml(prof.sections, header=f"imported from {src.name}"), encoding="utf-8")
     ok(f"Registered profile '{pname}' ({dest_dir / (pname + '.toml')}); build with: --profile {pname} --no-install")
     return pname
@@ -6032,19 +4904,47 @@ def do_import_bundle(src: Path) -> str:
 # ---------------------------------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------------------------------
+KBUILD_ENV_KEYS: Final = (
+    "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS", "RUSTFLAGS", "HOSTCFLAGS", "HOSTCXXFLAGS", "HOSTRUSTFLAGS", "HOSTLDFLAGS",
+    "ARCH", "SUBARCH", "CROSS_COMPILE", "KBUILD_OUTPUT", "KCONFIG_CONFIG", "KBUILD_KCONFIG",
+    "LOCALVERSION", "MAKEFLAGS", "MFLAGS", "KBUILD_MAKEFLAGS", "KCFLAGS", "KCPPFLAGS", "KAFLAGS",
+    "KRUSTFLAGS", "RUSTFLAGS_KERNEL", "RUSTFLAGS_MODULE", "CFLAGS_KERNEL", "CFLAGS_MODULE",
+    "AFLAGS_KERNEL", "AFLAGS_MODULE", "LDFLAGS_MODULE", "KBUILD_EXTMOD", "KBUILD_EXTMOD_OUTPUT",
+    "LLVM", "LLVM_IAS", "CC", "CXX", "LD", "AR", "NM", "OBJCOPY", "OBJDUMP", "READELF", "STRIP",
+    "HOSTCC", "HOSTCXX", "HOSTLD", "HOSTAR", "RUSTC", "BINDGEN", "CLANG_AUTOFDO_PROFILE",
+    "CLANG_PROPELLER_PROFILE_PREFIX", "LDFLAGS_vmlinux", "KBUILD_LDFLAGS", "MAKEPKGOPTS",
+)
+
+
 def toolchain_env(p: KernelProfile) -> dict[str, str]:
-    env = os.environ.copy()
-    for key in ("LOCALVERSION", "MAKEFLAGS", "KCFLAGS", "KRUSTFLAGS", "LLVM", "LLVM_IAS", "CC", "LD"):
-        env.pop(key, None)
+    env = {k: v for k, v in os.environ.items() if k not in KBUILD_ENV_KEYS}
+    env["ARCH"] = "x86"
     env["LANG"] = env["LC_ALL"] = "C.UTF-8"
-    env["KCONFIG_NOTIMESTAMP"] = "1"
     if p.g("compiler", "toolchain") == "llvm":
         env["LLVM"] = "1"
-        env["LLVM_IAS"] = "1"
     else:
-        env["CC"] = "gcc"
-        env["HOSTCC"] = "gcc"
+        env.update(CC="gcc", HOSTCC="gcc", HOSTCXX="g++", LD="ld.bfd")
     return env
+
+
+def validate_rust_cpu(d: Derived) -> None:
+    if not d.rust:
+        return
+    cp = run(["rustc", "--print", "target-cpus", "--target=x86_64-unknown-none"], timeout=30)
+    supported = {line.split()[0] for line in cp.stdout.splitlines() if line.strip()}
+    for cpu in (d.march, d.mtune):
+        if cpu not in ("native", "generic") and cpu not in supported:
+            raise ProfileError(f"rustc cannot target/tune for {cpu}; update Rust or disable compiler.rust")
+
+
+def validate_cpu_flags(p: KernelProfile) -> None:
+    arch = p.g("cpu", "arch")
+    march = {"generic": "x86-64", "generic_v2": "x86-64-v2", "generic_v3": "x86-64-v3", "generic_v4": "x86-64-v4"}.get(arch, arch)
+    flags = [f"-march={march}", *shlex.split(p.g("cpu", "march"))]
+    compiler = "clang" if p.g("compiler", "toolchain") == "llvm" else "gcc"
+    cp = run([compiler, *flags, "-x", "c", "-fsyntax-only", "/dev/null"], check=False)
+    if cp.returncode:
+        raise ProfileError(f"{compiler} cannot target {arch}: {cp.stdout.strip()}")
 
 
 def show_configuration(profile: KernelProfile, diff: Sequence[str]) -> None:
@@ -6059,20 +4959,82 @@ def show_configuration(profile: KernelProfile, diff: Sequence[str]) -> None:
             say(f"    {C.YELLOW}{line}{C.RESET}")
 
 
+@contextmanager
+def build_workspace_lock():
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    with (BUILD_DIR / ".build.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as e:
+            raise BuildError(f"Another build is using {BUILD_DIR}") from e
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def checkpoint_run(cmd):
+    # The signal handler sets _ABORT; saving after Ctrl-C must still be allowed.
+    aborted = _ABORT.is_set()
+    _ABORT.clear()
+    try:
+        return run(cmd)
+    finally:
+        if aborted:
+            _ABORT.set()
+
+
+@contextmanager
+def storage_session(use_ram: bool):
+    global THINLTO_CACHE_DIR, CCACHE_DIR, RAM_RESERVE_GIB
+    if not use_ram:
+        yield
+        return
+    persistent = BUILD_DIR
+    old_lto, old_ccache = THINLTO_CACHE_DIR, CCACHE_DIR
+    settings = STORAGE | {"persistent_dir": persistent}
+    try:
+        with kernel_storage.ram_workspace(settings, run, note, checkpoint_run) as ram:
+            set_build_dir(ram)
+            THINLTO_CACHE_DIR, CCACHE_DIR = ram / "thinlto-cache", ram / "ccache"
+            RAM_RESERVE_GIB = settings["ram_reserve_gib"]
+            yield
+    except (kernel_storage.StorageError, OSError) as exc:
+        raise BuildError(str(exc)) from exc
+    finally:
+        set_build_dir(persistent)
+        THINLTO_CACHE_DIR, CCACHE_DIR = old_lto, old_ccache
+        RAM_RESERVE_GIB = 0
+
+
+def choose_ram_build(args: argparse.Namespace) -> bool:
+    use_ram = False
+    if interactive():
+        # Deliberately bypass ASSUME_YES: volatile storage always needs this run's choice.
+        if kernel_storage.ram_mount(STORAGE["zram_dir"]):
+            use_ram = input(f"Use RAM workspace {STORAGE['zram_dir']} for this build? [y/N] ").strip().lower() in ("y", "yes")
+        else:
+            note(f"RAM workspace unavailable: {STORAGE['zram_dir']}; using persistent disk")
+    elif getattr(args, "ram_build", False):
+        use_ram = True
+    return use_ram
+
+
 def do_build(args: argparse.Namespace) -> int:
     banner()
     facts = host_facts()
     profiles = ensure_profiles_exist()
     profile = select_profile(profiles, args.profile, facts).clone()
-    diff = configure_profile_interactively(profile, facts, args)
+    target_facts = target_facts_for_profile(profile, facts)
+    diff = configure_profile_interactively(profile, target_facts, args)
+    target_facts = target_facts_for_profile(profile, facts)
+    if profile.g("meta", "manifest_path"):
+        args.no_install = True
 
-    if getattr(args, "build_dir", None):
-        set_build_dir(args.build_dir)
-    elif interactive() and not ASSUME_YES and not getattr(args, "no_prompt", False):
-        chosen_dir = ask("Build directory (RAM/ZRAM disk recommended for speed)", str(BUILD_DIR))
-        set_build_dir(chosen_dir)
-    else:
-        set_build_dir(BUILD_DIR)
+    set_build_dir(args.build_dir or STORAGE.get("persistent_dir", BUILD_DIR))
+    if kernel_storage.ram_mount(BUILD_DIR):
+        raise ProfileError("Persistent build directory is RAM-backed; configure storage.zram_dir and use the RAM prompt instead")
+    use_ram = choose_ram_build(args)
 
     while True:
         show_configuration(profile, diff)
@@ -6085,89 +5047,92 @@ def do_build(args: argparse.Namespace) -> int:
             info("Aborted by user")
             return 0
         if action in ("e", "edit", "m", "menu"):
-            diff.extend(run_wizard(profile, facts))
-            diff = wizard_review_loop(profile, facts, diff, force=bool(getattr(args, "force", False)))
+            diff.extend(run_wizard(profile, target_facts))
+            diff = wizard_review_loop(profile, target_facts, diff, force=bool(getattr(args, "force", False)))
             if diff:
                 offer_save_profile(profile)
             continue
         warn(f"Unrecognized response '{action}'. Choose [y]es to proceed, [e]dit to modify, or [n]o to abort.")
 
-    if not args.no_install and not args.configure_only:
-        PRIV.ensure()
-        check_pacman_preflight(require_install=True)
-    if not args.configure_only:
-        # Target is always a custom linux-dusky-* kernel, even when currently
-        # running stock (first build). Regular acpi_call can never work after
-        # reboot, so migrate to the DKMS variant now while headers hooks run.
-        if ensure_acpi_call_dkms_for_custom_kernel():
-            try:
-                facts = host_facts()
-            except DuskyError:
-                pass
-    JOURNAL.open(profile.name)
-    note(f"journal: {JOURNAL.path}")
     check_dependencies(profile, facts, profile.g("compiler", "toolchain"), bool(profile.g("compiler", "rust")))
-    check_disk_space(profile.g("compiler", "lto"))
-    rule("Kernel release")
-    release = choose_release(profile, fetch_releases())
-    tarball = obtain_tarball(release, bool(profile.g("release", "require_signature")))
-    patchset = profile.g("scheduler", "type") if profile.g("scheduler", "type") != "eevdf" else ""
-    tree = unpack(tarball, release, patchset, bool(args.fresh))
-    sched = apply_scheduler_patch(tree, profile, release)
-    apply_enhancement_patches(tree, profile, release, facts)
-    ensure_hz_choice(tree, int(profile.g("timing", "hz")))
-    env0 = toolchain_env(profile)
-    seed_source = seed_config(tree, profile, env0, Path(args.seed_config).expanduser() if args.seed_config else None)
-    run(["make", "olddefconfig"], cwd=tree, env=env0)
-    db = ensure_modprobed_db(profile)
-    localmodconfig(tree, profile, db, env0)
-    idx = KconfigIndex.scan(tree)
-    note(f"Kconfig index: {len(idx.symbols):,} symbols (x86 view), X86_64_VERSION range max {idx.x86_64_version_max}")
-    target_facts = target_facts_for_profile(profile, facts)
-    if target_facts is not facts:
-        note(f"Target hardware profile: {target_facts.model} ({target_facts.vendor}), {target_facts.threads} threads, uarch={target_facts.uarch or 'generic_v' + str(target_facts.psabi_level)}, gpus={', '.join(target_facts.gpus) or 'none'}, virt={target_facts.virt}")
-    rust_ok, rust_out = (rust_probe(tree, env0) if profile.g("compiler", "rust") else (False, ""))
-    d = derive(profile, target_facts, idx, tree, sched, rust_ok, rust_out)
-    d.seed_source = seed_source
-    inject_dkms_march_in_makefile(tree, d.march, d.mtune)
-    mx = build_config_matrix(profile, d)
-    apply_matrix(tree, mx)
-    env = build_env(profile, d, target_facts, tarball.stat().st_mtime)
-    (tree / "include" / "config" / "kernel.release").unlink(missing_ok=True)
-    finalize_config(tree, env)
-    d.kernelrelease = kernelrelease(tree, env)
-    info(f"kernelrelease: {d.kernelrelease}")
-    verify_config(tree, profile, mx, d)
-    save_config_snapshot(tree, profile)
-    if args.print_matrix:
-        rule("Kconfig matrix")
-        for op in mx.ops:
-            say(f"  {op.render():<56} {C.DIM}{op.why}{C.RESET}")
-    if args.configure_only:
-        ok(f"Configuration complete (--configure-only). Tree: {tree}")
-        return 0
-    link_thinlto_cache(tree, profile, d)
-    compile_wall_start = time.time()
-    pkgs = compile_kernel(tree, profile, d, env, facts)
-    d.kernelrelease = kernelrelease(tree, env)
-    if args.no_install:
+    with build_workspace_lock(), storage_session(use_ram):
+        if not args.no_install and not args.configure_only:
+            PRIV.ensure()
+            check_pacman_preflight(require_install=True)
+        JOURNAL.open(profile.name)
+        note(f"journal: {JOURNAL.path}")
+        validate_cpu_flags(profile)
+        host_facts.cache_clear()
+        facts = host_facts()
+        target_facts = target_facts_for_profile(profile, facts)
+        check_disk_space(profile.g("compiler", "lto"), installing=not args.no_install and not args.configure_only)
+        rule("Kernel release")
+        release = choose_release(profile, fetch_releases())
+        tarball = obtain_tarball(release, bool(profile.g("release", "require_signature")))
+        identity = json.dumps({"profile": profile.sections, "target": target_facts.as_json(),
+                               "engine": sha256_file(Path(__file__)),
+                               "schema": sha256_file(SCRIPT_DIR / "kernel_profiles/schema.py"),
+                               "runtime": sha256_file(SCRIPT_DIR / "kernel_runtime.py"),
+                               "patches": {f.name: sha256_file(f) for f in sorted((SCRIPT_DIR / "patches").glob("*.patch"))}}, sort_keys=True)
+        patchset = profile.name + "-" + hashlib.sha256(identity.encode()).hexdigest()[:16]
+        tree = unpack(tarball, release, patchset, bool(args.fresh))
+        sched = apply_scheduler_patch(tree, profile, release)
+        apply_enhancement_patches(tree, profile, release, target_facts)
+        ensure_hz_choice(tree, int(profile.g("timing", "hz")))
+        env0 = toolchain_env(profile)
+        seed_source = seed_config(tree, profile, env0, Path(args.seed_config).expanduser() if args.seed_config else None)
+        run(["make", "olddefconfig"], cwd=tree, env=env0)
+        db = ensure_modprobed_db(profile)
+        localmodconfig(tree, profile, db, env0)
+        idx = KconfigIndex.scan(tree)
+        note(f"Kconfig index: {len(idx.symbols):,} symbols (x86 view), X86_64_VERSION range max {idx.x86_64_version_max}")
+        target_facts = target_facts_for_profile(profile, facts)
+        if target_facts is not facts:
+            note(f"Target hardware profile: {target_facts.model} ({target_facts.vendor}), {target_facts.threads} threads, uarch={target_facts.uarch or 'generic_v' + str(target_facts.psabi_level)}, gpus={', '.join(target_facts.gpus) or 'none'}, virt={target_facts.virt}")
+        rust_ok, rust_out = (rust_probe(tree, env0) if profile.g("compiler", "rust") else (False, ""))
+        d = derive(profile, target_facts, idx, tree, sched, rust_ok, rust_out)
+        validate_rust_cpu(d)
+        d.seed_source = seed_source
+        mx = build_config_matrix(profile, d)
+        apply_matrix(tree, mx)
+        env = build_env(profile, d, facts, int((tree / ".dusky" / "source-epoch").read_text()))
+        (tree / "include" / "config" / "kernel.release").unlink(missing_ok=True)
+        prepare_extmod_build(tree, d, env)
+        finalize_config(tree, env)
+        d.kernelrelease = kernelrelease(tree, env)
+        info(f"kernelrelease: {d.kernelrelease}")
+        verify_config(tree, profile, mx, d)
+        save_config_snapshot(tree, profile)
+        (tree / ".dusky" / "build.json").write_text(json.dumps({"profile": profile.name, "kernelrelease": d.kernelrelease}))
+        if args.print_matrix:
+            rule("Kconfig matrix")
+            for op in mx.ops:
+                say(f"  {op.render():<56} {C.DIM}{op.why}{C.RESET}")
+        if args.configure_only:
+            ok(f"Configuration complete (--configure-only). Tree: {tree}")
+            return 0
+        link_thinlto_cache(tree, profile, d)
+        compile_wall_start = time.time()
+        pkgs = compile_kernel(tree, profile, d, env, facts)
+        d.kernelrelease = kernelrelease(tree, env)
+        if args.no_install:
+            total_wall = time.time() - compile_wall_start
+            rule("Done")
+            ok(f"Packages built in {fmt_duration(d.compile_duration)} (--no-install). Install later with: sudo pacman -U " + " ".join(str(x) for x in pkgs))
+            say(f"  {C.CYAN}⏱ Kernel compilation:{C.RESET} {fmt_duration(d.compile_duration)}" + (f" ({d.compile_steps:,} steps)" if d.compile_steps else ""))
+            say(f"  {C.CYAN}⏱ Total process time:{C.RESET} {fmt_duration(total_wall)}")
+            send_notification("Kernel build complete", f"{d.kernelrelease} ({profile.name}) compiled in {fmt_duration(d.compile_duration)}", icon="dialog-information")
+            return 0
+        install_packages(pkgs, profile)
+        refresh_boot(profile, facts, d, kernel_install=bool(args.kernel_install))
         total_wall = time.time() - compile_wall_start
         rule("Done")
-        ok(f"Packages built in {fmt_duration(d.compile_duration)} (--no-install). Install later with: sudo pacman -U " + " ".join(str(x) for x in pkgs))
+        ok(f"{d.kernelrelease} ({profile.name}) installed as {profile.pkgbase}.")
         say(f"  {C.CYAN}⏱ Kernel compilation:{C.RESET} {fmt_duration(d.compile_duration)}" + (f" ({d.compile_steps:,} steps)" if d.compile_steps else ""))
-        say(f"  {C.CYAN}⏱ Total process time:{C.RESET} {fmt_duration(total_wall)}")
-        send_notification("Kernel build complete", f"{d.kernelrelease} ({profile.name}) compiled in {fmt_duration(d.compile_duration)}", icon="dialog-information")
+        say(f"  {C.CYAN}⏱ Total process time:{C.RESET} {fmt_duration(total_wall)} (compilation + packaging + install + initramfs)")
+        say(f"  {C.DIM}Reboot to test; roll back with --uninstall {profile.suffix}.{C.RESET}")
+        send_notification("Kernel build complete", f"{d.kernelrelease} ({profile.name}) compiled in {fmt_duration(d.compile_duration)} (total: {fmt_duration(total_wall)})", icon="dialog-information")
         return 0
-    install_packages(pkgs, profile)
-    refresh_boot(profile, facts, d, kernel_install=bool(args.kernel_install))
-    total_wall = time.time() - compile_wall_start
-    rule("Done")
-    ok(f"{d.kernelrelease} ({profile.name}) installed as {profile.pkgbase}.")
-    say(f"  {C.CYAN}⏱ Kernel compilation:{C.RESET} {fmt_duration(d.compile_duration)}" + (f" ({d.compile_steps:,} steps)" if d.compile_steps else ""))
-    say(f"  {C.CYAN}⏱ Total process time:{C.RESET} {fmt_duration(total_wall)} (compilation + packaging + install + initramfs)")
-    say(f"  {C.DIM}Reboot to test; roll back with --uninstall {profile.suffix}.{C.RESET}")
-    send_notification("Kernel build complete", f"{d.kernelrelease} ({profile.name}) compiled in {fmt_duration(d.compile_duration)} (total: {fmt_duration(total_wall)})", icon="dialog-information")
-    return 0
 
 
 def do_list(_: argparse.Namespace) -> int:
@@ -6199,11 +5164,21 @@ def do_spec(_: argparse.Namespace) -> int:
     return 0
 
 
-def latest_tree() -> Path | None:
+def latest_tree(profile_name: str | None = None) -> Path | None:
     if not SRC_DIR.is_dir():
         return None
     trees = [d for d in SRC_DIR.iterdir() if d.is_dir() and is_valid_kernel_tree(d)]
-    return max(trees, key=lambda d: d.stat().st_mtime) if trees else None
+    if profile_name is not None:
+        selected = []
+        for tree in trees:
+            try:
+                metadata = json.loads((tree / ".dusky" / "build.json").read_text())
+            except (OSError, ValueError):
+                continue
+            if metadata.get("profile") == profile_name:
+                selected.append(tree)
+        trees = selected
+    return max(trees, key=lambda d: (d / ".config").stat().st_mtime if (d / ".config").exists() else d.stat().st_mtime) if trees else None
 
 
 def do_matrix(args: argparse.Namespace) -> int:
@@ -6219,6 +5194,8 @@ def do_matrix(args: argparse.Namespace) -> int:
     else:
         idx = KconfigIndex(frozenset(), 3)
         note("No extracted source tree yet; showing the permissive matrix (every symbol assumed available)")
+    facts = target_facts_for_profile(p, facts)
+    cross_validate(p, facts)
     d = derive(p, facts, idx, tree or Path("."), p.g("scheduler", "type"), True, "")
     mx = build_config_matrix(p, d)
     show_configuration(p, diff)
@@ -6251,7 +5228,7 @@ def do_doctor(args: argparse.Namespace) -> int:
         ["bootloaders", ", ".join(facts.bootloaders) or "none detected"], ["ESP / XBOOTLDR", f"{facts.esp or '-'} / {facts.xbootldr or '-'}"],
         ["mkinitcpio", f"compression={facts.initrd_compression} microcode_hook={'yes' if facts.microcode_hook else 'no'}"],
         ["DKMS modules", ", ".join(facts.dkms_modules) or "none"], ["sched_ext live", "yes" if facts.sched_ext_live else "no"],
-        ["CAS knob", "present" if any(Path(f"/sys/kernel/debug/sched/{k}").exists() for k in ("llc_aggr_tolerance", "cache_aggr_tolerance")) else "absent/debugfs not mounted"],
+        ["CAS knob", "present" if Path("/sys/kernel/debug/sched/llc_balancing/aggr_tolerance").exists() else "absent/debugfs not mounted"],
         ["amd_pstate", _read("/sys/devices/system/cpu/amd_pstate/status").strip() or "n/a"], ["THP", _read("/sys/kernel/mm/transparent_hugepage/enabled").strip() or "n/a"],
         ["zram", ", ".join(p.name for p in Path("/sys/block").glob("zram*")) or "none"],
     ])
@@ -6307,8 +5284,6 @@ def do_doctor(args: argparse.Namespace) -> int:
         rule("Recent builds")
         table(["when", "profile", "version", "lto", "duration", "result"],
               [[h.get("ts", "")[:16], h.get("profile"), h.get("version"), h.get("lto"), fmt_duration(float(h.get("duration", 0))), "ok" if h.get("success") else "failed"] for h in hist[-8:]])
-    if facts.mem_gib <= 8.5:
-        info(f"{facts.mem_gib:.1f} GiB host: profiles low_ram / minimal_strict / embedded_lowram target this class of machine")
     return 0
 
 
@@ -6318,43 +5293,41 @@ def do_clean(args: argparse.Namespace) -> int:
     what = args.clean or "all"
     targets = {"src": SRC_DIR, "tarballs": TARBALL_DIR, "patches": PATCH_CACHE, "packages": PKGDEST_DIR, "thinlto": THINLTO_CACHE_DIR, "logs": LOG_DIR, "seeds": BUILD_DIR / "seeds"}
     chosen = list(targets) if what == "all" else [w.strip() for w in what.split(",")]
-    for name in chosen:
-        path = targets.get(name)
-        if path is None:
-            warn(f"Unknown clean target '{name}' (choose from: all, {', '.join(targets)})")
-            continue
-        if path.exists():
-            size = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
-            shutil.rmtree(path)
-            ok(f"Removed {path} ({fmt_bytes(size)})")
-        else:
-            note(f"{path} already clean")
-    return 0
+    with build_workspace_lock():
+        for name in chosen:
+            path = targets.get(name)
+            if path is None:
+                warn(f"Unknown clean target '{name}' (choose from: all, {', '.join(targets)})")
+                continue
+            if path.exists():
+                size = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+                shutil.rmtree(path)
+                ok(f"Removed {path} ({fmt_bytes(size)})")
+            else:
+                note(f"{path} already clean")
+        return 0
 
 
 def write_default_profiles(dest_dir: Path) -> None:
     dest_dir.mkdir(parents=True, exist_ok=True)
-    for name, desc, suffix, priority, tweaks in DEFAULT_PROFILES:
-        prof = profile_from_tweaks(name, desc, suffix, tweaks, priority)
-        validate_profile(prof)
-        (dest_dir / f"{name}.toml").write_text(render_profile_toml(prof.sections, header=desc), encoding="utf-8")
-    ok(f"Wrote {len(DEFAULT_PROFILES)} profiles to {dest_dir}")
+    dest = dest_dir / "custom.toml"
+    if dest.exists():
+        raise ProfileError(f"{dest} already exists; choose a new name in the profile manager")
+    prof = profile_from_tweaks("custom", "Custom kernel", "dusky-custom", {})
+    dest.write_text(render_profile_toml(prof.sections), encoding="utf-8")
+    ok(f"Created {dest}; edit it before building")
 
 
 def do_write_defaults(_: argparse.Namespace) -> int:
-    banner()
-    rule("Write default profiles")
-    dest = PROFILES_DIR if (PROFILES_DIR.exists() and os.access(PROFILES_DIR, os.W_OK)) or not PROFILES_DIR.exists() else USER_PROFILES_DIR
-    try:
-        write_default_profiles(dest)
-    except OSError:
-        write_default_profiles(USER_PROFILES_DIR)
+    write_default_profiles(PROFILES_DIR)
     return 0
 
 
 def do_uninstall(args: argparse.Namespace) -> int:
     banner()
     flavor = args.uninstall.removeprefix("linux-")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", flavor):
+        raise ProfileError("Invalid kernel flavor suffix")
     rule(f"Uninstall linux-{flavor}")
     installed = set((run(["pacman", "-Qq"], check=False).stdout or "").split())
     pkgs = [pkg for pkg in (f"linux-{flavor}-headers", f"linux-{flavor}") if pkg in installed]
@@ -6366,7 +5339,8 @@ def do_uninstall(args: argparse.Namespace) -> int:
     facts = host_facts()
     root = facts.xbootldr or facts.esp
     if root:
-        entries = list(Path(root, "loader", "entries").glob(f"linux-{flavor}*.conf"))
+        entries = [Path(root, "loader", "entries", f"linux-{flavor}{suffix}.conf") for suffix in ("", "-fallback")]
+        entries = [entry for entry in entries if entry.is_file()]
         if entries:
             PRIV.run(["rm", "-f", *[str(e) for e in entries]], check=False)
             ok(f"Removed boot entries: {', '.join(e.name for e in entries)}")
@@ -6387,7 +5361,7 @@ def do_uninstall(args: argparse.Namespace) -> int:
         PRIV.run(["rm", "-f", str(preset)], check=False)
         ok(f"Cleaned up {preset}")
     if "grub" in facts.bootloaders and have("grub-mkconfig"):
-        PRIV.run(["grub-mkconfig", "-o", "/boot/grub/grub.cfg"], check=False, capture=False)
+        PRIV.run(["grub-mkconfig", "-o", "/boot/grub/grub.cfg"], capture=False)
     return 0
 
 
@@ -6420,9 +5394,12 @@ def _pkg_file_pkgbase(pkg: Path) -> str:
 def _resolve_install_profile(pkgbase: str, wanted: str | None, facts: HostFacts) -> KernelProfile:
     """Profile driving boot entries for a saved package: --profile, else the
     known profile with the same pkgbase, else defaults (base cmdline only)."""
-    profiles = ensure_profiles_exist()
+    profiles = discover_profiles()
     if wanted:
-        return select_profile(profiles, wanted, facts).clone()
+        selected = select_profile(profiles, wanted, facts).clone()
+        if selected.pkgbase != pkgbase:
+            raise ProfileError(f"Profile {wanted} belongs to {selected.pkgbase}, not {pkgbase}")
+        return selected
     for p in profiles:
         if p.pkgbase == pkgbase:
             return p.clone()
@@ -6431,12 +5408,33 @@ def _resolve_install_profile(pkgbase: str, wanted: str | None, facts: HostFacts)
     return profile_from_tweaks(f"install-{suffix}", f"Reinstall {pkgbase} from saved packages", suffix, {}, 90)
 
 
+def packaged_profile(pkgs: Sequence[Path], pkgbase: str) -> KernelProfile | None:
+    member_name = f"usr/lib/dusky-kernel/{pkgbase}/profile.json"
+    for pkg in pkgs:
+        try:
+            with tarfile.open(pkg, "r:*") as tf:
+                member = next((m for m in tf if m.name.removeprefix("./") == member_name), None)
+                if member is None:
+                    continue
+                with tf.extractfile(member) as stream:
+                    raw = json.load(stream)["profile"]
+                sections, explicit = coerce(raw, pkg)
+                result = KernelProfile(pkg, sections, explicit)
+                validate_profile(result)
+                if result.pkgbase != pkgbase:
+                    raise ProfileError("Packaged profile does not match the kernel package")
+                return result
+        except (tarfile.TarError, OSError, ValueError, KeyError, TypeError) as e:
+            raise ProfileError(f"Cannot read kernel metadata in {pkg}: {e}") from e
+    return None
+
+
 def do_install_pkg(args: argparse.Namespace) -> int:
     banner()
     rule("Install saved kernel packages")
     PRIV.ensure()
     check_pacman_preflight(require_install=True)
-    check_disk_space("none")
+    check_disk_space("none", installing=True, building=False)
     facts = host_facts()
     files: list[Path] = []
     for a in args.install_pkg:
@@ -6453,12 +5451,7 @@ def do_install_pkg(args: argparse.Namespace) -> int:
     note(f"journal: {JOURNAL.path}")
     for pkgbase, pkgs in sorted(groups.items()):
         wanted = getattr(args, "profile", None)
-        profile = _resolve_install_profile(pkgbase, wanted, facts)
-        if wanted is None and not profile.g("boot", "write_entries"):
-            # Auto-matched remote_* profiles set write_entries=False for the build
-            # host; installing means we are on the target, so write entries.
-            profile.set("boot", "write_entries", True, explicit=False)
-            note(f"{pkgbase}: enabled boot entries for this machine (profile '{profile.name}' had write_entries=false)")
+        profile = (packaged_profile(pkgs, pkgbase) if wanted is None else None) or _resolve_install_profile(pkgbase, wanted, facts)
         info(f"{pkgbase}: using profile '{profile.name}' for preset and boot entries")
         install_packages(sorted(pkgs), profile)
         krels = sorted(_kernelreleases_for_pkgbases({pkgbase}))
@@ -6483,10 +5476,15 @@ def do_fdo_record(args: argparse.Namespace) -> int:
     p = select_profile(ensure_profiles_exist(), args.profile, facts)
     if not have("perf") or not have("create_llvm_prof"):
         raise DependencyError("perf and create_llvm_prof are required (pacman -S perf; build create_llvm_prof from google/autofdo)")
-    tree = latest_tree()
+    tree = latest_tree(p.name)
     vmlinux = tree / "vmlinux" if tree else None
     if vmlinux is None or not vmlinux.is_file():
         raise BuildError("No vmlinux found; build the profile once with compiler.fdo=autofdo (profile-less first pass) before recording")
+    metadata = json.loads((tree / ".dusky" / "build.json").read_text())
+    if metadata["kernelrelease"] != os.uname().release:
+        raise ProfileError("FDO recording requires booting the matching built kernel first")
+    if int(args.fdo_record) <= 0:
+        raise ProfileError("FDO recording duration must be positive")
     outdir = Path(p.g("compiler", "fdo_profile_dir")).expanduser() if p.g("compiler", "fdo_profile_dir") else STATE_DIR / "fdo" / p.name
     outdir.mkdir(parents=True, exist_ok=True)
     seconds = int(args.fdo_record)
@@ -6506,174 +5504,15 @@ def do_fdo_record(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------------------------------
-# Built-in profiles
-# ---------------------------------------------------------------------------------------------------
-DEFAULT_PROFILES: Final[tuple[tuple[str, str, str, int, dict[str, dict[str, Any]]], ...]] = (
-    ("dusky_personal", "Performance Desktop: full LTO, native -march, EEVDF + CAS + scx_lavd, NTSync, lazy preemption, mitigations off", "dusky-personal", 10, {
-        "meta": {"bare_metal_only": True},
-        "release": {"channel": "mainline", "allow_rc": True},
-        "scheduler": {"type": "eevdf", "scx": "scx_lavd", "scx_flags": "--autopilot", "scx_enable_class": True},
-        "cache": {"sched_cache": True, "llc_aggr_tolerance": 1},
-        "rseq": {"slice_extension": True, "slice_ext_nsec": 10000},
-        "cpu": {"arch": "native", "governor": "schedutil", "amd_pstate": "active", "epp": "balance_performance", "mitigations": "off", "prefcore": True},
-        "timing": {"hz": 1000, "tickless": "idle", "preempt": "lazy", "preempt_dynamic": True},
-        "memory": {"footprint": "standard", "thp": "madvise", "thp_defrag": "defer+madvise", "swap_backend": "zram", "zram_algo": "zstd", "zram_recomp_algo": "zstd",
-                   "zram_size_pct": 50, "ksm": False, "tracing": "full"},
-        "compiler": {"toolchain": "llvm", "optimize": "o2", "lto": "full", "kcfi": False, "debug_info": "reduced", "rust": False, "headers": "auto"},
-        "security": {"profile": "extreme", "acknowledge_risk": True},
-        "gaming": {"ntsync": True, "uclamp": True, "split_lock_mitigate": False},
-        "storage": {"io_scheduler": "none"},
-        "network": {"congestion": "bbr", "qdisc": "fq", "mptcp": True},
-        "modules": {"mode": "strict", "modprobed_db": True},
-        "dusky": {"enhanced": True},
-    }),
-    ("gaming", "Gaming: BORE + scx_bpfland, 1000 Hz, full preemption, THP always, NTSync, cake, mitigations off", "dusky-gaming", 20, {
-        "release": {"channel": "stable", "allow_rc": True},
-        "scheduler": {"type": "bore", "scx": "scx_bpfland", "scx_flags": "-m performance", "scx_enable_class": True, "allow_vanilla_fallback": True},
-        "cache": {"sched_cache": True, "llc_aggr_tolerance": 0},
-        "cpu": {"arch": "native", "governor": "performance", "amd_pstate": "active", "epp": "performance", "mitigations": "off"},
-        "timing": {"hz": 1000, "tickless": "idle", "preempt": "full", "preempt_dynamic": True},
-        "memory": {"thp": "always", "thp_defrag": "defer+madvise", "swap_backend": "zram", "zram_algo": "zstd", "zram_recomp_algo": "zstd", "zram_size_pct": 50},
-        "compiler": {"toolchain": "llvm", "lto": "thin", "debug_info": "reduced", "rust": False},
-        "security": {"profile": "extreme", "acknowledge_risk": True},
-        "gaming": {"ntsync": True, "uclamp": True, "max_map_count": 2147483642, "split_lock_mitigate": False, "controllers": True},
-        "network": {"congestion": "bbr", "qdisc": "cake"},
-        "modules": {"mode": "strict", "modprobed_db": True},
-        "dusky": {"enhanced": True},
-    }),
-    ("low_ram", "Low RAM (<= 8 GiB): lean footprint, zram zstd, MGLRU anti-thrash, ThinLTO, strict modules", "dusky-lowram", 30, {
-        "release": {"channel": "stable", "allow_rc": True},
-        "scheduler": {"type": "eevdf", "scx": "none", "scx_enable_class": False},
-        "cpu": {"arch": "native", "governor": "schedutil", "mitigations": "on"},
-        "timing": {"hz": 500, "tickless": "idle", "preempt": "lazy", "preempt_dynamic": True},
-        "memory": {"footprint": "lean", "thp": "madvise", "thp_defrag": "defer", "mglru": True, "mglru_min_ttl_ms": 1000, "swap_backend": "zram", "zram_algo": "zstd",
-                   "zram_recomp_algo": "zstd", "zram_size_pct": 100, "zram_multi_comp": True, "swappiness": 180, "vfs_cache_pressure": 120, "watermark_scale_factor": 125,
-                   "dirty_bytes_mb": 128, "slub_tiny": False, "numa": False, "ksm": True, "damon": False, "kallsyms_all": False, "tracing": "minimal", "kexec": False,
-                   "hugetlbfs": False},
-        "compiler": {"toolchain": "llvm", "optimize": "o2", "lto": "thin", "debug_info": "none", "rust": False, "headers": "auto"},
-        "security": {"profile": "balanced"},
-        "gaming": {"ntsync": True, "controllers": True},
-        "modules": {"mode": "strict", "modprobed_db": True},
-    }),
-    ("minimal_strict", "Minimal strict (<= 4-8 GiB, sub-300 MiB idle target): SLUB_TINY, -Os, THP off, no BTF/tracing, DAMON reclaim, strict pruning", "dusky-minimal", 31, {
-        "release": {"channel": "stable", "allow_rc": True},
-        "scheduler": {"type": "eevdf", "scx": "none", "scx_enable_class": False, "autogroup": True},
-        "cpu": {"arch": "native", "governor": "schedutil", "mitigations": "on"},
-        "timing": {"hz": 250, "tickless": "idle", "preempt": "lazy", "preempt_dynamic": False},
-        "memory": {"footprint": "minimal", "thp": "never", "mglru": True, "mglru_min_ttl_ms": 1000, "swap_backend": "zram", "zram_algo": "zstd", "zram_recomp_algo": "zstd",
-                   "zram_size_pct": 150, "zram_multi_comp": False, "swappiness": 180, "vfs_cache_pressure": 150, "watermark_scale_factor": 125, "dirty_bytes_mb": 64,
-                   "slub_tiny": True, "per_vma_lock": True, "numa": False, "ksm": True, "ksm_run": False, "damon": True, "hugetlbfs": False, "kallsyms_all": False,
-                   "log_buf_shift": 15, "tracing": "minimal", "kexec": False, "ikconfig": False, "trim_unused_ksyms": True},
-        "compiler": {"toolchain": "llvm", "optimize": "size", "lto": "thin", "debug_info": "none", "rust": False, "headers": "never", "module_compress": "zstd"},
-        "security": {"profile": "balanced", "ubsan_bounds": False},
-        "gaming": {"ntsync": False, "uclamp": False, "controllers": False},
-        "storage": {"io_scheduler": "mq-deadline"},
-        "power": {"hibernation": False},
-        "network": {"congestion": "bbr", "qdisc": "fq_codel", "mptcp": False},
-        "modules": {"mode": "strict", "modprobed_db": True},
-        "verify": {"require_ntsync": False, "require_btf": False},
-    }),
-    ("embedded_lowram", "Embedded / appliance (<= 4 GiB, headless): BASE_SMALL, SLUB_TINY, no 32-bit compat, no hibernation, NR_CPUS 8, -Os", "dusky-embedded", 32, {
-        "release": {"channel": "longterm", "allow_rc": True},
-        "scheduler": {"type": "eevdf", "scx": "none", "scx_enable_class": False, "autogroup": False},
-        "cpu": {"arch": "generic_v3", "governor": "schedutil", "mitigations": "on", "nr_cpus": 8, "compat32": False},
-        "timing": {"hz": 250, "tickless": "idle", "preempt": "lazy", "preempt_dynamic": False},
-        "memory": {"footprint": "embedded", "thp": "never", "mglru": True, "swap_backend": "zram", "zram_algo": "zstd", "zram_multi_comp": False, "zram_size_pct": 150,
-                   "swappiness": 180, "vfs_cache_pressure": 200, "watermark_scale_factor": 125, "dirty_bytes_mb": 32, "slub_tiny": True, "numa": False, "ksm": False,
-                   "damon": True, "hugetlbfs": False, "kallsyms_all": False, "memcg": True, "base_small": True, "log_buf_shift": 15, "tracing": "minimal", "kexec": False,
-                   "ikconfig": False, "trim_unused_ksyms": True},
-        "compiler": {"toolchain": "llvm", "optimize": "size", "lto": "thin", "debug_info": "none", "rust": False, "headers": "never"},
-        "security": {"profile": "balanced", "ubsan_bounds": False},
-        "gaming": {"ntsync": False, "uclamp": False, "controllers": False},
-        "storage": {"io_scheduler": "mq-deadline"},
-        "power": {"hibernation": False, "suspend": True},
-        "network": {"congestion": "cubic", "qdisc": "fq_codel", "mptcp": False, "xdp": False},
-        "modules": {"mode": "strict", "modprobed_db": True},
-        "boot": {"nowatchdog": False},
-        "verify": {"require_ntsync": False, "require_btf": False},
-    }),
-    ("zen4_zen5", "AMD Zen 4 / Zen 5: znver4 codegen, P-State active EPP, EEVDF + CAS + scx_lavd, ThinLTO, Rust", "dusky-zen", 40, {
-        "release": {"channel": "stable", "allow_rc": True},
-        "scheduler": {"type": "eevdf", "scx": "scx_lavd", "scx_flags": "--autopilot", "scx_enable_class": True},
-        "cache": {"sched_cache": True, "llc_aggr_tolerance": 1},
-        "cpu": {"arch": "znver4", "governor": "schedutil", "amd_pstate": "active", "epp": "balance_performance", "prefcore": True, "mitigations": "on"},
-        "timing": {"hz": 1000, "tickless": "idle", "preempt": "lazy", "preempt_dynamic": True},
-        "memory": {"thp": "madvise", "mglru": True, "swap_backend": "zram", "zram_algo": "zstd", "zram_recomp_algo": "zstd", "zram_size_pct": 50},
-        "compiler": {"toolchain": "llvm", "optimize": "o2", "lto": "none", "kcfi": False, "debug_info": "reduced", "rust": True},
-        "security": {"profile": "balanced"},
-        "modules": {"mode": "strict", "modprobed_db": True},
-    }),
-    ("server_workstation", "Server / workstation: 250 Hz, NUMA balancing, iocost, scx_layered, full LTO, expanded drivers, headers always", "dusky-server", 50, {
-        "release": {"channel": "longterm", "allow_rc": True},
-        "scheduler": {"type": "eevdf", "scx": "scx_layered", "scx_enable_class": True, "sched_core": True},
-        "cache": {"sched_cache": True, "llc_aggr_tolerance": 1},
-        "cpu": {"arch": "generic_v3", "governor": "schedutil", "mitigations": "on"},
-        "timing": {"hz": 250, "tickless": "idle", "preempt": "lazy", "preempt_dynamic": True},
-        "memory": {"thp": "madvise", "mglru": True, "numa": True, "numa_balancing": True, "nodes_shift": 6, "swap_backend": "zswap", "zswap_compressor": "zstd", "ksm": True},
-        "compiler": {"toolchain": "llvm", "optimize": "o2", "lto": "full", "debug_info": "reduced", "headers": "always", "rust": False},
-        "security": {"profile": "balanced"},
-        "gaming": {"ntsync": False, "controllers": False},
-        "storage": {"io_scheduler": "mq-deadline", "iocost": True, "nvme_poll_queues": 2},
-        "network": {"congestion": "bbr", "qdisc": "fq", "mptcp": True, "xdp": True},
-        "modules": {"mode": "expanded", "modprobed_db": True, "keep_symbols": ["WIREGUARD", "TUN", "VETH", "BRIDGE", "VLAN_8021Q", "MACVLAN", "NF_TABLES", "OVERLAY_FS"]},
-        "verify": {"require_ntsync": False},
-    }),
-    ("battery_efficiency", "Battery: powersave + EPP power, teo, RCU lazy, power-efficient workqueues, ASPM powersupersave, 300 Hz", "dusky-battery", 60, {
-        "release": {"channel": "stable", "allow_rc": True},
-        "scheduler": {"type": "eevdf", "scx": "scx_lavd", "scx_flags": "--autopower", "scx_enable_class": True},
-        "cache": {"sched_cache": True},
-        "cpu": {"arch": "native", "governor": "powersave", "epp": "balance_power", "amd_pstate": "active", "mitigations": "on"},
-        "timing": {"hz": 300, "tickless": "idle", "preempt": "lazy", "preempt_dynamic": True},
-        "memory": {"footprint": "lean", "thp": "madvise", "swap_backend": "zram", "zram_algo": "zstd", "zram_recomp_algo": "zstd", "zram_size_pct": 50, "tracing": "minimal"},
-        "power": {"wq_power_efficient": True, "cpu_idle_governor": "teo", "rcu_lazy": True, "energy_model": True, "pcie_aspm": "powersupersave", "hda_power_save": 10},
-        "compiler": {"toolchain": "llvm", "optimize": "o2", "lto": "thin", "debug_info": "none", "rust": False},
-        "security": {"profile": "balanced"},
-        "storage": {"io_scheduler": "none"},
-        "modules": {"mode": "strict", "modprobed_db": True},
-    }),
-    ("vm_guest", "VM guest (KVM/QEMU, Hyper-V, VMware): paravirt, virtio, free page reporting, haltpoll, memory hotplug, portable v3 codegen", "dusky-vm", 70, {
-        "meta": {"portable_package": True},
-        "release": {"channel": "stable", "allow_rc": True},
-        "scheduler": {"type": "eevdf", "scx": "none", "scx_enable_class": True},
-        "cache": {"sched_cache": False},
-        "cpu": {"arch": "generic_v3", "governor": "schedutil", "amd_pstate": "undefined", "mitigations": "on", "nr_cpus": 64},
-        "timing": {"hz": 250, "tickless": "idle", "preempt": "lazy", "preempt_dynamic": True},
-        "memory": {"footprint": "lean", "thp": "madvise", "swap_backend": "zram", "zram_algo": "zstd", "zram_size_pct": 50, "page_reporting": True, "numa": False, "tracing": "minimal"},
-        "power": {"cpu_idle_governor": "haltpoll", "hibernation": False},
-        "compiler": {"toolchain": "llvm", "optimize": "o2", "lto": "thin", "debug_info": "none", "rust": False, "headers": "auto"},
-        "security": {"profile": "balanced"},
-        "gaming": {"ntsync": False, "controllers": False},
-        "storage": {"io_scheduler": "none"},
-        "modules": {"mode": "expanded", "modprobed_db": True, "allow_lsmod_fallback": True},
-        "verify": {"require_ntsync": False},
-    }),
-    ("hardened", "Hardened: KSPP-style hardening, kCFI + FineIBT, init_on_free, strict IOMMU, lockdown early, mitigations on, EEVDF + CAS", "dusky-hardened", 80, {
-        "release": {"channel": "stable", "allow_rc": True},
-        "scheduler": {"type": "eevdf", "scx": "none", "scx_enable_class": True, "sched_core": True},
-        "cache": {"sched_cache": True},
-        "cpu": {"arch": "native", "governor": "schedutil", "mitigations": "on"},
-        "timing": {"hz": 1000, "tickless": "idle", "preempt": "lazy", "preempt_dynamic": True},
-        "memory": {"thp": "madvise", "mglru": True, "swap_backend": "zram", "zram_algo": "zstd", "slab_buckets": True, "ksm": False},
-        "compiler": {"toolchain": "llvm", "optimize": "o2", "lto": "thin", "kcfi": True, "debug_info": "reduced", "rust": False},
-        "security": {"profile": "hardened", "apparmor": True, "lockdown_early": True},
-        "gaming": {"ntsync": True, "split_lock_mitigate": True},
-        "network": {"congestion": "bbr", "qdisc": "fq_codel"},
-        "modules": {"mode": "strict", "modprobed_db": True, "sig_force": False},
-        "boot": {"nowatchdog": False},
-    }),
-)
-
-
-# ---------------------------------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------------------------------
 EPILOG: Final = textwrap.dedent(f"""\
     examples:
-      %(prog)s --write-default-profiles        write the built-in profiles
+      %(prog)s --write-default-profiles        write the profile template
       %(prog)s --doctor                        host telemetry, toolchain and bootloader diagnostics
-      %(prog)s -p low_ram                      build; answers 'use defaults exactly?' [Y/n] first
-      %(prog)s -p gaming --wizard --no-install walk every knob, build packages only
-      %(prog)s -p zen4_zen5 --configure-only --print-matrix
+      %(prog)s -p battery                      build; answers 'use defaults exactly?' [Y/n] first
+      %(prog)s -p battery --wizard --no-install walk every knob, build packages only
+      %(prog)s -p battery --configure-only --print-matrix
       %(prog)s --export-bundle / --import-bundle FILE   cross-machine hardware bundles
       %(prog)s --uninstall dusky-gaming        remove packages and boot entries
       %(prog)s --install-pkg PKG...          install saved packages + preset/initramfs/DKMS/boot entries
@@ -6695,7 +5534,7 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--print-matrix", action="store_true", help="print the Kconfig matrix (dry-run without a build, or after configuration during a build)")
     mode.add_argument("--doctor", action="store_true", help="system diagnostics")
     mode.add_argument("--clean", metavar="WHAT", nargs="?", const="all", help="clean all|src|tarballs|patches|packages|thinlto|logs|seeds (comma separated)")
-    mode.add_argument("--write-default-profiles", action="store_true", help="write the built-in profiles")
+    mode.add_argument("--write-default-profiles", action="store_true", help="write the profile template")
     mode.add_argument("--export-bundle", nargs="?", const="", default=None, metavar="FILE", help="export a hardware bundle for remote builds")
     mode.add_argument("--import-bundle", type=Path, metavar="FILE", help="import a hardware bundle and register remote_<host>")
     mode.add_argument("--uninstall", metavar="FLAVOR", help="remove linux-<flavor>{,-headers} and boot entries")
@@ -6704,13 +5543,13 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--fdo-propeller", action="store_true", help="with --fdo-record: also emit Propeller profiles")
     mode.add_argument("--menu", action="store_true", help="interactive main menu")
     ov = ap.add_argument_group("overrides (applied before the wizard question)")
-    ov.add_argument("--cpu-arch", choices=list(CPU_ARCHES), metavar="ARCH")
+    ov.add_argument("--cpu-arch", metavar="ARCH")
     ov.add_argument("--modules-mode", choices=list(MODULES_MODE_CHOICES))
     ov.add_argument("--toolchain", choices=list(TOOLCHAIN_CHOICES))
     ov.add_argument("--lto", choices=list(LTO_CHOICES))
     ov.add_argument("--channel", choices=list(CHANNEL_CHOICES))
     ov.add_argument("--scheduler", choices=list(SCHED_CHOICES))
-    ov.add_argument("--scx", choices=list(SCX_CHOICES))
+    ov.add_argument("--scx", metavar="SCHEDULER")
     ov.add_argument("--headers", choices=list(HEADERS_CHOICES))
     ov.add_argument("--no-headers", action="store_const", dest="headers", const="never")
     ov.add_argument("--footprint", choices=list(FOOTPRINT_CHOICES))
@@ -6718,7 +5557,9 @@ def build_parser() -> argparse.ArgumentParser:
     ov.add_argument("-j", "--jobs", type=int)
     ov.add_argument("--no-rust", action="store_true")
     bh = ap.add_argument_group("build behaviour")
-    bh.add_argument("--build-dir", type=Path, metavar="DIR", help="build directory (default: /mnt/zram1/dusky_kernel or ~/.cache/dusky-kernel)")
+    bh.add_argument("--settings", type=Path, help="machine storage TOML (default: adjacent kernel_settings.toml)")
+    bh.add_argument("--ram-build", action="store_true", help="explicit RAM choice for noninteractive runs; interactive runs still ask")
+    bh.add_argument("--build-dir", type=Path, metavar="DIR", help="persistent build directory; RAM workspace is configured separately")
     bh.add_argument("--wizard", action="store_true", help="always enter the granular configuration wizard")
     bh.add_argument("--no-prompt", action="store_true", help="never ask the wizard question (use profile defaults)")
     bh.add_argument("--fresh", action="store_true", help="re-extract the source tree")
@@ -6787,7 +5628,7 @@ def initialize_toolchains() -> None:
 
     if have("modprobed-db"):
         ensure_modprobed_db_service(prompt=True)
-        ensure_modprobed_compat_link()
+
         db = resolve_modprobed_db()
         if db:
             ok(f"modprobed-db active: {db} ({count_db_modules(db)} modules logged)")
@@ -6823,7 +5664,7 @@ def live_telemetry() -> None:
 def config_manager_menu() -> None:
     while True:
         rule("Configuration manager")
-        say(" 1) List profiles\n 2) Show a profile\n 3) Run the wizard on a profile and save as new profile\n 4) Write built-in default profiles\n 5) Print schema\n 6) Back\n")
+        say(" 1) List profiles\n 2) Show a profile\n 3) Run the wizard on a profile and save as new profile\n 4) Write profile template\n 5) Print schema\n 6) Back\n")
         choice = ask_index("Select", 6, 6)
         facts = host_facts()
         match choice:
@@ -6908,20 +5749,25 @@ def interactive_menu() -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    global _VERBOSE, ASSUME_YES
+    global _VERBOSE, ASSUME_YES, STORAGE, CCACHE_DIR
     args = build_parser().parse_args(argv)
-    if getattr(args, "build_dir", None):
-        set_build_dir(args.build_dir)
+    try:
+        STORAGE = kernel_storage.load_settings(args.settings or SCRIPT_DIR / "kernel_settings.toml", XDG_CACHE, args.build_dir)
+        CCACHE_DIR = STORAGE["ccache_dir"]
+        set_build_dir(STORAGE["persistent_dir"])
+    except (OSError, ValueError) as exc:
+        sys.stderr.write(f"Storage settings: {exc}\n")
+        return 2
     _VERBOSE, ASSUME_YES = bool(args.verbose), bool(args.yes)
     if args.no_color or not sys.stdout.isatty() or os.environ.get("NO_COLOR") or os.environ.get("TERM") == "dumb":
         C.disable()
     install_signal_handlers()
     try:
         if args.export_bundle is not None:
-            do_export_bundle(Path(args.export_bundle).expanduser() if args.export_bundle else None)
+            do_export_bundle(Path(args.export_bundle).expanduser() if args.export_bundle else None, args.profile)
             return 0
         if args.import_bundle:
-            do_import_bundle(args.import_bundle.expanduser())
+            do_import_bundle(args.import_bundle.expanduser(), args.profile)
             return 0
         if args.uninstall:
             return do_uninstall(args)
@@ -6956,6 +5802,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _reap_all()
         sys.stdout.write(C.SHOW + "\n")
         warn("Interrupted -- child process groups terminated")
+        return 130
     except BrokenPipeError:
         try:
             sys.stdout.close()

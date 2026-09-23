@@ -1,10 +1,10 @@
-# Dusky Kernel Compiler v6.1.0 — General Mobile Battery Profile
+# Dusky Kernel Compiler — Tuned Mobile Battery Profile
 # Target: Modern Laptops (AMD Ryzen 6000-8000/AI 300, Intel 12th-14th Gen / Core Ultra)
 # Philosophy: Maximize package C-state residency, batch wakeups, minimize timer ticks.
 
 [meta]
 name = "battery"
-description = "maximum battery savings"
+description = "Tuned laptop battery profile with gaming and VFIO retained"
 suffix = "dusky-battery"
 priority = 60
 tags = ["laptop", "battery", "mobile", "efficiency"]
@@ -16,9 +16,9 @@ portable_package = false        # Allows native CPU instruction optimization on 
 # [release] — Upstream Branch & Integrity
 # ==============================================================================
 [release]
-channel = "stable"              # Track stable 7.2.y releases for daily reliability
+channel = "mainline"            # Track latest mainline (currently 7.3-rc; advances with upstream)
 pin = ""
-allow_rc =  true               # Laptops need reliability; avoid pre-release RCs
+allow_rc = true                 # Allow mainline release candidates
 min_version = "7.2"
 require_signature = true        # Verify PGP signatures with kernel.org release keys
 
@@ -29,7 +29,7 @@ require_signature = true        # Verify PGP signatures with kernel.org release 
 [scheduler]
 type = "eevdf"                  # Upstream fair scheduler (most predictable power behavior)
 scx = "none"                    # Disabled: scx 1.1.3 crashes on 7.2.4 and wakes dGPU every 2s
-scx_flags = ""                  # No daemon until scx updates past 1.1.3
+scx_flags = ""                  # No scheduler daemon selected
 scx_enable_class = true         # Compiles in-tree sched_ext support (CONFIG_SCHED_CLASS_EXT)
 require_patch = false
 allow_vanilla_fallback = true
@@ -45,7 +45,7 @@ patch_sources = ["cachyos", "upstream_author", "tkg"]
 [cache]
 sched_cache = true              # Preserves core-to-L3 affinity
 llc_aggr_tolerance = 1          # Conservative aggregation threshold
-llc_aggr_cap = -1
+llc_overaggr_pct = -1
 
 
 # ==============================================================================
@@ -77,11 +77,11 @@ extra_config = { VFIO_DEVICE_CDEV = true, VFIO_GROUP = true, VFIO_CONTAINER = tr
 [cpu]
 arch = "native"                 # Optimize specifically for your laptop's CPU pipeline
 march = ""
-amd_pstate = "undefined"        # You have Intel silicon, not AMD
+amd_pstate = "undefined"        # Preserve the upstream default on AMD; inert on Intel
 governor = "powersave"          # Standard driver for Intel HWP
 epp = "power"                   # Energy-Performance Preference
 mitigations = "off"             # disabled all security stuff for at home stuff, no shared network
-nr_cpus = 0                     # Automatically size per-CPU structures (0 = auto, minimum floor of 64)
+nr_cpus = 0                     # Size for target possible CPU slots, including offline CPUs (0 = auto)
 smt = true                      # Keep Hyper-Threading/SMT active
 mce = true                      # Machine Check Exception reporting
 prefcore = true                 # AMD Preferred Core / Intel ITMT core ranking
@@ -92,8 +92,8 @@ compat32 = true                 # Keep 32-bit IA32 emulation active for Steam/Wi
 # [timing] — Clock Cadence & Preemption
 # ==============================================================================
 [timing]
-# 300 Hz provides clean harmonics with 30/60/120 Hz screen refreshes and cuts
-# timer interrupts by 70% compared to 1000 Hz, while bounding lazy preemption to <= 3.3ms.
+# 300 Hz uses a ~3.3 ms periodic tick while busy; idle tick suppression is separate.
+# It does not guarantee a maximum scheduling latency.
 hz = 300
 tickless = "idle"               # NO_HZ_IDLE: stops the scheduler tick on idle cores
 preempt = "lazy"                # PREEMPT_LAZY: high responsiveness with low switch frequency
@@ -113,17 +113,17 @@ mglru_mask = 7                  # Full hardware MMU page-table walking
 mglru_min_ttl_ms = 0            # Disables unnecessary thrash-detection timers
 swap_backend = "zram"           # Keeps swap in RAM; NVMe SSD stays asleep at ~3 mW
 zram_algo = "zstd"              # Best compression value
-zram_recomp_algo = "lz4"        # Matches primary
-zram_size_pct = 50              # 25% = 16 GB compressed emergency pool (ample for 64 GB)
-zram_multi_comp = false         # Eliminates background recompression timer wakeups
+zram_recomp_algo = "lz4"        # Inactive while multi-comp is disabled
+zram_size_pct = 50              # Logical swap capacity = 50% of physical RAM
+zram_multi_comp = false         # Do not configure additional recompression algorithms
 zswap_compressor = "zstd"       # Dormant (zswap disabled)
 zswap_max_pool_pct = 25         # Dormant (zswap disabled)
 swappiness = 50                 # Keeps programs in raw RAM; stops CPU from compressing idle data
 vfs_cache_pressure = 50         # Keeps file metadata in RAM; keeps NVMe SSD asleep
-watermark_scale_factor = 10     # Standard 64 MB buffer; keeps kswapd asleep
+watermark_scale_factor = 10     # Watermark spacing scales with available memory
 watermark_boost_factor = 0      # Disables panic-mode aggressive memory eviction
 compaction_proactiveness = 0    # Stops kcompactd from proactively waking CPU cores
-dirty_bytes_mb = 480            # Replaces 12 GB writeback storms with tiny 128 MB bursts
+dirty_bytes_mb = 480            # Dirty limit 480 MiB; background writeback threshold 120 MiB
 slub_tiny = false               # Essential for 20 threads: prevents cores fighting over 1 lock
 slab_buckets = false            # Leanest slab cache footprint
 per_vma_lock = true             # Fast parallel memory mapping; lets cores return to sleep sooner
@@ -139,7 +139,7 @@ kallsyms_all = false            # Keeps function names in logs while saving ~1 M
 memcg = true                    # Mandatory for systemd on Arch Linux
 base_small = false              # Full-sized hash tables prevent CPU search collisions
 log_buf_shift = 16              # Clean 64 KB log buffer
-tracing = "auto"                # Enables hooks only if scx_lavd needs them
+tracing = "auto"                # Minimal unless a scheduler daemon requires tracing
 kexec = false                   # Strips unneeded instant-reboot server code
 ikconfig = true                 # 30 KB configuration tracker for easy auditing (0 Watts)
 trim_unused_ksyms = false       # Mandatory: prevents breaking outside drivers and DKMS
@@ -194,7 +194,7 @@ ntsync = true                   # Keep NTSync compiled (doesn't hurt battery whe
 uclamp = false                  # Inert under autonomous P-States; avoid bookkeeping
 max_map_count = 1048576         # Safe default for Wine/Proton games
 split_lock_mitigate = true      # Keep protection against misbehaving split-lock code
-controllers = false              # Retain gamepads/input drivers in case you plug one in
+controllers = false            # Controller drivers come from the census or explicit keep list
 
 
 # ==============================================================================
@@ -218,7 +218,7 @@ rcu_lazy = true                 # Batches non-urgent RCU callbacks for up to 10s
 energy_model = false            # Inert on symmetric x86
 suspend = true                  # System suspend-to-RAM / s2idle
 hibernation = true              # if you ever want to enable hiberatinon using disk swap, you have the option to. 
-pcie_aspm = "powersupersave"         # Aggressive PCIe ASPM (L1 substates); safe baseline
+pcie_aspm = "powersupersave"         # Aggressive PCIe ASPM; compatibility is hardware-dependent
 hda_power_save = 5              # Power down HD audio codec after 5 seconds of silence
 
 
@@ -245,7 +245,7 @@ allow_lsmod_fallback = false
 lmc_keep_extra = ["drivers/input", "drivers/hid", "sound/pci", "drivers/vfio", "drivers/i2c/busses"]
 keep_symbols = [
   # Laptop Battery, Power & USB-C Docking
-  "ACPI_BATTERY", "ACPI_AC", "TYPEC", "TYPEC_UCSI", "UCSI_ACPI", "THUNDERBOLT", "USB4",
+  "ACPI_BATTERY", "ACPI_AC", "TYPEC", "TYPEC_UCSI", "UCSI_ACPI", "USB4",
   # Touchpad & Inputs
   "HID_MULTITOUCH", "I2C_HID_ACPI",
   # Intel Wi-Fi & Bluetooth
@@ -285,3 +285,9 @@ optional_symbols = ["VFIO_PCI_DMABUF"]
 require_ntsync = true
 require_btf = true              # Asserts BTF presence for sched_ext
 require_sched_ext = true        # Asserts CONFIG_SCHED_CLASS_EXT presence
+
+
+# Boot-time settings are packaged with this kernel and only run when it boots.
+[runtime]
+enabled = true
+manage_zram = true             # Existing ZRAM swap is left to its current manager
