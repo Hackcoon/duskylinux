@@ -21,51 +21,45 @@ class SystemdEngine(BaseEngine):
     def target_path(self) -> str:
         return self._target_path
 
-    def _fetch_units(self, scope: str, list_cmd: str, state_filter: str = "") -> set:
-        """Optimized fetcher querying both services and timers in a single subprocess."""
-        cmd = ["systemctl", list_cmd, "--type=service,timer", "--no-pager", "--no-legend"]
+    def _fetch_unit_file_states(self, scope: str, units: list[str] | None = None) -> dict[str, str]:
+        """Read enablement, which is the setting changed by enable/disable --now."""
+        cmd = ["systemctl", "list-unit-files", "--type=service,timer", "--no-pager", "--no-legend"]
         if scope == "user":
             cmd.insert(1, "--user")
-        if state_filter:
-            cmd.extend(["--state", state_filter])
-            
-        try:
-            # stdin=DEVNULL ensures background commands NEVER hang the parser waiting for TTY auth
-            # No timeout — systemctl is a local deterministic command that always terminates.
-            res = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
-            return {line.split()[0] for line in res.stdout.splitlines() if line}
-        except Exception:
-            return set()
+        if units is not None:
+            cmd.extend(units)
+
+        res = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.strip() or f"systemctl exited with status {res.returncode}")
+        return {
+            parts[0]: parts[1]
+            for line in res.stdout.splitlines()
+            if len(parts := line.split()) >= 2
+        }
 
     def load_state(self) -> dict[str, Any]:
         state = {}
         for scope in ["user", "system"]:
-            installed = self._fetch_units(scope, "list-unit-files")
-            active = self._fetch_units(scope, "list-units", "active")
-            for unit in installed:
-                state[f"{scope}/{unit}"] = "true" if unit in active else "false"
+            for unit, unit_state in self._fetch_unit_file_states(scope).items():
+                state[f"{scope}/{unit}"] = "true" if unit_state in ("enabled", "enabled-runtime") else "false"
         return state
 
     def load_state_for_units(self, user_units: list[str], sys_units: list[str]) -> dict[str, Any]:
         """
-        Fast targeted state check for specific units using batch is-active queries.
+        Fast targeted enablement check for specific units.
         Uses 2 subprocess calls total (one per scope) instead of scanning all installed units.
         """
         state = {}
         for scope, units in [("user", user_units), ("system", sys_units)]:
             if not units:
                 continue
-            cmd = ["systemctl", "is-active"] + units
-            if scope == "user":
-                cmd.insert(1, "--user")
-            try:
-                res = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
-                lines = res.stdout.strip().splitlines()
-                for unit, status in zip(units, lines):
-                    state[f"{scope}/{unit}"] = "true" if status.strip() == "active" else "false"
-            except Exception:
-                for unit in units:
-                    state[f"{scope}/{unit}"] = "false"
+            unit_states = self._fetch_unit_file_states(scope, units)
+            for unit in units:
+                if unit in unit_states:
+                    state[f"{scope}/{unit}"] = (
+                        "true" if unit_states[unit] in ("enabled", "enabled-runtime") else "false"
+                    )
         return state
 
     def write_value(self, target_key: str, target_scope: str, new_value: str, item_type: str = "bool") -> tuple[bool, str, str]:

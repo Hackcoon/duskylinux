@@ -1630,7 +1630,7 @@ class ModeButton(Label):
 
         pending = getattr(self.app, "pending_commits", set())
         if not self.app.auto_save and pending:
-            txt.append(f" │ Pending: {len(pending)}", style=self.app.theme_colors["fg"])
+            txt.append(f" │ Pending: {self.app._pending_setting_count()}", style=self.app.theme_colors["fg"])
 
         self.update(txt)
 
@@ -2377,7 +2377,7 @@ Tooltip {
                         pass
                     self.exit()
 
-            self.push_screen(UnsavedChangesDialog(len(self.pending_commits)), on_reply)
+            self.push_screen(UnsavedChangesDialog(self._pending_setting_count()), on_reply)
             return
 
         # AUTO mode: flush debounced writes safely.
@@ -2502,6 +2502,14 @@ Tooltip {
             self.pending_commits.discard(key)
         else:
             self.pending_commits.add(key)
+
+    def _pending_setting_count(self) -> int:
+        """Count settings once even when they appear in several tabs."""
+        return len({
+            self._uid_engine_key(item)
+            for tab_idx, item_idx in self.pending_commits
+            if (item := self._get_schema_item(tab_idx, item_idx)) is not None
+        })
 
     def _item_is_pending(self, item: ConfigItem) -> bool:
         ref = self._item_refs.get(id(item))

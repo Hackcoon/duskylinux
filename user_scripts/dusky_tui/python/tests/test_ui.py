@@ -120,6 +120,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             await self.boot(app, pilot)
             app._apply_transaction([(0, 0, 0, 2), (1, 0, 0, 2)])
+            self.assertEqual(app._pending_setting_count(), 1)
             await app._save_batch_async()
             self.assertEqual(len(app.engine_pool[app.default_engine_key].batches[0]), 1)
             self.assertFalse(app.pending_commits)
