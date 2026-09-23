@@ -811,6 +811,7 @@ button,input,select,textarea{font:inherit;color:inherit;background:none;border:0
 .panel button.x{border-color:#6d3b40;color:#ffb4ab}
 .panel button.grow{flex:1;justify-content:center;text-align:center}
 .row{display:flex;align-items:center;gap:6px}
+.row[hidden]{display:none!important}
 .lbl{flex:0 0 68px;color:#8f857a;font-size:11.5px}
 .tag{flex:1;font:11.5px ui-monospace,monospace;color:#e6c280;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .panel select,.panel input[type=text],.panel textarea{flex:1;min-width:0;background:#0f0d0c;border:1px solid #3d342c;border-radius:7px;padding:4px 6px;font:11.5px ui-monospace,monospace;color:#f5ebe0}
@@ -818,630 +819,726 @@ button,input,select,textarea{font:inherit;color:inherit;background:none;border:0
 .panel input[type=range]{flex:1;accent-color:#e6c280}
 .seg{display:flex;flex:1;gap:2px;background:#0f0d0c;border:1px solid #3d342c;border-radius:7px;padding:2px}
 .seg button{flex:1;border:0;background:transparent;padding:3px 4px;font-size:11.5px;border-radius:5px}
-.seg button[aria-pressed=true]{background:#e6c280;color:#191614;font-weight:700}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:3px;max-height:230px;overflow:auto;padding:2px;border:1px solid #2a231d;border-radius:8px;background:#0f0d0c}
-.grid button{display:flex;align-items:center;gap:6px;border:1px solid transparent;background:transparent;padding:3px 5px;font-size:11.5px;text-align:left;overflow:hidden}
-.grid button:hover{background:#241f1a;border-color:#3d342c}
-.grid button.act{border-color:#e6c280}
-.grid button.act .lab::after{content:" ✓";color:#e6c280}
-.sw{flex:0 0 13px;height:13px;border-radius:50%;border:1px solid #00000066;box-shadow:inset 0 0 0 1px #ffffff14}
-.lab{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.chips{display:flex;flex-wrap:wrap;gap:4px;align-items:center}
-.cap{width:100%;color:#8f857a;font-size:10.5px}
-.chip{display:flex;align-items:center;gap:5px;max-width:200px;font-size:11px}
-.dot{flex:0 0 10px;height:10px;border-radius:50%;border:1px solid #00000066}
-.hint{color:#8f857a;font-size:10.5px}
-.list{overflow:auto;display:flex;flex-direction:column;gap:3px;padding-right:2px}
-.item{display:flex;gap:4px}
-.item .open{flex:1;display:flex;align-items:center;gap:6px;overflow:hidden}
-.item .sel{flex:1;font:11px ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.seg button[aria-pressed="true"]{background:#e6c280;color:#191614;font-weight:700}
+.panel button[aria-pressed="true"]{background:#e6c280;color:#191614;border-color:#e6c280}
+.swatches{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;max-height:260px;overflow:auto;padding:2px 0}
+.swatch{display:flex;align-items:center;gap:8px;width:100%;text-align:left;padding:5px 8px}
+.swatch[aria-pressed="true"]{border-color:#e6c280}
+.chip,.dot{width:14px;height:14px;border-radius:4px;border:1px solid #3d342c;flex:0 0 auto;display:inline-block;background:#333}
+.swatch-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px}
+.hint,.lead{color:#8f857a;font-size:11.5px;line-height:1.4}
+.lead{color:#c4b8aa}
+.list{overflow:auto;max-height:48vh;display:flex;flex-direction:column;gap:4px}
+.item{display:flex;gap:4px;align-items:stretch}
+.item .open{flex:1;display:flex;align-items:center;gap:8px;min-width:0;text-align:left}
+.item .sel{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:11.5px ui-monospace,monospace;color:#e6c280}
 .item .meta{color:#8f857a;font-size:10.5px;white-space:nowrap}
+.item .del{flex:0 0 auto}
+.bar{flex-wrap:wrap}
+.seg{flex-wrap:wrap}
 `;
 
+  const uiStyle = document.createElement("style");
+  uiStyle.textContent = UI_CSS;
+  root.append(uiStyle);
+
+  const maskEl = document.createElement("div");
+  maskEl.className = "mask";
+  root.append(maskEl);
+
+  /* Sentence-level chrome. Hover previews, click writes. */
   const BAR_HTML = `
-<span class="grip" aria-hidden="true">⠿</span>
-<span class="title">🎯 Dusky picker</span>
-<span class="info" id="binfo"></span>
-<span class="state" id="bstate"></span>
-<button id="bundo" title="Undo (Ctrl+Z)">↶</button>
-<button id="bredo" title="Redo (Ctrl+Shift+Z)">↷</button>
-<button id="bsync" title="Re-read this site's file from disk">⟲</button>
-<button id="brules" title="Rules saved for this site — click one to recolour it">Rules</button>
-<button id="bexit" class="x" title="Stop picking (Esc)">✕ Exit</button>`;
+<div class="head" id="bhead">
+  <span class="grip" aria-hidden="true">⠿</span>
+  <span class="title">Dusky picker</span>
+</div>
+<span class="info" id="binfo">Click any element to theme it</span>
+<span class="state" id="bstate" role="status"></span>
+<button type="button" id="bundo" title="Undo the last rule change (Ctrl+Z)">Undo</button>
+<button type="button" id="bredo" title="Redo (Ctrl+Shift+Z / Ctrl+Y)">Redo</button>
+<button type="button" id="bup" title="Theme the parent container instead (Arrow Up)">Parent</button>
+<button type="button" id="bdn" title="Theme a nested child instead (Arrow Down)">Child</button>
+<button type="button" id="block" title="Keep this element selected while you move the mouse">Lock</button>
+<button type="button" id="brules" title="List, edit or delete every picked rule for this site">Rules (0)</button>
+<button type="button" id="bsync" title="Re-read disk and keep any local picks the file does not have">⟲ Resync</button>
+<button type="button" id="bstop" class="x" title="Close the picker (Esc)">Stop</button>`;
 
   const PICK_HTML = `
 <div class="head" id="phead">
   <span class="grip" aria-hidden="true">⠿</span>
-  <span class="title">🎨 Theme this element</span>
-  <button id="pghost" title="See-through while the pointer is elsewhere" aria-pressed="false">👁</button>
-  <button id="pclose" title="Close (Esc)">✕</button>
+  <span class="title" id="ptitle">Theme this element</span>
+  <button type="button" id="pclose" class="x" title="Close this panel, keep picking">✕</button>
 </div>
-<div class="row"><span class="lbl">Element</span><span class="tag" id="ptag"></span></div>
-<div class="row"><span class="lbl">Depth</span>
-  <button id="pchild" title="Down (↓)">↓ child</button>
+<p class="lead" id="pinfo">Choose what the rule matches, which part to paint, then a palette colour. Hover previews; click saves.</p>
+<div class="row" id="pstack-row">
+  <span class="lbl">Target</span>
+  <div class="seg" id="pstack"></div>
+</div>
+<div class="row" id="pdepth-row">
+  <span class="lbl">Depth</span>
   <input type="range" id="pslider" min="0" max="0" value="0" aria-label="DOM depth">
-  <button id="pparent" title="Up (↑)">↑ parent</button>
+  <span class="tag" id="pdepth" style="flex:0 0 40px;text-align:right"></span>
 </div>
-<div class="row"><span class="lbl">Target</span>
-  <div class="seg" id="pmode" role="group" aria-label="Target mode">
-    <button data-mode="selector" aria-pressed="true">Element selector</button>
-    <button data-mode="variable" aria-pressed="false" id="pvarbtn">CSS variable</button>
+<div class="row" id="psel-row">
+  <span class="lbl">Matches</span>
+  <select id="psel" title="CSS selector written into the template. Prefer rows that say 'this element only'."></select>
+</div>
+<div class="row">
+  <span class="lbl">Mode</span>
+  <div class="seg">
+    <button type="button" id="pmode-sel" aria-pressed="true" title="Paint this element's background, text, border or fill">Element</button>
+    <button type="button" id="pvarbtn" aria-pressed="false" title="Point one of this element's CSS variables at a Matugen token">CSS variable</button>
   </div>
 </div>
-<div class="row" id="psel-row"><span class="lbl">Selector</span><select id="psel" aria-label="CSS selector"></select></div>
-<div class="row" id="pvar-row" hidden><span class="lbl">Variable</span><select id="pvar" aria-label="CSS variable"></select></div>
-<div class="row" id="pscope-row" hidden><span class="lbl">Scope</span><select id="pscope" aria-label="Override scope"></select></div>
-<div class="row" id="pprop-row"><span class="lbl">Property</span>
-  <div class="seg" id="pseg" role="group" aria-label="Property">
-    <button data-group="bg" aria-pressed="true">Background</button>
-    <button data-group="text" aria-pressed="false">Text</button>
-    <button data-group="border" aria-pressed="false">Border</button>
-    <button data-group="fill" aria-pressed="false">Fill (SVG)</button>
+<div class="row" id="pvar-row" hidden>
+  <span class="lbl">Variable</span>
+  <select id="pvar" title="Custom properties found on this element"></select>
+</div>
+<div class="row" id="pseg-row">
+  <span class="lbl">Part</span>
+  <div class="seg" id="pseg">
+    <button type="button" data-group="bg" aria-pressed="true" title="background-color plus a readable text colour">Background</button>
+    <button type="button" data-group="text" title="color">Text</button>
+    <button type="button" data-group="border" title="border-color">Border</button>
+    <button type="button" data-group="fill" title="SVG fill">Fill</button>
   </div>
 </div>
-<div class="chips" id="pexist"></div>
+<div class="row">
+<button type="button" id="pextra" class="grow"></button>
+<button type="button" id="phide" class="grow" title="Same as Shift+click — writes display:none for the selector">Hide this element</button>
+</div>
+<p class="hint" id="phint"></p>
 <div id="pgrid"></div>
-<div class="row">
-  <button id="pextra" class="grow"></button>
-  <button id="phide" class="x grow" title="display:none — Shift+click on the page does this">🙈 Hide element</button>
-</div>
-<div class="row">
-  <input type="text" id="pcustom" spellcheck="false" placeholder="custom CSS, e.g. border-radius: 8px; opacity: .9" aria-label="Custom CSS">
-  <button id="papply">Apply</button>
-</div>
-<p class="hint">Hover or Tab to a swatch to preview · click/Enter applies — the panel stays open · ↑ ↓ change depth · click the page to move · Esc closes</p>`;
+<div class="row" id="pcustom-row">
+  <span class="lbl">Custom</span>
+  <input id="pcustom" type="text" placeholder="or type CSS, then Enter — e.g. opacity: 0.8" title="Any declaration list. Saved as a picked rule.">
+</div>`;
 
   const EDIT_HTML = `
 <div class="head" id="ehead">
   <span class="grip" aria-hidden="true">⠿</span>
-  <span class="title">✏️ Edit rule</span>
-  <button id="eghost" title="See-through while the pointer is elsewhere" aria-pressed="false">👁</button>
-  <button id="eclose" title="Close (Esc)">✕</button>
+  <span class="title">Edit saved rule</span>
+  <button type="button" id="edel" class="x" title="Remove this rule from the template">Delete</button>
+  <button type="button" id="eclose" title="Close">✕</button>
 </div>
-<div class="row" id="esel-row"><span class="lbl" id="esel-lbl">Selector</span><input type="text" id="esel" spellcheck="false" aria-label="Selector"></div>
-<div class="row" id="evar-row" hidden><span class="lbl">Variable</span><span class="tag" id="evar"></span></div>
-<div class="row" id="eprop-row"><span class="lbl">Property</span>
-  <div class="seg" id="eseg" role="group" aria-label="Property">
-    <button data-group="bg">Background</button>
-    <button data-group="text">Text</button>
-    <button data-group="border">Border</button>
-    <button data-group="fill">Fill (SVG)</button>
+<div class="row" id="esel-row">
+  <span class="lbl" id="esel-lbl">Selector</span>
+  <input id="esel" type="text" title="What this rule matches. Press Enter to save.">
+</div>
+<div class="row" id="evar-row" hidden>
+  <span class="lbl">Variable</span>
+  <span class="tag" id="evar"></span>
+</div>
+<div class="row" id="eprop-row">
+  <span class="lbl">Property</span>
+  <div class="seg" id="eseg">
+    <button type="button" data-group="bg">Background</button>
+    <button type="button" data-group="text">Text</button>
+    <button type="button" data-group="border">Border</button>
+    <button type="button" data-group="fill">Fill</button>
   </div>
 </div>
-<div id="egrid"></div>
-<div class="row" id="eraw-row" hidden><textarea id="eraw" spellcheck="false" aria-label="Raw CSS"></textarea></div>
+<div class="row" id="eraw-row" hidden>
+  <span class="lbl">CSS</span>
+  <textarea id="eraw" title="Hand-written rule. Tab or Enter saves."></textarea>
+</div>
 <div class="row" id="ecustom-row">
-  <input type="text" id="ecustom" spellcheck="false" placeholder="declaration, e.g. color: var(--primary)" aria-label="Declaration">
-  <button id="eapply">Apply</button>
+  <span class="lbl">Decl</span>
+  <input id="ecustom" type="text" title="Declaration list. Enter saves.">
 </div>
-<div class="row">
-  <button id="edelete" class="x grow">🗑 Remove rule</button>
-  <button id="edone" class="grow">Done</button>
-</div>
-<p class="hint" id="ehint"></p>`;
+<p class="hint" id="ehint"></p>
+<div id="egrid"></div>`;
 
   const DRAWER_HTML = `
 <div class="head" id="rhead">
   <span class="grip" aria-hidden="true">⠿</span>
-  <span class="title">📋 Rules for this site</span>
-  <button id="rclear" class="x" title="Remove every rule (Ctrl+Z restores)">Clear all</button>
-  <button id="rclose" title="Close">✕</button>
+  <span class="title">Rules for this site</span>
+  <button type="button" id="rclear" title="Remove every picked rule (Auto-map tokens are untouched)">Clear picks</button>
+  <button type="button" id="rclose" class="x">✕</button>
 </div>
-<div class="list" id="rlist"></div>
-<p class="hint">Click a rule to recolour or edit it · hover highlights it on the page · ✕ removes it</p>`;
+<p class="hint">Click a row to edit it. Hover previews. These lines live in the picks region of the template.</p>
+<div class="list" id="rlist"></div>`;
 
-  root.adoptedStyleSheets = [(() => { const s = new CSSStyleSheet(); s.replaceSync(UI_CSS); return s; })()];
-  root.innerHTML = `<div class="mask" id="mask"></div>`;
+  let bar = null, panel = null, drawer = null, panelKind = "";
+  let pickGrid = null, editGrid = null, flashTimer = 0;
+
   const q = (id) => root.getElementById(id);
-  const isOurs = (e) => e.composedPath().includes(hostEl);
 
-  let bar = null, panel = null, panelKind = null, drawer = null;
-  /* Every panel publishes how IT previews a token. One contract, two panels. */
-  let previewOf = () => null;
-
-  function el(tag, attrs, ...children) {
+  function el(tag, attrs = {}, ...kids) {
     const n = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs ?? {})) {
-      if (v === undefined || v === null) continue;
       if (k === "text") n.textContent = v;
       else if (k === "class") n.className = v;
-      else if (k === "style") Object.assign(n.style, v);
-      else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
-      else if (k === "disabled") n.disabled = !!v;
-      else n.setAttribute(k, v);
+      else if (k === "style" && v && typeof v === "object") Object.assign(n.style, v);
+      else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2), v);
+      else if (v === false || v == null) { /* skip */ }
+      else if (v === true) n.setAttribute(k, "");
+      else n.setAttribute(k, String(v));
     }
-    n.append(...children);
+    for (const c of kids) if (c) n.append(c);
     return n;
   }
 
-  function drag(p, handle, onMove) {
+  function isOurs(e) {
+    const path = e.composedPath?.() ?? [];
+    return path.includes(hostEl);
+  }
+
+  function setState(text, kind = "") {
+    const n = q("bstate");
+    if (!n) { S.note = text; return; }
+    n.textContent = text;
+    n.className = `state ${kind}`;
+  }
+
+  function baseState() {
+    const t = target();
+    const label = t
+      ? `${t.localName}${t.id ? "#" + t.id : ""}`
+      : "click an element";
+    setState(S.note || (S.hydrated ? label : "host unreachable"), S.note ? "err" : "");
+  }
+
+  function flash(text, kind = "ok") {
+    setState(text, kind);
+    clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => { flashTimer = 0; baseState(); }, 2400);
+  }
+
+  function drag(node, handle) {
+    if (!handle || !node) return;
+    let ox = 0, oy = 0, dragging = false;
     handle.addEventListener("pointerdown", (e) => {
       if (e.button !== 0 || e.target.closest("button,input,select,textarea,a,[contenteditable]")) return;
-      const r = p.getBoundingClientRect();
-      const ox = e.clientX - r.left, oy = e.clientY - r.top, w = r.width, h = r.height;
-      const ctl = new AbortController();
-      const move = (ev) => {
-        const x = Math.min(Math.max(0, ev.clientX - ox), Math.max(0, innerWidth - w));
-        const y = Math.min(Math.max(0, ev.clientY - oy), Math.max(0, innerHeight - h));
-        Object.assign(p.style, { left: `${x}px`, top: `${y}px`, right: "auto", bottom: "auto", transform: "none" });
-        onMove?.(x, y);
-      };
+      dragging = true;
+      const r = node.getBoundingClientRect();
+      ox = e.clientX - r.left;
+      oy = e.clientY - r.top;
       handle.setPointerCapture(e.pointerId);
-      handle.addEventListener("pointermove", move, { signal: ctl.signal });
-      handle.addEventListener("pointerup", () => ctl.abort(), { signal: ctl.signal });
-      handle.addEventListener("pointercancel", () => ctl.abort(), { signal: ctl.signal });
       e.preventDefault();
-      e.stopPropagation();
     });
+    handle.addEventListener("pointermove", (e) => {
+      if (!dragging) return;
+      const x = Math.min(window.innerWidth - 40, Math.max(0, e.clientX - ox));
+      const y = Math.min(window.innerHeight - 40, Math.max(0, e.clientY - oy));
+      node.style.left = `${x}px`;
+      node.style.top = `${y}px`;
+      node.style.right = "auto";
+      node.style.bottom = "auto";
+      node.style.transform = "none";
+      S.panelPos = { x, y };
+    });
+    handle.addEventListener("pointerup", () => { dragging = false; });
   }
 
   function drawMask() {
-    const m = q("mask"), t = target();
-    if (!t?.isConnected || panelKind === "edit") { m.style.display = "none"; return; }
+    const t = target();
+    if (!t || !S.active) { maskEl.style.display = "none"; return; }
     const r = t.getBoundingClientRect();
-    Object.assign(m.style, {
-      display: "block", left: `${r.left}px`, top: `${r.top}px`,
+    Object.assign(maskEl.style, {
+      display: "block",
+      top: `${r.top}px`, left: `${r.left}px`,
       width: `${r.width}px`, height: `${r.height}px`,
     });
   }
-  const scheduleMask = () => { S.raf ||= requestAnimationFrame(() => { S.raf = 0; drawMask(); }); };
 
-  /* ── Selector synthesis ────────────────────────────────────────────── */
-  const SKIP_CLASS = /^(is-|has-|js-|dusky)|^(active|selected|open|hover|focus|focused|visible|hidden|show|shown|collapsed|expanded|disabled|checked|current)$/;
-  /* The v3 literal contained a stray markup artefact ("$\vert{}") which
-   * silently disabled the "looks like a hash" branch (\v is a vertical tab). */
-  const HASHY = /^(css|sc|jsx|jss|svelte|emotion)-|^_[a-z0-9]+$|__[a-z0-9]{5,}$|^[^-_]*\d[^-_]*$/i;
-  const HASHY_ID = /^(radix|aria|headlessui|react-select|__next|mui|floating-ui)-|^:[a-z0-9]+:$/i;
-  const TW_UTILITY = /^(flex|grid|block|inline|inline-flex|inline-block|contents|table|hidden|grow|shrink|relative|absolute|fixed|sticky|static|isolate|overflow-.*|truncate|antialiased|box-border|box-content|z-.*|w-.*|h-.*|size-.*|min-w-.*|max-w-.*|min-h-.*|max-h-.*|[pm][trblxy]?-.*|inset-.*|top-.*|left-.*|right-.*|bottom-.*|col-.*|row-.*|order-.*|basis-.*|items-.*|justify-.*|content-.*|place-.*|self-.*|gap-.*|space-.*|divide-.*|cursor-.*|select-.*|pointer-events-.*|rounded.*|shadow.*|opacity-.*|transition.*|duration-.*|ease-.*|animate-.*|scale-.*|rotate-.*|translate-.*|font-.*|text-.*|leading-.*|tracking-.*|whitespace-.*|break-.*|align-.*|list-.*|underline|uppercase|lowercase|capitalize|bg-.*|from-.*|via-.*|to-.*|border(-.*)?|ring-.*|outline-.*|fill-.*|stroke-.*|group|peer|sr-only|not-sr-only)$/i;
+  function scheduleMask() {
+    if (S.raf) return;
+    S.raf = requestAnimationFrame(() => { S.raf = 0; drawMask(); });
+  }
 
-  const goodClasses = (n) => [...n.classList].filter((c) =>
-    !SKIP_CLASS.test(c) && !HASHY.test(c) && !TW_UTILITY.test(c) &&
-    !c.includes(":") && !c.includes("(") && !c.includes("/") && !c.includes("["),
-  ).slice(0, 3);
+  const noisyClass = (c) =>
+    !c || c.length > 28 || /\d{5,}/.test(c) ||
+    /^(is-|has-|js-|css-|active|open|show|selected|focus|hover|scrolled|sticky)$/i.test(c);
 
-  const simple = (n) => n.localName + goodClasses(n).map((c) => `.${CSS.escape(c)}`).join("");
-  const usableId = (n) => !!n.id && !HASHY.test(n.id) && !HASHY_ID.test(n.id);
-  const describe = (n) => simple(n) + (usableId(n) ? `#${CSS.escape(n.id)}` : "");
-
-  function pathSel(n) {
+  function nthPath(elm) {
     const parts = [];
-    for (let cur = n;
-      cur && cur !== document.body && cur !== document.documentElement && parts.length < 3;
-      cur = cur.parentElement) {
-      if (usableId(cur)) { parts.unshift(`#${CSS.escape(cur.id)}`); break; }
-      let s = simple(cur);
-      const sibs = cur.parentElement ? [...cur.parentElement.children] : [];
-      let ambiguous = false;
-      try { ambiguous = sibs.some((c) => c !== cur && c.matches(s)); } catch { ambiguous = false; }
-      if (ambiguous) {
-        s += `:nth-of-type(${sibs.filter((c) => c.localName === cur.localName).indexOf(cur) + 1})`;
+    for (let n = elm; n && n.nodeType === 1 && parts.length < 5; n = n.parentElement) {
+      if (n.id && /^[A-Za-z][\w-]*$/.test(n.id)) {
+        parts.unshift(`#${CSS.escape(n.id)}`);
+        break;
       }
-      parts.unshift(s);
+      const tag = n.localName;
+      const parent = n.parentElement;
+      if (!parent) { parts.unshift(tag); break; }
+      const sibs = [...parent.children].filter((c) => c.localName === tag);
+      const idx = sibs.indexOf(n) + 1;
+      parts.unshift(sibs.length > 1 ? `${tag}:nth-of-type(${idx})` : tag);
     }
-    return parts.join(" > ") || n.localName;
+    return parts.join(" > ");
   }
 
-  function candidates(n) {
-    if (!n || n === document.documentElement) return [{ sel: "html", count: 1 }];
-    if (n === document.body) return [{ sel: "body", count: 1 }];
+  function candidates(elm) {
     const out = [];
-    if (usableId(n)) out.push(`#${CSS.escape(n.id)}`);
-    const s = simple(n);
-    if (s !== n.localName) out.push(s);
-    for (const a of ["role", "aria-label", "data-testid", "data-test-id", "name"]) {
-      const v = n.getAttribute(a);
-      if (v && v.length < 60) out.push(`${n.localName}[${a}=${cssString(v)}]`);
-    }
-    out.push(pathSel(n), n.localName);
     const seen = new Set();
-    return out.filter((sel) => !seen.has(sel) && seen.add(sel)).map((sel) => {
-      let count = 0;
-      try { count = document.querySelectorAll(sel).length; } catch { /* invalid */ }
-      return { sel, count };
-    }).filter((c) => c.count > 0);
+    if (!elm || elm.nodeType !== 1) return out;
+    const add = (sel) => {
+      if (!sel || seen.has(sel) || sel.length > LIMITS.SEL || !validSelector(sel)) return;
+      let n = 0;
+      try { n = document.querySelectorAll(sel).length; } catch { return; }
+      if (!n) return;
+      seen.add(sel);
+      out.push({ sel, n });
+    };
+    const tag = elm.localName;
+    if (elm.id) add(`#${CSS.escape(elm.id)}`);
+    const classes = [...elm.classList].filter((c) => !noisyClass(c)).slice(0, 4);
+    if (classes.length) add(`${tag}.${classes.map((c) => CSS.escape(c)).join(".")}`);
+    for (const c of classes.slice(0, 2)) add(`.${CSS.escape(c)}`);
+    const role = elm.getAttribute("role");
+    if (role) add(`${tag}[role=${cssString(role)}]`);
+    const testid = elm.getAttribute("data-testid") || elm.getAttribute("data-test");
+    if (testid) add(`[data-testid=${cssString(testid)}]`);
+    const name = elm.getAttribute("name");
+    if (name) add(`${tag}[name=${cssString(name)}]`);
+    const aria = elm.getAttribute("aria-label");
+    if (aria && aria.length < 80) add(`${tag}[aria-label=${cssString(aria)}]`);
+    const type = elm.getAttribute("type");
+    if (type) add(`${tag}[type=${cssString(type)}]`);
+    add(tag);
+    add(nthPath(elm));
+    out.sort((a, b) => a.n - b.n || a.sel.length - b.sel.length);
+    return out;
   }
 
-  /* ── Toolbar ───────────────────────────────────────────────────────── */
-  function buildBar() {
-    bar = el("section", { class: "panel bar", role: "toolbar", "aria-label": "Dusky picker" });
-    bar.innerHTML = BAR_HTML;
-    root.append(bar);
-    drag(bar, bar);
-    q("bundo").addEventListener("click", undo);
-    q("bredo").addEventListener("click", redo);
-    q("bsync").addEventListener("click", () => void recover(true));
-    q("brules").addEventListener("click", toggleDrawer);
-    q("bexit").addEventListener("click", () => void setActive(false));
-    refreshBar();
-    baseState();
+  function selected() {
+    const box = q("psel");
+    if (box?.value) return box.value.trim();
+    return candidates(target()).at(0)?.sel ?? "";
+  }
+
+  function describe(node) {
+    if (!node) return "Click anything on the page.";
+    const id = node.id ? `#${node.id}` : "";
+    const cls = [...node.classList].slice(0, 3).map((c) => `.${c}`).join("");
+    return `${node.localName}${id}${cls}`;
+  }
+
+  function previewOf(token) {
+    if (panelKind === "edit") {
+      const r = currentEdit();
+      if (!r) return { highlight: "", css: "" };
+      const sel = q("esel")?.value?.trim() || r.sel;
+      return previewForKey(r.key, sel, r.decl, token);
+    }
+    if (panelKind !== "pick") {
+      const tsel = selected();
+      return { highlight: tsel, css: "" };
+    }
+    if (S.targetMode === "variable") {
+      const name = q("pvar")?.value;
+      return token && name
+        ? { highlight: "", css: `${ROOT_ARMOR}{${name}: var(--${token}) !important}` }
+        : { highlight: selected(), css: "" };
+    }
+    const sel = selected();
+    if (!sel) return null;
+    if (!token) return { highlight: sel, css: "" };
+    return { highlight: sel, css: `${sel}{${declFor(colourGroup(S.group), token)}}` };
+  }
+
+  class PaletteGrid {
+    constructor(mount, { onHover, onLeave, onPick }) {
+      this.mount = mount;
+      this.onHover = onHover;
+      this.onLeave = onLeave;
+      this.onPick = onPick;
+      this.active = "";
+      this.buttons = [];
+      this.build();
+    }
+    build() {
+      this.mount.textContent = "";
+      const wrap = el("div", { class: "swatches" });
+      for (const [token, label] of TOKENS) {
+        const b = el("button", {
+          class: "swatch", type: "button",
+          title: `${label}  —  var(--${token})`,
+          "data-token": token, "aria-label": label,
+        });
+        b.append(
+          el("i", { class: "chip", style: { background: `var(--${token}, #333)` } }),
+          el("span", { class: "swatch-name", text: label }),
+        );
+        b.addEventListener("pointerenter", () => this.onHover?.(token));
+        b.addEventListener("pointerleave", () => this.onLeave?.());
+        b.addEventListener("focus", () => this.onHover?.(token));
+        b.addEventListener("blur", () => this.onLeave?.());
+        b.addEventListener("click", () => this.onPick?.(token));
+        wrap.append(b);
+      }
+      this.mount.append(wrap);
+      this.buttons = [...wrap.children];
+    }
+    setActive(token) {
+      this.active = token || "";
+      for (const b of this.buttons) {
+        b.setAttribute("aria-pressed", String(b.dataset.token === this.active));
+      }
+    }
   }
 
   function refreshBar() {
     if (!bar) return;
     const t = target();
-    q("binfo").textContent = t
-      ? `<${describe(t)}>${S.stack.length > 1 ? `  · depth ${S.depth}/${S.stack.length - 1}` : ""}`
-      : "Hover an element · click to theme · Shift+click hides · Esc exits";
+    q("binfo").textContent = t ? describe(t) : "Click any element to theme it";
     q("bundo").disabled = !S.undo.length;
     q("bredo").disabled = !S.redo.length;
+    q("bup").disabled = !S.stack.length || S.depth >= S.stack.length - 1;
+    q("bdn").disabled = !S.stack.length || S.depth <= 0;
+    const lock = q("block");
+    lock.setAttribute("aria-pressed", String(!!S.locked));
+    lock.textContent = S.locked ? "Locked" : "Lock";
     q("brules").textContent = `Rules (${S.rules.length})`;
+    if (!flashTimer) baseState();
   }
 
-  let flashTimer = 0;
-  function setState(text, cls = "") {
-    const s = q("bstate");
-    if (s) { s.textContent = text; s.className = `state ${cls}`; }
-  }
-  function baseState() {
-    if (!S.hydrated) setState(`⚠ NOT SAVING — ${S.note || "host unreachable"} · press ⟲`, "err");
-    else if (S.warnings.length) setState(`⚠ ${S.warnings[0]}`, "warn");
-    else if (!paletteLoaded()) setState("⚠ palette variables not loaded on this page", "warn");
-    else setState("", "");
-  }
-  function flash(text, cls = "ok") {
-    clearTimeout(flashTimer);
-    setState(text, cls);
-    flashTimer = setTimeout(baseState, 2600);
-  }
-
-  /* ── Panels ────────────────────────────────────────────────────────── */
-  const rememberPos = (x, y) => { S.panelPos = { x, y }; };
-  function placePanel(p) {
-    if (S.panelPos) Object.assign(p.style, { left: `${S.panelPos.x}px`, top: `${S.panelPos.y}px`, right: "auto" });
-  }
-  function dropPanel() {
-    panel?.remove();
-    panel = null;
-    panelKind = null;
-    previewOf = () => null;
-    S.editKey = null;
-  }
-  function closePanel() {
-    dropPanel();
-    S.locked = false;
-    Preview.clear();
-    drawMask();
+  function buildBar() {
+    bar = el("div", { class: "panel bar", id: "bar", role: "toolbar", "aria-label": "Dusky picker toolbar" });
+    bar.innerHTML = BAR_HTML;
+    root.append(bar);
+    drag(bar, q("bhead"));
+    q("bundo").addEventListener("click", undo);
+    q("bredo").addEventListener("click", redo);
+    q("bup").addEventListener("click", () => step(1));
+    q("bdn").addEventListener("click", () => step(-1));
+    q("block").addEventListener("click", () => { S.locked = !S.locked; refreshBar(); });
+    q("brules").addEventListener("click", toggleDrawer);
+    q("bsync").addEventListener("click", () => { void recover(true); });
+    q("bstop").addEventListener("click", () => { void setActive(false); });
     refreshBar();
   }
-  const refreshPanel = () => {
-    if (panelKind === "pick") refreshPick();
-    else if (panelKind === "edit") refreshEdit();
-  };
 
-  /* ── PaletteGrid: built ONCE, delegated events, never rebuilt ───────
-   * This is the structural fix for the dead edit-mode hover: no refresh can
-   * destroy the node the pointer is resting on, and pointerover bubbles, so a
-   * swatch inserted under a stationary pointer still previews on the next
-   * movement (mouseenter, which does not bubble, never would). */
-  function PaletteGrid({ onHover, onPick }) {
-    const grid = el("div", { class: "grid", role: "listbox", "aria-label": "Palette" });
-    const buttons = new Map();
-    for (const [token, label] of TOKENS) {
-      const b = el("button", { type: "button", "data-token": token, title: `var(--${token})`, tabindex: "-1" },
-        el("i", { class: "sw", style: { background: `var(--${token}, transparent)` } }),
-        el("span", { class: "lab", text: label }));
-      buttons.set(token, b);
-      grid.append(b);
-    }
-    grid.firstElementChild?.setAttribute("tabindex", "0");
-
-    const tokenFrom = (node) => node?.closest?.("button[data-token]")?.dataset.token ?? null;
-
-    grid.addEventListener("pointerover", (e) => { const t = tokenFrom(e.target); if (t) onHover(t); });
-    grid.addEventListener("pointerleave", () => onHover(null));
-    grid.addEventListener("focusin", (e) => { const t = tokenFrom(e.target); if (t) onHover(t); });
-    grid.addEventListener("focusout", (e) => { if (!grid.contains(e.relatedTarget)) onHover(null); });
-    grid.addEventListener("click", (e) => { const t = tokenFrom(e.target); if (t) onPick(t); });
-    grid.addEventListener("keydown", (e) => {
-      const step = { ArrowRight: 1, ArrowLeft: -1, ArrowDown: 2, ArrowUp: -2 }[e.key];
-      if (!step) return;
-      const items = [...buttons.values()];
-      const i = items.indexOf(e.target.closest("button[data-token]"));
-      const next = items[Math.min(Math.max(0, i + step), items.length - 1)];
-      if (!next || next === e.target) return;
-      for (const b of items) b.tabIndex = -1;
-      next.tabIndex = 0;
-      next.focus();
-      e.preventDefault();
-      e.stopPropagation();
-    });
-
-    return {
-      el: grid,
-      setActive(token) {
-        for (const [name, b] of buttons) b.classList.toggle("act", name === token);
-      },
-    };
+  function currentEdit() {
+    if (!S.editKey) return null;
+    return S.rules.find((r) => r.key === S.editKey) ?? null;
   }
 
-  /* ---- pick panel ---- */
-  let pickGrid = null;
-  const selected = () => (panelKind === "pick" ? q("psel").value : candidates(target()).at(0)?.sel ?? "");
+  function closePanel() {
+    panel?.remove();
+    panel = null;
+    panelKind = "";
+    pickGrid = editGrid = null;
+    S.editKey = null;
+    S.locked = false;
+    Preview.clear();
+    refreshBar();
+  }
 
-  function pickPreviewSpec(token) {
+  function refreshPanel() {
+    if (panelKind === "pick") refreshPick(false);
+    else if (panelKind === "edit") refreshEdit();
+  }
+
+  function refreshPick(rebuildSels = false) {
+    if (panelKind !== "pick" || !panel) return;
+    const t = target();
+    q("ptitle").textContent = t ? `Theme <${t.localName}>` : "Theme this element";
+    q("pinfo").textContent = t
+      ? `${describe(t)} — pick a unique selector, a part, then a colour.`
+      : "Click anything on the page.";
+
+    const stackBox = q("pstack");
+    stackBox.textContent = "";
+    S.stack.slice(0, 6).forEach((node, i) => {
+      const label = i === 0 ? `this <${node.localName}>` : `<${node.localName}>`;
+      const b = el("button", { type: "button", text: label });
+      b.setAttribute("aria-pressed", String(i === S.depth));
+      b.title = i === 0 ? "The element you clicked" : `Ancestor ${i} — theme this container instead`;
+      b.addEventListener("click", () => { S.depth = i; retarget(); });
+      stackBox.append(b);
+    });
+    const sl = q("pslider");
+    if (sl) {
+      sl.max = String(Math.max(0, S.stack.length - 1));
+      sl.value = String(S.depth);
+      sl.disabled = S.stack.length < 2;
+    }
+    const dt = q("pdepth");
+    if (dt) dt.textContent = S.stack.length > 1 ? `${S.depth}/${S.stack.length - 1}` : "";
+
+    if (rebuildSels) {
+      const box = q("psel");
+      const prev = box.value;
+      box.textContent = "";
+      for (const c of candidates(t)) {
+        const opt = document.createElement("option");
+        opt.value = c.sel;
+        opt.textContent = c.n === 1 ? `${c.sel}  (this element only)` : `${c.sel}  (matches ${c.n})`;
+        box.append(opt);
+      }
+      if ([...box.options].some((o) => o.value === prev)) box.value = prev;
+    }
+
+    const varMode = S.targetMode === "variable";
+    q("pmode-sel").setAttribute("aria-pressed", String(!varMode));
+    q("pvarbtn").setAttribute("aria-pressed", String(varMode));
+    q("pvarbtn").disabled = S.elementVars.length === 0;
+    q("pvar-row").hidden = !varMode;
+    q("pseg-row").hidden = varMode;
+    q("psel-row").hidden = varMode;
+
+    if (varMode) {
+      const box = q("pvar");
+      const prev = box.value;
+      box.textContent = "";
+      for (const v of S.elementVars) {
+        const opt = document.createElement("option");
+        opt.value = v.name;
+        opt.textContent = `${v.name}  =  ${v.value}`;
+        box.append(opt);
+      }
+      if ([...box.options].some((o) => o.value === prev)) box.value = prev;
+    }
+
+    for (const b of q("pseg").children) {
+      b.setAttribute("aria-pressed", String(b.dataset.group === S.group));
+    }
+    const extra = GROUPS[S.group]?.extra;
+    q("pextra").textContent = extra?.label ?? "";
+    q("pextra").hidden = varMode || !extra;
+    q("phint").textContent = varMode
+      ? "Hover a swatch to preview remapping this variable across the page; click saves."
+      : "Hover previews · click saves · Shift+click hides.";
+    pickGrid?.setActive("");
+  }
+
+  function applyPick(token) {
     if (S.targetMode === "variable") {
-      const name = q("pvar").value;
-      const scope = q("pscope").value || ROOT_ARMOR;
-      if (!name) return { highlight: "", css: "" };
-      return previewForKey(varKey(scope, name), scope, "", token);
+      const name = q("pvar")?.value;
+      if (!name) { flash("pick a CSS variable first", "err"); return; }
+      upsert({
+        sel: ROOT_ARMOR,
+        decl: `${name}: var(--${token}) !important;`,
+        meta: `var ${name} → ${token}`,
+        key: varKey(ROOT_ARMOR, name),
+      });
+      flash(`✓ ${name} → ${token}`);
+      return;
     }
     const sel = selected();
-    return previewForKey(selKey(sel, S.group), sel, "", token);
-  }
-  const pickPreview = (token) => Preview.show(pickPreviewSpec(token));
-
-  function openPick() {
-    const t = target();
-    if (!t) return;
-    dropPanel();
-    panelKind = "pick";
-    S.locked = true;
-    S.elementVars = getElementVars(t);
-    S.targetMode = "selector";
-    if (t.closest("svg") && S.group === "bg") S.group = "fill";
-
-    panel = el("section", { class: "panel dlg", role: "dialog", "aria-label": "Theme this element", tabindex: "-1" });
-    panel.innerHTML = PICK_HTML;
-    placePanel(panel);
-    root.append(panel);
-    drag(panel, q("phead"), rememberPos);
-
-    previewOf = pickPreviewSpec;
-    pickGrid = PaletteGrid({
-      onHover: (token) => Preview.show(previewOf(token)),
-      onPick: (token) => {
-        if (S.targetMode === "variable") {
-          const name = q("pvar").value;
-          if (!name) return;
-          const sc = q("pscope").value || ROOT_ARMOR;
-          upsert({
-            sel: sc, decl: `${name}: var(--${token}) !important;`,
-            meta: `var ${name} → ${token}`, key: varKey(sc, name),
-          });
-          flash(`✓ ${name} → ${token}`);
-        } else {
-          applySel(declFor(S.group, token), `${S.group}: ${token}`, S.group);
-        }
-      },
+    if (!validSelector(sel)) { flash("no usable selector here", "err"); return; }
+    const group = colourGroup(S.group);
+    upsert({
+      sel,
+      decl: declFor(group, token),
+      meta: `${group}: ${token}`,
+      key: selKey(sel, group),
     });
-    q("pgrid").append(pickGrid.el);
+    flash(`✓ ${group}: ${token} on ${sel}`);
+  }
 
-    q("pclose").addEventListener("click", closePanel);
-    q("pghost").addEventListener("click", (e) =>
-      e.currentTarget.setAttribute("aria-pressed", String(panel.classList.toggle("ghost"))));
-    q("pslider").addEventListener("input", (e) => { S.depth = Number(e.target.value); retarget(); });
-    q("pchild").addEventListener("click", () => step(-1));
-    q("pparent").addEventListener("click", () => step(1));
-    for (const id of ["psel", "pvar", "pscope"]) {
-      q(id).addEventListener("change", () => refreshPick());
+  function applyExtra() {
+    const extra = GROUPS[S.group]?.extra;
+    const sel = selected();
+    if (!extra || !validSelector(sel)) return;
+    upsert({
+      sel,
+      decl: important(extra.css),
+      meta: extra.meta,
+      key: selKey(sel, S.group),
+    });
+    flash(`✓ ${extra.meta}`);
+  }
+
+  /* Light depth-chrome sync for slider drags: no querySelectorAll storms, so the
+   * thumb never sticks on heavy pages. Full rebuild happens on release. */
+  function syncDepthChrome() {
+    drawMask();
+    refreshBar();
+    if (panelKind !== "pick" || !panel) return;
+    const t = target();
+    q("ptitle").textContent = t ? `Theme <${t.localName}>` : "Theme this element";
+    q("pinfo").textContent = t
+      ? `${describe(t)} — pick a unique selector, a part, then a colour.`
+      : "Click anything on the page.";
+    for (const [i, b] of [...q("pstack").children].entries()) {
+      b.setAttribute("aria-pressed", String(i === S.depth));
     }
+    const dt = q("pdepth");
+    if (dt) dt.textContent = S.stack.length > 1 ? `${S.depth}/${S.stack.length - 1}` : "";
+    Preview.show(previewOf(null));
+  }
 
-    const varBtn = q("pvarbtn");
-    varBtn.disabled = S.elementVars.length === 0;
-    varBtn.title = varBtn.disabled
-      ? "No CSS custom properties detected on this element"
-      : `${S.elementVars.length} variable(s) detected`;
-    q("pmode").addEventListener("click", (e) => {
-      const b = e.target.closest("button[data-mode]");
-      if (!b || b.disabled) return;
-      S.targetMode = b.dataset.mode;
-      refreshPick();
+  function bindPick() {
+    q("pclose").addEventListener("click", closePanel);
+    q("pslider").addEventListener("input", (e) => {
+      S.depth = Number(e.target.value);
+      e.target.value = String(S.depth);
+      syncDepthChrome();
+    });
+    q("pslider").addEventListener("change", () => { retarget(); });
+    q("psel").addEventListener("change", () => Preview.show(previewOf(null)));
+    q("pvar").addEventListener("change", () => Preview.show(previewOf(null)));
+    q("pmode-sel").addEventListener("click", () => {
+      S.targetMode = "selector";
+      refreshPick(false);
+      Preview.show(previewOf(null));
+    });
+    q("pvarbtn").addEventListener("click", () => {
+      if (!S.elementVars.length) return;
+      S.targetMode = "variable";
+      refreshPick(false);
+      Preview.show(previewOf(null));
     });
     q("pseg").addEventListener("click", (e) => {
-      const b = e.target.closest("button[data-group]");
+      const b = e.target.closest("[data-group]");
       if (!b) return;
       S.group = b.dataset.group;
-      refreshPick();
+      refreshPick(false);
+      Preview.show(previewOf(null));
     });
-
-    const hoverExtra = (css) => () => {
+    q("pextra").addEventListener("click", applyExtra);
+    const hoverExtra = (css) => {
       if (S.targetMode !== "selector") return;
       const sel = selected();
       Preview.show({ highlight: sel, css: validSelector(sel) ? `${sel}{${css}}` : "" });
     };
-    q("pextra").addEventListener("pointerenter", () => hoverExtra(GROUPS[S.group].extra.css)());
-    q("pextra").addEventListener("focus", () => hoverExtra(GROUPS[S.group].extra.css)());
-    q("pextra").addEventListener("pointerleave", () => pickPreview(null));
-    q("pextra").addEventListener("blur", () => pickPreview(null));
-    q("pextra").addEventListener("click", () =>
-      applySel(GROUPS[S.group].extra.css, GROUPS[S.group].extra.meta, S.group));
-
-    q("phide").addEventListener("pointerenter", hoverExtra("display:none !important;"));
-    q("phide").addEventListener("pointerleave", () => pickPreview(null));
-    q("phide").addEventListener("click", () => applySel("display: none !important;", "hidden", "display"));
-
-    const custom = q("pcustom");
-    const applyCustom = () => {
-      const decl = normaliseDecl(custom.value);
-      if (!decl) { flash("that is not a valid declaration", "err"); return; }
-      applySel(decl, `custom: ${propsOf(decl).join(", ")}`, `custom:${propsOf(decl).join(",")}`);
-      custom.value = "";
-    };
-    q("papply").addEventListener("click", applyCustom);
-    custom.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") { e.preventDefault(); applyCustom(); }
+    q("pextra").addEventListener("pointerenter", () => {
+      const extra = GROUPS[S.group]?.extra;
+      if (extra) hoverExtra(important(extra.css));
     });
-
-    refreshPick(true);
-    panel.focus({ preventScroll: true });
-  }
-
-  function rulesTouching(t) {
-    if (!t) return [];
-    const cands = new Set(candidates(t).map((c) => c.sel));
-    const vars = new Set(S.elementVars.map((v) => v.name));
-    return S.rules.filter((r) => {
-      const k = decodeKey(r.key);
-      if (k.kind === "var") return vars.has(k.name);
-      if (k.kind === "raw") return false;
-      if (cands.has(r.sel)) return true;
-      try { return t.matches(r.sel); } catch { return false; }
+    q("pextra").addEventListener("focus", () => {
+      const extra = GROUPS[S.group]?.extra;
+      if (extra) hoverExtra(important(extra.css));
+    });
+    q("pextra").addEventListener("pointerleave", () => Preview.show(previewOf(null)));
+    q("pextra").addEventListener("blur", () => Preview.show(previewOf(null)));
+    q("phide").addEventListener("pointerenter", () => hoverExtra("display:none !important;"));
+    q("phide").addEventListener("focus", () => hoverExtra("display:none !important;"));
+    q("phide").addEventListener("pointerleave", () => Preview.show(previewOf(null)));
+    q("phide").addEventListener("blur", () => Preview.show(previewOf(null)));
+    q("phide").addEventListener("click", () => {
+      const sel = selected();
+      if (!validSelector(sel)) { flash("no usable selector here", "err"); return; }
+      if (/^(html|body|:root)$/i.test(sel.trim())) { flash("refusing to hide the whole page", "err"); return; }
+      upsert({ sel, decl: "display: none !important;", meta: "hidden", key: selKey(sel, "display") });
+      flash(`✓ hidden ${sel}`);
+    });
+    q("pcustom").addEventListener("keydown", (e) => {
+      if (e.key !== "Enter") return;
+      e.preventDefault();
+      const sel = selected();
+      const decl = normaliseDecl(q("pcustom").value);
+      if (!validSelector(sel) || !decl) { flash("need a selector and some CSS", "err"); return; }
+      const group = groupOfDecl(decl);
+      const name = propsOf(decl)[0];
+      upsert({
+        sel, decl, meta: "custom",
+        key: group === "var" ? varKey(sel, name) : selKey(sel, group),
+      });
+      q("pcustom").value = "";
+      flash("✓ custom rule saved");
+    });
+    pickGrid = new PaletteGrid(q("pgrid"), {
+      onHover: (tok) => Preview.show(previewOf(tok)),
+      onLeave: () => Preview.show(previewOf(null)),
+      onPick: applyPick,
     });
   }
 
-  let lastPickTarget = null;
-  function refreshPick(full = false) {
-    const t = target();
-    if (panelKind !== "pick" || !t) return;
-    const changed = full || t !== lastPickTarget;
-    lastPickTarget = t;
-
-    q("ptag").textContent = `<${describe(t)}>`;
-
-    const sl = q("pslider");
-    sl.max = String(Math.max(0, S.stack.length - 1));
-    sl.value = String(S.depth);
-    q("pchild").disabled = S.depth === 0;
-    q("pparent").disabled = S.depth >= S.stack.length - 1;
-
-    const isVar = S.targetMode === "variable";
-    for (const x of q("pmode").children) x.setAttribute("aria-pressed", String(x.dataset.mode === S.targetMode));
-    q("psel-row").hidden = isVar;
-    q("pprop-row").hidden = isVar;
-    q("pvar-row").hidden = !isVar;
-    q("pscope-row").hidden = !isVar;
-    q("pextra").disabled = isVar;
-    q("phide").disabled = isVar;
-
-    /* Selects are rebuilt only when the target element actually changed, so a
-     * selection made inside them is never clobbered by an unrelated refresh. */
-    if (changed) {
-      const cands = candidates(t);
-      const fill = (node, options, keep) => {
-        node.textContent = "";
-        for (const o of options) node.append(el("option", o));
-        if (keep && [...node.options].some((o) => o.value === keep)) node.value = keep;
-      };
-      fill(q("psel"), cands.map((c) => ({
-        value: c.sel, text: `${c.sel}   — ${c.count} match${c.count === 1 ? "" : "es"}`,
-      })), q("psel").value);
-      fill(q("pvar"), S.elementVars.map((v) => ({ value: v.name, text: `${v.name}  =  ${v.value}` })), q("pvar").value);
-      fill(q("pscope"), [
-        { value: ROOT_ARMOR, text: ":root  (whole page)" },
-        ...cands.map((c) => ({ value: c.sel, text: `${c.sel}  (${c.count})` })),
-      ], q("pscope").value);
-    }
-
-    for (const x of q("pseg").children) x.setAttribute("aria-pressed", String(x.dataset.group === S.group));
-    q("pextra").textContent = GROUPS[S.group].extra.label;
-
-    /* existing rules for this element → one click to edit */
-    const chips = q("pexist");
-    chips.textContent = "";
-    const touching = rulesTouching(t);
-    if (touching.length) {
-      chips.append(el("span", { class: "cap", text: "already themed here — click to edit:" }));
-      for (const r of touching) {
-        const tok = tokenOf(r.decl);
-        const chip = el("button", { class: "chip", type: "button", title: ruleCss(r), onclick: () => openEdit(r) },
-          el("i", { class: "dot", style: { background: tok ? `var(--${tok}, transparent)` : "transparent" } }),
-          el("span", { class: "lab", text: r.meta || ruleCss(r) }));
-        chip.addEventListener("pointerenter", () => Preview.show(previewForKey(r.key, r.sel, r.decl, "")));
-        chip.addEventListener("pointerleave", () => pickPreview(null));
-        chips.append(chip);
-      }
-    }
-
-    /* palette: tick whatever is currently applied for this selector+property */
-    const activeKey = isVar
-      ? varKey(q("pscope").value || ROOT_ARMOR, q("pvar").value)
-      : selKey(q("psel").value, S.group);
-    pickGrid?.setActive(tokenOf(S.rules.find((r) => r.key === activeKey)?.decl));
-    pickPreview(null);
-  }
-
-  function applySel(decl, meta, group) {
-    const sel = selected();
-    if (!validSelector(sel)) { flash("invalid selector", "err"); return; }
-    if (group === "display" && /^(html|body)$/i.test(sel.trim())) {
-      flash("refusing to hide the whole page", "err");
-      return;
-    }
-    upsert({ sel, decl, meta, key: selKey(sel, group) });
-    flash(`✓ ${meta}`);
-  }
-
-  /* ---- edit panel ---- */
-  let editGrid = null;
-  const currentEdit = () => S.rules.find((r) => r.key === S.editKey) ?? null;
-
-  function editPreviewSpec(token) {
-    const r = currentEdit();
-    if (!r) return null;
-    /* The selector box may hold an unsaved edit — preview what the user sees. */
-    const sel = r.raw !== undefined ? "" : (q("esel")?.value.trim() || r.sel);
-    return previewForKey(r.key, sel, r.decl, token);
-  }
-
-  function openEdit(rule) {
-    const live = S.rules.find((r) => r.key === rule.key) ?? rule;
-    dropPanel();
-    panelKind = "edit";
-    S.editKey = live.key;
+  function openPick() {
     S.locked = true;
-    panel = el("section", { class: "panel dlg", role: "dialog", "aria-label": "Edit rule", tabindex: "-1" });
-    panel.innerHTML = EDIT_HTML;
-    placePanel(panel);
-    root.append(panel);
-    drag(panel, q("ehead"), rememberPos);
+    S.elementVars = getElementVars(target());
+    if (!S.elementVars.length) S.targetMode = "selector";
+    if (panelKind !== "pick" || !panel) {
+      panel?.remove();
+      editGrid = null;
+      panelKind = "pick";
+      panel = el("section", { class: "panel dlg ghost", role: "dialog", "aria-label": "Theme this element" });
+      panel.innerHTML = PICK_HTML;
+      root.append(panel);
+      drag(panel, q("phead"));
+      bindPick();
+    }
+    refreshPick(true);
+    Preview.show(previewOf(null));
+    refreshBar();
+  }
 
-    previewOf = editPreviewSpec;
-    editGrid = PaletteGrid({
-      onHover: (token) => Preview.show(previewOf(token)),
-      onPick: (token) => editPick(token),
-    });
-    q("egrid").append(editGrid.el);
-
+  function bindEdit() {
     q("eclose").addEventListener("click", closePanel);
-    q("edone").addEventListener("click", closePanel);
-    q("eghost").addEventListener("click", (e) =>
-      e.currentTarget.setAttribute("aria-pressed", String(panel.classList.toggle("ghost"))));
-    q("edelete").addEventListener("click", () => { removeRule(S.editKey); closePanel(); });
+    q("edel").addEventListener("click", () => {
+      if (S.editKey) removeRule(S.editKey);
+      closePanel();
+    });
     q("esel").addEventListener("change", commitSelector);
-    q("esel").addEventListener("input", () => Preview.show(previewOf("")));
-    q("eapply").addEventListener("click", commitDecl);
+    q("esel").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); commitSelector(); }
+    });
+    q("ecustom").addEventListener("change", commitDecl);
     q("ecustom").addEventListener("keydown", (e) => {
       if (e.key === "Enter") { e.preventDefault(); commitDecl(); }
     });
     q("eraw").addEventListener("change", commitRaw);
-    q("eseg").addEventListener("click", (e) => {
-      const b = e.target.closest("button[data-group]");
-      const r = currentEdit();
-      if (!b || !r) return;
-      const k = decodeKey(r.key);
-      if (k.kind !== "sel") return;
-      const token = tokenOf(r.decl) || "primary";
-      writeRule(r.key, {
-        sel: r.sel, decl: declFor(b.dataset.group, token),
-        meta: `${b.dataset.group}: ${token}`, key: selKey(r.sel, b.dataset.group),
-      });
-      flash(`✓ ${b.dataset.group}`);
+    q("eraw").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commitRaw(); }
     });
-
-    drawMask();
-    refreshEdit();
-    /* Preview the rule's own outline immediately so the user sees the target. */
-    Preview.show(previewOf(""));
-    panel.focus({ preventScroll: true });
+    q("eseg").addEventListener("click", (e) => {
+      const b = e.target.closest("[data-group]");
+      if (!b) return;
+      const r = currentEdit();
+      if (!r || r.raw !== undefined) return;
+      const k = decodeKey(r.key);
+      if (k.kind === "var") return;
+      const group = b.dataset.group;
+      const tok = tokenOf(r.decl);
+      writeRule(r.key, {
+        sel: r.sel,
+        decl: tok ? declFor(group, tok) : r.decl,
+        meta: `${group}: ${tok || "custom"}`,
+        key: selKey(r.sel, group),
+      });
+    });
+    editGrid = new PaletteGrid(q("egrid"), {
+      onHover: (tok) => Preview.show(previewOf(tok)),
+      onLeave: () => Preview.show(previewOf(null)),
+      onPick: applyEdit,
+    });
   }
 
-  function editPick(token) {
+  function openEdit(r) {
+    if (!r) return;
+    S.editKey = r.key;
+    S.locked = true;
+    if (panelKind !== "edit" || !panel) {
+      panel?.remove();
+      pickGrid = null;
+      panelKind = "edit";
+      panel = el("section", { class: "panel dlg ghost", role: "dialog", "aria-label": "Edit a saved rule" });
+      panel.innerHTML = EDIT_HTML;
+      root.append(panel);
+      drag(panel, q("ehead"));
+      bindEdit();
+    }
+    refreshEdit();
+    Preview.show(previewOf(null));
+    refreshBar();
+  }
+
+  function applyEdit(token) {
     const r = currentEdit();
     if (!r) return;
     const k = decodeKey(r.key);
     if (k.kind === "var") {
       writeRule(r.key, {
-        sel: r.sel, decl: `${k.name}: var(--${token}) !important;`,
-        meta: `var ${k.name} → ${token}`, key: r.key,
+        sel: r.sel,
+        decl: `${k.name}: var(--${token}) !important;`,
+        meta: `var ${k.name} → ${token}`,
+        key: varKey(r.sel, k.name),
       });
       flash(`✓ ${k.name} → ${token}`);
       return;
     }
-    if (k.kind !== "sel") return;
-    if (k.group?.startsWith("custom:") || k.group === "display") {
-      const swapped = String(r.decl).replaceAll(/var\(\s*--[a-z0-9_]+/gi, `var(--${token}`);
-      if (swapped === r.decl) { flash("this rule has no colour to change", "warn"); return; }
-      writeRule(r.key, { ...r, decl: swapped, meta: `${k.group}: ${token}` });
+    if (r.raw !== undefined || k.kind === "raw") return;
+    if (k.kind === "sel" && typeof k.group === "string" && k.group.startsWith("custom:")) {
+      const swapped = String(r.decl ?? "").replaceAll(/var\(\s*--[a-z0-9_]+/gi, `var(--${token}`);
+      writeRule(r.key, {
+        sel: r.sel,
+        decl: swapped === r.decl ? declFor("bg", token) : important(swapped),
+        meta: `${k.group}: ${token}`,
+        key: swapped === r.decl ? selKey(r.sel, "bg") : r.key,
+      });
       flash(`✓ ${token}`);
       return;
     }

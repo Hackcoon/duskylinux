@@ -273,15 +273,46 @@ def domain_lock(root: Path, domain: str) -> Iterator[None]:
 
     flock(2) is per open-file-description, so it works across processes (two
     Firefox profiles, Firefox + LibreWolf, the CLI selftest) on every local fs
-    Arch ships, including btrfs/ext4/xfs/tmpfs.
+    Arch ships, including btrfs/ext4/xfs/tmpfs. The file is removed on release
+    so the store stays clean; correctness never depends on it alone because the
+    revision CAS refuses stale writes even if two holders ever overlap.
     """
     root.mkdir(parents=True, exist_ok=True, mode=DIR_MODE)
-    fd = os.open(root / f".{domain}.lock", os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, FILE_MODE)
+    lock = root / f".{domain}.lock"
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, FILE_MODE)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
         os.close(fd)                                 # releases the lock
+        with contextlib.suppress(OSError):
+            lock.unlink()                            # best-effort: leave no litter
+
+
+def sweep_stale_locks(root: Path) -> None:
+    """Remove orphaned `.*.lock` files left by older versions (or crashes).
+
+    Only a file nobody currently holds is removed: each candidate is opened
+    and exclusively locked non-blocking first, so a live holder is never
+    disturbed.
+    """
+    if not root.is_dir():
+        return
+    for lock in root.glob(".*.lock"):
+        try:
+            fd = os.open(lock, os.O_RDWR | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)                             # live holder — leave it
+            continue
+        try:
+            with contextlib.suppress(OSError):
+                lock.unlink()
+        finally:
+            os.close(fd)
 
 
 def write_atomic(path: Path, text: str) -> None:
@@ -448,6 +479,7 @@ def send_message(stream: io.BufferedWriter, obj: Reply) -> None:
 
 def serve() -> int:
     root = config_dir()
+    sweep_stale_locks(root)                          # one-time: clear pre-fix litter
     stdin, stdout = sys.stdin.buffer, sys.stdout.buffer
     while True:
         try:
