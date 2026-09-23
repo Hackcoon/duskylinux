@@ -134,6 +134,7 @@ class AuditTests(unittest.TestCase):
                     (Path(td) / (dest.name + '.part')).write_bytes(b'incomplete')
                     return subprocess.CompletedProcess(cmd, 2)
                 self.assertEqual(cmd[0], 'curl')
+                self.assertNotIn('-C', cmd)
                 fallback_part = Path(cmd[cmd.index('-o') + 1])
                 self.assertEqual(fallback_part.name, dest.name + '.fallback1.part')
                 with tarfile.open(fallback_part, 'w:gz') as archive:
@@ -141,10 +142,52 @@ class AuditTests(unittest.TestCase):
                     marker.type = tarfile.DIRTYPE
                     archive.addfile(marker)
                 return subprocess.CompletedProcess(cmd, 0)
-            with patch.object(k, 'run', side_effect=fake_run):
+            with patch.object(k, 'run', side_effect=fake_run), patch.object(k, 'interactive', return_value=False):
                 k.download('https://git.kernel.org/example', dest, ('https://codeload.github.com/example',))
             self.assertTrue(tarfile.is_tarfile(dest))
-            self.assertFalse((Path(td) / (dest.name + '.part')).exists())
+            self.assertEqual((Path(td) / (dest.name + '.part')).read_bytes(), b'incomplete')
+
+    def test_interactive_download_can_retry_original_then_switch_hosts(self):
+        with tempfile.TemporaryDirectory() as td, patch.object(k, 'have', return_value=True), \
+             patch.object(k, 'interactive', return_value=True), patch.object(k, 'ask', side_effect=['r', 'a']) as prompt:
+            dest = Path(td) / 'linux-7.3-rc4.tar.gz'
+            attempts = []
+            def fake_run(cmd, **_kwargs):
+                attempts.append(cmd[0])
+                if cmd[0] == 'curl':
+                    with tarfile.open(Path(cmd[cmd.index('-o') + 1]), 'w:gz') as archive:
+                        marker = tarfile.TarInfo('linux-7.3-rc4/')
+                        marker.type = tarfile.DIRTYPE
+                        archive.addfile(marker)
+                    return subprocess.CompletedProcess(cmd, 0)
+                return subprocess.CompletedProcess(cmd, 1)
+            with patch.object(k, 'run', side_effect=fake_run):
+                k.download('https://git.kernel.org/example', dest, ('https://codeload.github.com/example',))
+            self.assertEqual(attempts, ['aria2c', 'aria2c', 'curl'])
+            self.assertEqual(prompt.call_count, 2)
+            self.assertTrue(tarfile.is_tarfile(dest))
+
+    def test_interactive_download_can_return_to_original_after_fallback(self):
+        with tempfile.TemporaryDirectory() as td, patch.object(k, 'have', return_value=True), \
+             patch.object(k, 'interactive', return_value=True), patch.object(k, 'ask', side_effect=['a', 'a']):
+            dest = Path(td) / 'linux-7.3-rc4.tar.gz'
+            attempts = []
+            def fake_run(cmd, **_kwargs):
+                attempts.append(cmd[0])
+                if len(attempts) == 3:
+                    self.assertEqual((Path(td) / (dest.name + '.part')).read_bytes(), b'partial')
+                    with tarfile.open(Path(td) / (dest.name + '.part'), 'w:gz') as archive:
+                        marker = tarfile.TarInfo('linux-7.3-rc4/')
+                        marker.type = tarfile.DIRTYPE
+                        archive.addfile(marker)
+                    return subprocess.CompletedProcess(cmd, 0)
+                if len(attempts) == 1:
+                    (Path(td) / (dest.name + '.part')).write_bytes(b'partial')
+                return subprocess.CompletedProcess(cmd, 1)
+            with patch.object(k, 'run', side_effect=fake_run):
+                k.download('https://git.kernel.org/example', dest, ('https://codeload.github.com/example',))
+            self.assertEqual(attempts, ['aria2c', 'curl', 'aria2c'])
+            self.assertTrue(tarfile.is_tarfile(dest))
 
     def test_future_cpu_names_are_not_allowlisted(self):
         p = profile(); p.set('cpu', 'arch', 'futurecpu2030')

@@ -2441,30 +2441,57 @@ def download(url: str, dest: Path, fallback_urls: Sequence[str] = ()) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if not (have("aria2c") or have("curl")):
         raise DependencyError("Neither aria2c nor curl is installed (pacman -S curl)")
+    sources = (url, *fallback_urls)
     failures = []
-    for index, source in enumerate((url, *fallback_urls)):
+    index = 0
+    while True:
+        source = sources[index]
         # Different hosts can serve different gzip streams for the same source tree.
         # Never resume a partial download from one host against another.
         tmp = dest.with_name(dest.name + (".part" if index == 0 else f".fallback{index}.part"))
+        codeload = urllib.parse.urlparse(source).hostname == "codeload.github.com"
+        if codeload and tmp.exists():
+            note("GitHub archive host does not support byte-range resume; restarting its partial download")
+            tmp.unlink()
+            tmp.with_name(tmp.name + ".aria2").unlink(missing_ok=True)
         info(f"Downloading {source}")
         if have("aria2c") and (index == 0 or not have("curl")):
-            cmd = ["aria2c", "--console-log-level=warn", "--summary-interval=0", "-x8", "-s8", "-k1M", "-c",
+            cmd = ["aria2c", "--console-log-level=warn", "--summary-interval=0", "-x1" if codeload else "-x8",
+                   "-s1" if codeload else "-s8", "-k1M", *([] if codeload else ["-c"]),
                    "--connect-timeout=10", "--timeout=30", "--max-tries=2", "--auto-file-renaming=false",
                    "-d", str(dest.parent), "-o", tmp.name, source]
         else:
-            cmd = ["curl", "-fL", "--connect-timeout", "10", "--retry", "3", "--retry-all-errors", "-C", "-",
+            cmd = ["curl", "-fL", "--connect-timeout", "10", "--retry", "3", "--retry-all-errors",
+                   *([] if codeload else ["-C", "-"]),
                    "--progress-bar", "-A", USER_AGENT, "-o", str(tmp), source]
         cp = run(cmd, check=False, capture=False)
+        check_abort()
         if cp.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0 and tarfile.is_tarfile(tmp):
             tmp.replace(dest)
             return
-        tmp.unlink(missing_ok=True)
-        tmp.with_name(tmp.name + ".aria2").unlink(missing_ok=True)
+        if cp.returncode == 0:  # A successful HTTP response can still be an error page.
+            tmp.unlink(missing_ok=True)
+            tmp.with_name(tmp.name + ".aria2").unlink(missing_ok=True)
         reason = f"exit {cp.returncode}" if cp.returncode else "missing or invalid archive"
         failures.append(f"{source} ({reason})")
-        if index < len(fallback_urls):
-            warn(f"Source unavailable; trying alternate archive host")
-    raise NetworkError(f"Download failed: {'; '.join(failures)}")
+        if interactive() and not ASSUME_YES:
+            choices = "[r]etry / [a]lternate / [c]ancel" if len(sources) > 1 else "[r]etry / [c]ancel"
+            default = "a" if len(sources) > 1 else "c"
+            while True:
+                action = ask(f"Download failed ({reason}). {choices}", default).lower()
+                if action in ("r", "retry"):
+                    break
+                if action in ("a", "alternate") and len(sources) > 1:
+                    index = (index + 1) % len(sources)
+                    break
+                if action in ("c", "cancel"):
+                    raise AbortError("Download cancelled; partial archives remain available for resume")
+                warn("Choose retry, alternate or cancel")
+            continue
+        if index + 1 >= len(sources):
+            raise NetworkError(f"Download failed: {'; '.join(failures)}")
+        warn("Source unavailable; trying alternate archive host")
+        index += 1
 
 
 def ensure_kernel_keys() -> bool:
