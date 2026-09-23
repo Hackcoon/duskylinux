@@ -2419,22 +2419,34 @@ def expected_sha256(archive_name: str, version: str) -> str | None:
     return None
 
 
-def download(url: str, dest: Path) -> None:
+def download(url: str, dest: Path, fallback_urls: Sequence[str] = ()) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(dest.name + ".part")
-    info(f"Downloading {url}")
-    if have("aria2c"):
-        cmd = ["aria2c", "--console-log-level=warn", "--summary-interval=0", "-x8", "-s8", "-k1M", "-c", "--auto-file-renaming=false",
-               "-d", str(dest.parent), "-o", tmp.name, url]
-    elif have("curl"):
-        cmd = ["curl", "-fL", "--retry", "5", "--retry-all-errors", "-C", "-", "--progress-bar", "-A", USER_AGENT, "-o", str(tmp), url]
-    else:
+    if not (have("aria2c") or have("curl")):
         raise DependencyError("Neither aria2c nor curl is installed (pacman -S curl)")
-    cp = run(cmd, check=False, capture=False)
-    if cp.returncode != 0 or not tmp.is_file() or tmp.stat().st_size == 0:
+    failures = []
+    for index, source in enumerate((url, *fallback_urls)):
+        # Different hosts can serve different gzip streams for the same source tree.
+        # Never resume a partial download from one host against another.
+        tmp = dest.with_name(dest.name + (".part" if index == 0 else f".fallback{index}.part"))
+        info(f"Downloading {source}")
+        if have("aria2c") and (index == 0 or not have("curl")):
+            cmd = ["aria2c", "--console-log-level=warn", "--summary-interval=0", "-x8", "-s8", "-k1M", "-c",
+                   "--connect-timeout=10", "--timeout=30", "--max-tries=2", "--auto-file-renaming=false",
+                   "-d", str(dest.parent), "-o", tmp.name, source]
+        else:
+            cmd = ["curl", "-fL", "--connect-timeout", "10", "--retry", "3", "--retry-all-errors", "-C", "-",
+                   "--progress-bar", "-A", USER_AGENT, "-o", str(tmp), source]
+        cp = run(cmd, check=False, capture=False)
+        if cp.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0 and tarfile.is_tarfile(tmp):
+            tmp.replace(dest)
+            return
         tmp.unlink(missing_ok=True)
-        raise NetworkError(f"Download failed ({cp.returncode}): {url}")
-    tmp.replace(dest)
+        tmp.with_name(tmp.name + ".aria2").unlink(missing_ok=True)
+        reason = f"exit {cp.returncode}" if cp.returncode else "missing or invalid archive"
+        failures.append(f"{source} ({reason})")
+        if index < len(fallback_urls):
+            warn(f"Source unavailable; trying alternate archive host")
+    raise NetworkError(f"Download failed: {'; '.join(failures)}")
 
 
 def ensure_kernel_keys() -> bool:
@@ -2484,7 +2496,8 @@ def obtain_tarball(rel: Release, require_signature: bool) -> Path:
     if dest.is_file() and dest.stat().st_size > 0:
         ok(f"Using cached archive {dest.name} ({fmt_bytes(dest.stat().st_size)})")
     else:
-        download(rel.source_url, dest)
+        fallback = (f"https://codeload.github.com/torvalds/linux/tar.gz/refs/tags/v{rel.version}",) if rel.is_rc and rel.source_url.startswith("https://git.kernel.org/torvalds/") else ()
+        download(rel.source_url, dest, fallback)
     verified = False
     if rel.pgp_url:
         match verify_pgp(dest, rel.pgp_url):
@@ -2507,7 +2520,7 @@ def obtain_tarball(rel: Release, require_signature: bool) -> Path:
             verified = True
     if not verified:
         if rel.is_rc:
-            warn("-rc snapshots from git.kernel.org carry no signature or checksum; continuing because allow_rc/pin opted in")
+            warn("-rc source snapshots carry no archive signature or checksum; continuing because allow_rc/pin opted in")
         elif require_signature:
             raise VerifyError(f"Could not verify {dest.name} (no PGP, no SHA256). Set release.require_signature=false to override.")
         else:

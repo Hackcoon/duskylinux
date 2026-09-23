@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 import tempfile
 import tomllib
 import unittest
@@ -74,6 +75,35 @@ class AuditTests(unittest.TestCase):
         with self.assertRaises(k.ProfileError): k.cross_validate(p)
         p.set('release', 'pin', '7.3-rc4'); p.set('release', 'allow_rc', False)
         with self.assertRaises(k.ProfileError): k.cross_validate(p)
+
+    def test_rc_archive_falls_back_to_tagged_source(self):
+        rel = k.Release('7.3-rc4', 'mainline', '', 'https://git.kernel.org/torvalds/t/linux-7.3-rc4.tar.gz', None)
+        with tempfile.TemporaryDirectory() as td, patch.object(k, 'TARBALL_DIR', Path(td)), \
+             patch.object(k, 'expected_sha256', return_value=None), patch.object(k, 'download') as fetch:
+            fetch.side_effect = lambda _url, dest, _fallback: dest.write_bytes(b'archive')
+            self.assertEqual(k.obtain_tarball(rel, False), Path(td) / 'linux-7.3-rc4.tar.gz')
+            self.assertEqual(fetch.call_args.args[2],
+                             ('https://codeload.github.com/torvalds/linux/tar.gz/refs/tags/v7.3-rc4',))
+
+    def test_download_fallback_uses_separate_partial_file(self):
+        with tempfile.TemporaryDirectory() as td, patch.object(k, 'have', return_value=True):
+            dest = Path(td) / 'linux-7.3-rc4.tar.gz'
+            def fake_run(cmd, **_kwargs):
+                if cmd[0] == 'aria2c':
+                    (Path(td) / (dest.name + '.part')).write_bytes(b'incomplete')
+                    return subprocess.CompletedProcess(cmd, 2)
+                self.assertEqual(cmd[0], 'curl')
+                fallback_part = Path(cmd[cmd.index('-o') + 1])
+                self.assertEqual(fallback_part.name, dest.name + '.fallback1.part')
+                with tarfile.open(fallback_part, 'w:gz') as archive:
+                    marker = tarfile.TarInfo('linux-7.3-rc4/')
+                    marker.type = tarfile.DIRTYPE
+                    archive.addfile(marker)
+                return subprocess.CompletedProcess(cmd, 0)
+            with patch.object(k, 'run', side_effect=fake_run):
+                k.download('https://git.kernel.org/example', dest, ('https://codeload.github.com/example',))
+            self.assertTrue(tarfile.is_tarfile(dest))
+            self.assertFalse((Path(td) / (dest.name + '.part')).exists())
 
     def test_future_cpu_names_are_not_allowlisted(self):
         p = profile(); p.set('cpu', 'arch', 'futurecpu2030')
