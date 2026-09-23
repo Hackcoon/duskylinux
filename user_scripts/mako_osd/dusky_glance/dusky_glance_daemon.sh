@@ -1084,8 +1084,9 @@ case "$MODE" in
                 exit 0
             fi
             left=$((target_epoch - now))
-            format_time time_str "$left"
-            send_osd "A $time_str"
+            alarm_mins=$(((left + 59) / 60))
+            printf -v time_str '%02d:%02d' "$((alarm_mins / 60))" "$((alarm_mins % 60))"
+            send_osd "$time_str"
             sleep 1
         done ;;
 
