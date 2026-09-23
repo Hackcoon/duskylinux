@@ -1,1876 +1,1820 @@
 #!/usr/bin/env python3
 # =============================================================================
-#  Dusky RAM Analyzer & Balloon Benchmark  -  v2.8 (Arch Linux Bleeding-Edge)
-#  Target : Arch Linux (rolling) | Python 3.14+ | Linux 7.x | Textual 8.x+
-#  Scope  : Interactive mouse-driven & keyboard-driven TUI for ZRAM / Memory
-#           forensics and multi-category synthetic memory pressure ballooning:
-#           - [1] Dormant Anon (cold swap candidate, direct MADV_PAGEOUT to ZRAM)
-#           - [2] Active Anon (foreground persistent memory, periodic page touch)
-#           - [3] Clean Page Cache (reclaimable file cache, disk-backed fsync)
-#           - [4] Dirty Page Cache (unflushed disk writes, writeback testing)
-#           - [5] Shmem / Tmpfs (/dev/shm shared memory)
-#           - [6] Thrash / Stress (rapid cyclic anon memory pressure & thrash test)
+#  Dusky RAM Analyzer & Balloon Benchmark  -  v3.0 (Arch Linux bleeding-edge)
+#  Target : Arch Linux (rolling) | Linux 7.2+ | Python 3.14+ | Textual 8.x
+#  Scope  : Live ZRAM / reclaim / PSI / writeback forensics plus synthetic,
+#           multi-category memory-pressure ballooning:
+#             [1] Dormant Anon  MADV_COLD at birth, MADV_PAGEOUT on demand
+#             [2] Active Anon   kept hot: one store per page every 1.5 s
+#             [3] Clean Cache   O_TMPFILE page cache, fdatasync'd (clean)
+#             [4] Dirty Cache   O_TMPFILE page cache, re-dirtied every 1.5 s
+#             [5] Shmem         memfd (tmpfs/shmem) pages, swap-backed
+#             [6] Thrash        continuous store-per-page cycling through swap
+#  Threads: Textual UI loop | sampler | balloon owner | pressure loop.
+#           Page-granular work runs inside the kernel with the GIL released
+#           (ctypes madvise/memmove, os.pwritev, os.fdatasync); Python issues
+#           O(size / 8 MiB) calls instead of O(size / 4 KiB) bytecode loops.
 # =============================================================================
 
 import argparse
-import atexit
 import ctypes
-import ctypes.util
+import errno
+import heapq
 import json
+import mmap
 import os
+import pwd
+import queue
 import re
+import select
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 try:
-    import mmap
-    from rich.markup import escape
-    from rich.panel import Panel
-    from rich.table import Table
+    from rich.segment import Segment
+    from rich.style import Style
     from rich.text import Text
     from textual import events, on
     from textual.app import App, ComposeResult
     from textual.binding import Binding
+    from textual.color import Color
     from textual.containers import Container, Horizontal, VerticalScroll
+    from textual.message import Message
     from textual.screen import ModalScreen
-    from textual.widgets import Button, Label, Static
+    from textual.strip import Strip
+    from textual.theme import Theme
+    from textual.widget import Widget
+    from textual.widgets import Button, Static
 except ImportError as exc:
     raise SystemExit(
         f"[fatal] missing dependency: {exc.name}\n"
         "        sudo pacman -S --needed python-textual python-rich"
     )
 
-PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
-MIB = 1048576
-MISSING = "\x00missing"      # sentinel: absent / unreadable
-DENIED = "\x00denied"        # sentinel: exists but needs root
+# --------------------------------------------------------------------------- #
+#  constants & kernel ABI                                                     #
+# --------------------------------------------------------------------------- #
+PAGE = mmap.PAGESIZE
+MIB = 1 << 20
+TEMPLATE = 2 * MIB            # 512 distinct pages; stays cache-hot while replicated
+SLICE = 8 * MIB               # pressure-loop unit: bounds per-step lock and GIL hold
+IOV_SPAN = 512 * MIB          # bytes per pwritev(2) call (256 iovecs, far below IOV_MAX)
+TOUCH_PERIOD = 1.5            # active-anon touch / dirty re-dirty cadence (s)
+THRASH_PAUSE = 0.02           # pause between thrash block passes (s)
+STATS_PERIOD = 2.0            # balloon residency (mincore/cachestat) cadence (s)
+TOP_N = 7
+MISSING, DENIED = "\x00missing", "\x00denied"
+CATS = ("dormant", "active", "clean", "dirty", "shmem", "thrash")
 
-# C library bindings for kernel memory advice
-libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-libc.madvise.restype = ctypes.c_int
+MADV_COLD, MADV_PAGEOUT, MADV_POPULATE_WRITE = 20, 21, 23   # uapi asm-generic/mman-common.h
+PR_SET_VMA, PR_SET_VMA_ANON_NAME = 0x53564D41, 0           # uapi linux/prctl.h (5.17+)
+MFD_NOEXEC_SEAL = 0x0008                                   # uapi linux/memfd.h (6.3+)
+NR_CACHESTAT = 451                                         # asm-generic unistd (6.5+)
 
-MADV_COLD = 20
-MADV_PAGEOUT = 21
+# dlopen(NULL): glibc is already mapped -> no ctypes.util.find_library() ldconfig fork.
+# CDLL calls release the GIL for their whole duration (mmap.madvise() does not).
+_libc = ctypes.CDLL(None, use_errno=True)
+_libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+_libc.madvise.restype = ctypes.c_int
+_libc.mincore.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
+_libc.mincore.restype = ctypes.c_int
+_libc.prctl.restype = ctypes.c_int
+_libc.syscall.restype = ctypes.c_long
+_memmove = ctypes.memmove                                  # CFUNCTYPE -> GIL released
+_LSB = bytes(i & 1 for i in range(256))                    # mincore(2): only bit 0 is defined
 
 
-# ============================================================================
-#  Dynamic Matugen Theme Compiler
-# ============================================================================
-def load_theme() -> dict[str, str]:
-    """Loads the user's Matugen-generated theme with bulletproof fallback mechanisms."""
-    path = Path.home() / ".config" / "matugen" / "generated" / "dusky_tui.json"
-    defaults: dict[str, str] = {
-        "bg": "#191113",
-        "fg": "#efdfe1",
-        "accent": "#ffb1c8",
-        "error": "#ffb4ab",
-        "warning": "#e3bdc6",
-        "success": "#efbd94",
-        "muted": "#514347",
-    }
-    if path.exists():
+class _CacheRange(ctypes.Structure):
+    _fields_ = [("off", ctypes.c_uint64), ("len", ctypes.c_uint64)]
+
+
+class _CacheStat(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_uint64) for n in ("cache", "dirty", "writeback", "evicted", "recent")]
+
+
+def madvise(addr: int, length: int, advice: int) -> int:
+    """GIL-free madvise(2). Returns 0 or errno."""
+    return 0 if _libc.madvise(addr, length, advice) == 0 else ctypes.get_errno()
+
+
+def name_vma(addr: int, length: int, name: bytes) -> None:
+    """Label an anonymous VMA -> '[anon:<name>]' in /proc/PID/{maps,smaps}. Best effort."""
+    _libc.prctl(PR_SET_VMA, ctypes.c_ulong(PR_SET_VMA_ANON_NAME), ctypes.c_ulong(addr),
+                ctypes.c_ulong(length), ctypes.c_char_p(name))
+
+
+# --------------------------------------------------------------------------- #
+#  Matugen theme                                                              #
+# --------------------------------------------------------------------------- #
+_THEME_DEFAULTS = {
+    "bg": "#191113", "fg": "#efdfe1", "accent": "#ffb1c8", "error": "#ffb4ab",
+    "warning": "#e3bdc6", "success": "#efbd94", "muted": "#514347",
+}
+
+
+def _config_home() -> Path:
+    if xdg := os.environ.get("XDG_CONFIG_HOME"):
+        return Path(xdg)
+    if os.geteuid() == 0 and (user := os.environ.get("SUDO_USER")):
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                user_theme = json.load(f)
-                return {k: str(user_theme.get(k, defaults[k])) for k in defaults}
+            return Path(pwd.getpwnam(user).pw_dir) / ".config"   # keep the invoking user's theme
+        except KeyError:
+            pass
+    return Path.home() / ".config"
+
+
+def load_theme() -> dict[str, str]:
+    try:
+        raw = json.loads((_config_home() / "matugen/generated/dusky_tui.json").read_bytes())
+    except (OSError, ValueError):
+        raw = {}
+    theme = {}
+    for key, default in _THEME_DEFAULTS.items():
+        try:
+            theme[key] = Color.parse(str(raw.get(key, default))).hex   # reject values Textual CSS can't parse
         except Exception:
-            return defaults
-    return defaults
+            theme[key] = default
+    return theme
 
 
 THEME = load_theme()
-BG = THEME["bg"]
-FG = THEME["fg"]
-ACCENT = THEME["accent"]
-ERROR = THEME["error"]
-WARNING = THEME["warning"]
-SUCCESS = THEME["success"]
-MUTED = THEME["muted"]
+BG, FG, ACCENT, ERROR, WARNING, SUCCESS, MUTED = (
+    THEME[k] for k in ("bg", "fg", "accent", "error", "warning", "success", "muted"))
+
+# Pre-built Rich styles: rows are Segment tuples, so the render path never parses markup.
+K = Style(color=FG, bold=True)
+V = Style(color=SUCCESS)
+D = Style(dim=True)
+FGS = Style(color=FG)
+FGB = Style(color=FG, bold=True)
+A = Style(color=ACCENT)
+AB = Style(color=ACCENT, bold=True)
+AD = Style(color=ACCENT, dim=True)
+W = Style(color=WARNING)
+WB = Style(color=WARNING, bold=True)
+E = Style(color=ERROR)
+EB = Style(color=ERROR, bold=True)
+OK = Style(color=SUCCESS)
+OKB = Style(color=SUCCESS, bold=True)
+M = Style(color=MUTED)
+CRIT = Style(color="#ffffff", bgcolor=ERROR, bold=True)
+
+Row = tuple[tuple[Segment, ...], tuple[Segment, ...]]
+GAP: Row = ((), ())
+
+
+def t(text: str, style: Style = V) -> Segment:
+    return Segment(text, style)
+
+
+def L(label: str, note: str = "", style: Style = K) -> tuple[Segment, ...]:
+    return (Segment(label, style), Segment(f" ({note})", D)) if note else (Segment(label, style),)
+
+
+def R(*parts: Segment | str) -> tuple[Segment, ...]:
+    return tuple(p if isinstance(p, Segment) else Segment(p, V) for p in parts)
+
+
+def fmt_bytes(n: float | None) -> str:
+    if n is None:
+        return "n/a"
+    v = float(n)
+    if abs(v) < 1024.0:
+        return f"{v:.0f} B"
+    for unit in ("KiB", "MiB", "GiB", "TiB"):
+        v /= 1024.0
+        if abs(v) < 1024.0:
+            return f"{v:.2f} {unit}"
+    return f"{v / 1024.0:.2f} PiB"
+
+
+def bar(frac: float, width: int = 16) -> tuple[Segment, ...]:
+    f = min(max(frac, 0.0), 1.0)
+    n = round(f * width)
+    return (Segment("█" * n, OK if f < 0.70 else W if f < 0.90 else E), Segment("░" * (width - n), M))
+
+
+def grade(v: float, lo: float, hi: float) -> Style:
+    return OK if v < lo else W if v < hi else EB
+
+
+def cell(value: str, style: Style | None = None) -> tuple[Segment, ...]:
+    if value == MISSING:
+        return (t("n/a", D),)
+    if value == DENIED:
+        return (t("root only", D),)
+    return (t(value, style or V),)
 
 
 # --------------------------------------------------------------------------- #
-#  privilege escalation (opt-in via --root)                                   #
+#  procfs / sysfs access: persistent fds, one pread(2) per sample             #
 # --------------------------------------------------------------------------- #
+class KFile:
+    """Persistent read-only fd. seq_file (procfs, PSI) and kernfs (sysfs, cgroupfs)
+    regenerate content on every read at offset 0, so each sample is exactly one
+    pread(2): no openat/fstat/close, no Python file-object construction."""
+
+    __slots__ = ("path", "fd", "cap")
+
+    def __init__(self, path: str, cap: int = 4096) -> None:
+        self.path, self.cap = path, cap
+        self.fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+
+    @classmethod
+    def maybe(cls, path: str, cap: int = 4096) -> "KFile | None":
+        try:
+            return cls(path, cap)
+        except OSError:
+            return None
+
+    @classmethod
+    def state(cls, path: str, cap: int = 256) -> "KFile | str":
+        try:
+            return cls(path, cap)
+        except PermissionError:
+            return DENIED
+        except OSError:
+            return MISSING
+
+    def read(self) -> bytes:
+        while len(data := os.pread(self.fd, self.cap, 0)) >= self.cap:
+            self.cap *= 2                        # content outgrew the buffer: retry larger
+        return data
+
+    def text(self) -> str:
+        try:
+            return self.read().strip().decode(errors="replace")
+        except PermissionError:
+            return DENIED
+        except OSError:
+            return MISSING
+
+    def close(self) -> None:
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+_MEM_RE = re.compile(rb"^([^:\n]+):\s+(\d+)( kB)?$", re.M)
+_PSI_RE = re.compile(rb"^(some|full) avg10=([\d.]+) avg60=([\d.]+) avg300=([\d.]+) total=(\d+)", re.M)
+VM_KEYS = ("pswpin", "pswpout", "pgmajfault", "oom_kill", "pgscan_kswapd", "pgscan_direct",
+           "pgsteal_kswapd", "pgsteal_direct", "compact_stall",
+           "workingset_refault_anon", "workingset_refault_file")
+_VM_RE = re.compile(rb"^(" + b"|".join(k.encode() for k in VM_KEYS) + rb") (\d+)$", re.M)
+_SEL_RE = re.compile(r"\[([^\]]+)\]")
+
+Psi = dict[str, tuple[float, float, float, int]]   # "some"/"full" -> (avg10, avg60, avg300, total_us)
+
+
+def parse_meminfo(data: bytes) -> dict[str, int]:
+    return {k.decode(): int(v) << 10 if kb else int(v) for k, v, kb in _MEM_RE.findall(data)}
+
+
+def parse_vmstat(data: bytes) -> dict[str, int]:
+    return {k.decode(): int(v) for k, v in _VM_RE.findall(data)}
+
+
+def parse_psi(data: bytes) -> Psi:
+    return {k.decode(): (float(a), float(b), float(c), int(tot)) for k, a, b, c, tot in _PSI_RE.findall(data)}
+
+
+def selected(raw: str) -> str:
+    """'lzo [zstd] lz4' -> 'zstd' (sentinels pass through)."""
+    if raw in (MISSING, DENIED):
+        return raw
+    m = _SEL_RE.search(raw)
+    return m.group(1) if m else raw
+
+
+@dataclass(slots=True, frozen=True)
+class SwapSplit:
+    zram_total: int = 0
+    zram_used: int = 0
+    disk_total: int = 0
+    disk_used: int = 0
+
+
+def parse_swaps(data: bytes) -> tuple[SwapSplit, frozenset[str]]:
+    zt = zu = dt = du = 0
+    devs = []
+    for line in data.splitlines()[1:]:
+        f = line.split()
+        if len(f) < 5:
+            continue
+        name = f[0].decode(errors="replace")
+        size, used = int(f[2]) << 10, int(f[3]) << 10
+        devs.append(name)
+        if name.startswith("/dev/zram"):
+            zt, zu = zt + size, zu + used
+        else:
+            dt, du = dt + size, du + used
+    return SwapSplit(zt, zu, dt, du), frozenset(devs)
+
+
+def parse_mounts(data: bytes) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for line in data.splitlines():
+        if line.startswith(b"/dev/zram"):
+            src, mnt = line.split(b" ", 2)[:2]
+            out[src.decode()] = mnt.decode(errors="replace").replace("\\040", " ")
+    return out
+
+
+class RateMeter:
+    """Per-second deltas of monotonic counters (vmstat events, PSI total µs).
+    Spans shorter than 250 ms (forced refreshes) reuse the previous rates instead of
+    amplifying counter quantisation noise."""
+
+    __slots__ = ("prev", "stamp", "rates")
+
+    def __init__(self) -> None:
+        self.prev: dict[str, float] | None = None
+        self.stamp = 0.0
+        self.rates: dict[str, float] = {}
+
+    def update(self, sample: dict[str, float], now: float) -> dict[str, float]:
+        if self.prev is not None:
+            span = now - self.stamp
+            if span < 0.25:
+                return self.rates
+            prev = self.prev
+            self.rates = {k: (v - p) / span for k, v in sample.items()
+                          if (p := prev.get(k)) is not None and v >= p}
+        self.prev, self.stamp = sample, now
+        return self.rates
+
+
+def pick_cgroup() -> tuple[str, KFile | None]:
+    """Our own cgroup-v2 chain (balloons are charged here): prefer the user@UID.service
+    ancestor (systemd-oomd's usual ManagedOOMMemoryPressure target), else the nearest slice.
+    Under sudo the process stays in the invoking user's scope, so this also holds for --root."""
+    try:
+        rel = next(line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines()
+                   if line.startswith("0::"))
+    except (OSError, StopIteration):
+        return "", None
+    parts = [p for p in rel.split("/") if p]
+    chain = ["/".join(parts[:i]) for i in range(len(parts), 0, -1)]
+    pick = (next((c for c in chain if c.rsplit("/", 1)[-1].startswith("user@")), None)
+            or next((c for c in chain if c.endswith(".slice")), None)
+            or (chain[0] if chain else None))
+    if pick is None:
+        return "", None
+    kf = KFile.maybe(f"/sys/fs/cgroup/{pick}/memory.pressure", 512)
+    return (pick.rsplit("/", 1)[-1], kf) if kf else ("", None)
+
+
+def _status_field(buf: bytes, key: bytes) -> bytes:
+    i = buf.find(key)
+    if i < 0:
+        return b""
+    j = buf.find(b"\n", i + len(key))
+    return buf[i + len(key): j if j >= 0 else None].strip()
+
+
+def scan_top(limit: int = TOP_N) -> list[tuple[int, int, int, str]]:
+    """Rank every process by /proc/PID/statm (tiny, cheap kernel format), then read the
+    expensive /proc/PID/status (name + VmSwap) only for the top `limit` winners."""
+    ranked: list[tuple[int, int]] = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            fd = os.open(f"/proc/{name}/statm", os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            fields = os.read(fd, 256).split(maxsplit=2)
+        except OSError:
+            continue
+        finally:
+            os.close(fd)
+        if len(fields) >= 2 and (rss := int(fields[1])):
+            ranked.append((rss, int(name)))
+    rows = []
+    for rss, pid in heapq.nlargest(limit, ranked):
+        try:
+            fd = os.open(f"/proc/{pid}/status", os.O_RDONLY)
+            try:
+                st = os.read(fd, 16384)
+            finally:
+                os.close(fd)
+        except OSError:
+            continue
+        swap = _status_field(st, b"\nVmSwap:").split()
+        rows.append((rss * PAGE, int(swap[0]) << 10 if swap else 0, pid,
+                     _status_field(st, b"Name:").decode(errors="replace")))
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+#  systemd-oomd model (oomd.conf [OOM] + systemd 261 *.oomrule rulesets)      #
+# --------------------------------------------------------------------------- #
+SYSTEMD_DIRS = ("/etc/systemd", "/run/systemd", "/usr/local/lib/systemd", "/usr/lib/systemd")
+OOMD_UNIT_LINK = "/run/systemd/units/invocation:systemd-oomd.service"
+OOMD_CGROUP = "/sys/fs/cgroup/system.slice/systemd-oomd.service"
+
+
+@dataclass(slots=True, frozen=True)
+class OomRule:
+    name: str
+    swap_max: float | None
+    psi_above: float | None
+    lasting: float
+    action: str
+
+
+@dataclass(slots=True, frozen=True)
+class OomdConf:
+    swap_limit: float = 0.90        # SwapUsedLimit: memory AND swap used fraction must exceed
+    psi_limit: float = 0.60         # DefaultMemoryPressureLimit: cgroup PSI "full avg10"
+    psi_duration: float = 30.0      # DefaultMemoryPressureDurationSec
+    rules: tuple[OomRule, ...] = ()
+
+
+def oomd_active() -> bool:
+    """Two stat(2) calls; systemd maintains both while the unit runs (no /proc walk)."""
+    return os.path.lexists(OOMD_UNIT_LINK) or os.path.isdir(OOMD_CGROUP)
+
+
+def _ini(path: str, section: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        text = Path(path).read_text(errors="replace")
+    except OSError:
+        return out
+    cur = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line[0] in "#;":
+            continue
+        if line[0] == "[" and line[-1] == "]":
+            cur = line[1:-1].strip()
+        elif cur == section and "=" in line:
+            k, _, v = line.partition("=")
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _dropins(sub: str, suffix: str) -> list[str]:
+    """systemd drop-in semantics: same file name -> highest-priority dir wins, symlink to
+    /dev/null masks, surviving files are applied in lexicographic order."""
+    seen: dict[str, str] = {}
+    for d in SYSTEMD_DIRS:
+        try:
+            names = os.listdir(f"{d}/{sub}")
+        except OSError:
+            continue
+        for n in names:
+            if n.endswith(suffix):
+                seen.setdefault(n, f"{d}/{sub}/{n}")
+    return [p for n in sorted(seen) if os.path.realpath(p := seen[n]) != "/dev/null"]
+
+
+def _frac(v: str | None) -> float | None:
+    if not v:
+        return None
+    v = v.strip()
+    for suffix, div in (("%", 1e2), ("‰", 1e3), ("‱", 1e4)):
+        if v.endswith(suffix):
+            try:
+                return float(v[: -len(suffix)]) / div
+            except ValueError:
+                return None
+    return None
+
+
+_SPAN_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([a-z]*)")
+_SPAN_UNITS = {"": 1.0, "s": 1.0, "sec": 1.0, "second": 1.0, "seconds": 1.0, "ms": 1e-3,
+               "msec": 1e-3, "us": 1e-6, "usec": 1e-6, "m": 60.0, "min": 60.0, "minute": 60.0,
+               "minutes": 60.0, "h": 3600.0, "hr": 3600.0, "hour": 3600.0, "hours": 3600.0}
+
+
+def _span(v: str | None, default: float) -> float:
+    if not v:
+        return default
+    total = 0.0
+    for num, unit in _SPAN_RE.findall(v.lower()):
+        if unit not in _SPAN_UNITS:
+            return default
+        total += float(num) * _SPAN_UNITS[unit]
+    return total or default
+
+
+def load_oomd_conf() -> OomdConf:
+    main = next((p for d in SYSTEMD_DIRS if os.path.isfile(p := f"{d}/oomd.conf")), None)
+    kv = _ini(main, "OOM") if main else {}
+    for p in _dropins("oomd.conf.d", ".conf"):
+        kv.update(_ini(p, "OOM"))
+    rules = []
+    for p in _dropins("oomd/rules.d", ".oomrule"):
+        r = _ini(p, "Rule")
+        swap, psi, act = _frac(r.get("SwapUsageMax")), _frac(r.get("MemoryPressureAbove")), r.get("Action", "")
+        if act and (swap is not None or psi is not None):       # oomd ignores incomplete rules
+            rules.append(OomRule(Path(p).stem, swap, psi, _span(r.get("LastingSec"), 0.0), act))
+    swap_limit, psi_limit = _frac(kv.get("SwapUsedLimit")), _frac(kv.get("DefaultMemoryPressureLimit"))
+    return OomdConf(
+        swap_limit=0.90 if swap_limit is None else swap_limit,
+        psi_limit=0.60 if psi_limit is None else psi_limit,
+        psi_duration=_span(kv.get("DefaultMemoryPressureDurationSec"), 30.0),
+        rules=tuple(rules),
+    )
+
+
+# --------------------------------------------------------------------------- #
+#  panel row builders (pure; executed on the sampler thread)                  #
+# --------------------------------------------------------------------------- #
+def rows_memory(mem: dict[str, int], sw: SwapSplit) -> list[Row]:
+    if not mem:
+        return [(L("/proc/meminfo unreadable", style=EB), ())]
+    g = mem.get
+    total, avail = g("MemTotal", 0), g("MemAvailable", 0)
+    used = max(total - avail, 0)
+    uf = used / total if total else 0.0
+    shmem, dirty = g("Shmem", 0), g("Dirty", 0)
+    st = g("SwapTotal", 0)
+    su = max(st - g("SwapFree", 0), 0)
+    sf = su / st if st else 0.0
+    rows = [
+        (L("Total physical RAM"), R(t(fmt_bytes(total), FGB))),
+        (L("Used", "Total − Available"), R(fmt_bytes(used), t(f" ({uf:.1%})", D))),
+        ((), bar(uf)),
+        (L("Available", "reclaim headroom"), R(t(fmt_bytes(avail), OKB))),
+        (L("Free", "strict"), R(fmt_bytes(g("MemFree", 0)))),
+        (L("  ↳ Anon pages"), R(fmt_bytes(g("AnonPages", 0)))),
+        (L("  ↳ File cache", "Cached − Shmem"), R(fmt_bytes(max(g("Cached", 0) - shmem, 0)))),
+        (L("  ↳ Shmem / tmpfs / memfd"), R(fmt_bytes(shmem))),
+        (L("  ↳ Buffers + SReclaimable"), R(fmt_bytes(g("Buffers", 0) + g("SReclaimable", 0)))),
+        (L("  ↳ Dirty / Writeback"),
+         R(t(fmt_bytes(dirty), WB if dirty > 64 * MIB else V), t(" / ", D), fmt_bytes(g("Writeback", 0)))),
+        (L("  ↳ Unevictable / Mlocked"),
+         R(fmt_bytes(g("Unevictable", 0)), t(" / ", D), fmt_bytes(g("Mlocked", 0)))),
+        GAP,
+        (L("Swap total"), R(t(fmt_bytes(st), FGB))),
+        (L("Swap used"), R(fmt_bytes(su), t(f" ({sf:.1%})", D))),
+        ((), bar(sf)),
+        (L("  ↳ ZRAM swap pool"), R(t(f"{fmt_bytes(sw.zram_used)} / {fmt_bytes(sw.zram_total)}", A))),
+        (L("  ↳ Disk swap spillover"),
+         R(t(f"{fmt_bytes(sw.disk_used)} / {fmt_bytes(sw.disk_total)}", EB if sw.disk_used else V))),
+        (L("  ↳ SwapCached"), R(fmt_bytes(g("SwapCached", 0)))),
+    ]
+    if g("Zswap"):
+        rows.append((L("  ↳ Zswap pool / stored"), R(f"{fmt_bytes(g('Zswap'))} / {fmt_bytes(g('Zswapped', 0))}")))
+    return rows
+
+
+def _live(rates: dict[str, float], key: str) -> float:
+    return min(100.0, rates.get(key, 0.0) / 1e4)          # Δµs stalled per s -> percent
+
+
+def rows_pressure(psi: dict[str, Psi], cg: Psi, cg_label: str, rates: dict[str, float],
+                  vm: dict[str, int], active: bool, conf: OomdConf,
+                  risk: tuple[str, Style, str], session_kills: int) -> list[Row]:
+    rows: list[Row] = []
+    if m := psi.get("memory"):
+        for kind, lo, hi in (("some", 5.0, 20.0), ("full", 1.0, 10.0)):
+            a10, a60, a300, _ = m.get(kind, (0.0, 0.0, 0.0, 0))
+            live = _live(rates, f"memory.{kind}")
+            st = grade(max(a10, live), lo, hi)
+            rows.append((L(f"Memory PSI {kind}", "live · 10/60/300 s"),
+                         R(t(f"{live:4.1f}%", st), t(" · ", D), t(f"{a10:.2f}", st), f"/{a60:.2f}/{a300:.2f}")))
+    else:
+        rows.append((L("Pressure (PSI)"), R(t("unavailable (CONFIG_PSI / psi=0)", D))))
+    if c := psi.get("cpu"):
+        a10, a60, _, _ = c.get("some", (0.0, 0.0, 0.0, 0))
+        live = _live(rates, "cpu.some")
+        st = grade(max(a10, live), 15.0, 50.0)
+        rows.append((L("CPU PSI some", "contention"), R(t(f"{live:4.1f}%", st), t(" · ", D), t(f"{a10:.2f}", st), f"/{a60:.2f}")))
+    if io := psi.get("io"):
+        s10, f10 = io.get("some", (0.0,))[0], io.get("full", (0.0,))[0]
+        rows.append((L("I/O PSI some / full", "disk / swap"),
+                     R(f"{_live(rates, 'io.some'):4.1f}%", t(" · ", D), f"{s10:.2f}", t(" some / ", D), f"{f10:.2f}", t(" full", D))))
+    if cg:
+        s10, f10 = cg.get("some", (0.0,))[0], cg.get("full", (0.0,))[0]
+        st = grade(f10, 10.0, conf.psi_limit * 100.0)
+        rows.append((L("cgroup PSI", cg_label),
+                     R(f"{_live(rates, 'cg.some'):4.1f}% some", t(" · ", D), t(f"full {_live(rates, 'cg.full'):4.1f}%", st),
+                       t(" · avg10 ", D), f"{s10:.2f}/", t(f"{f10:.2f}", st))))
+    rows.append(GAP)
+    sin, sout = rates.get("pswpin", 0.0) * PAGE, rates.get("pswpout", 0.0) * PAGE
+    rows.append((L("Swap I/O", "in=decompress / out=compress"),
+                 R(f"in {fmt_bytes(sin)}/s", t(" · ", D), t(f"out {fmt_bytes(sout)}/s", AB))))
+    direct, kswapd = rates.get("pgscan_direct", 0.0), rates.get("pgscan_kswapd", 0.0)
+    rows.append((L("Reclaim scan", "direct / kswapd"),
+                 R(t(f"{direct:.0f}/s direct", EB if direct else V), t(" · ", D), f"{kswapd:.0f}/s kswapd")))
+    rows.append((L("Reclaim steal", "direct / kswapd"),
+                 R(f"{rates.get('pgsteal_direct', 0.0):.0f}/s", t(" · ", D), f"{rates.get('pgsteal_kswapd', 0.0):.0f}/s")))
+    ra, rf = rates.get("workingset_refault_anon", 0.0), rates.get("workingset_refault_file", 0.0)
+    rows.append((L("Refaults", "anon / file"), R(t(f"{ra:.0f}/s", WB if ra > 1000 else V), t(" · ", D), f"{rf:.0f}/s")))
+    rows.append((L("Major faults · compaction stalls"),
+                 R(f"{rates.get('pgmajfault', 0.0):.0f}/s", t(" · ", D), f"{rates.get('compact_stall', 0.0):.0f}/s")))
+    rows.append(GAP)
+    rows.append((L("systemd-oomd"),
+                 R(t("active", OKB) if active else t("inactive", D),
+                   t(f" · swap>{conf.swap_limit:.0%} (mem∧swap) · full>{conf.psi_limit:.0%}/{conf.psi_duration:.0f}s", D))))
+    for r in conf.rules[:3]:
+        cond = [f"swap>{r.swap_max:.0%}"] if r.swap_max is not None else []
+        if r.psi_above is not None:
+            cond.append(f"full>{r.psi_above:.0%}")
+        lasting = f" {r.lasting:.0f}s" if r.lasting else ""
+        rows.append((L(f"  ↳ rule {r.name}", style=FGS), R(t(f"{' ∧ '.join(cond)}{lasting} → {r.action}", D))))
+    level, style, why = risk
+    rows.append((L("OOM risk", "oomd model"), R(t(f" {level} ", style), t(f" {why}", D))))
+    boot = vm.get("oom_kill", 0)
+    rows.append((L("Kernel OOM kills"),
+                 R(t(str(boot), EB if boot else V), t(" boot · ", D), t(f"+{session_kills}", EB if session_kills else V), t(" session", D))))
+    return rows
+
+
+def rows_procs(procs: list[tuple[int, int, int, str]], total: int) -> list[Row]:
+    rows: list[Row] = [((t(f"{'PID':>7}  PROCESS", D),), (t(f"{'RSS':>10} {'SWAP':>10} {'%':>5}", D),))]
+    for rss, swap, pid, name in procs:
+        rows.append(((t(f"{pid:>7}  ", AD), t(name[:24], FGB)),
+                     (t(f"{fmt_bytes(rss):>10} ", W), t(f"{fmt_bytes(swap) if swap else '-':>10} ", AB if swap else D),
+                      t(f"{rss / total * 100.0 if total else 0.0:5.1f}", E))))
+    if not procs:
+        rows.append((L("scanning /proc …", style=D), ()))
+    return rows
+
+
+@dataclass(slots=True, frozen=True)
+class ZStat:
+    name: str
+    role: str
+    algo: str
+    disksize: int
+    orig: int          # orig_data_size   (bytes, includes same-filled pages)
+    compr: int         # compr_data_size  (bytes, huge pages count PAGE_SIZE each)
+    used: int          # mem_used_total   (bytes, incl. zsmalloc fragmentation/metadata)
+    limit: int         # mem_limit
+    peak: int          # mem_used_max
+    same: int          # same_pages      -> bytes
+    compacted: int     # pages_compacted -> bytes (cumulative)
+    huge: int          # huge_pages      -> bytes
+
+
+def _codec_ratio(orig: int, compr: int, same: int, huge: int) -> float:
+    """Compression ratio over pages that were actually compressed: same-filled pages add
+    to orig but cost no compressed bytes; huge pages are stored raw (PAGE_SIZE each)."""
+    num, den = orig - same - huge, compr - huge
+    return num / den if num > 0 and den > 0 else 0.0
+
+
+def rows_zram(devs: list[ZStat]) -> list[Row]:
+    if not devs:
+        return [(L("No ZRAM devices detected", style=D), ()),
+                (L("enable", style=D), R(t("systemctl start systemd-zram-setup@zram0", D)))]
+    rows: list[Row] = []
+    for i, d in enumerate(devs):
+        if i:
+            rows.append(GAP)
+        rows.append(((t(f"/dev/{d.name}", AB), t(f" {d.role}", W)), R(t(f"{d.algo} · {fmt_bytes(d.disksize)}", D))))
+        if not d.orig:
+            rows.append((L("  empty", style=D), R(t("0 B stored", D))))
+            continue
+        rows.append((L("  Stored → compressed"),
+                     R(f"{fmt_bytes(d.orig)} → {fmt_bytes(d.compr)}",
+                       t(f" ({_codec_ratio(d.orig, d.compr, d.same, d.huge):.2f}× codec)", D))))
+        rows.append((L("  RAM used", "incl. allocator"), R(fmt_bytes(d.used), t(f" ({d.orig / d.used if d.used else 0:.2f}× eff)", D))))
+        rows.append((L("  RAM saved"), R(t(f"+{fmt_bytes(max(d.orig - d.used, 0))}", OKB))))
+        rows.append((L("  Same-filled / huge pages"), R(f"{fmt_bytes(d.same)} / ", t(fmt_bytes(d.huge), WB if d.huge else V))))
+        rows.append((L("  Peak used · limit · compacted"),
+                     R(f"{fmt_bytes(d.peak)} · {fmt_bytes(d.limit) if d.limit else 'none'} · {fmt_bytes(d.compacted)}")))
+    if len(devs) > 1:
+        o, c, u = sum(d.orig for d in devs), sum(d.compr for d in devs), sum(d.used for d in devs)
+        rows.append(GAP)
+        rows.append((L("Total ZRAM pool"), R(t(f"{fmt_bytes(sum(d.disksize for d in devs))} capacity", FGB))))
+        rows.append((L("  Stored → compressed → RAM"), R(f"{fmt_bytes(o)} → {fmt_bytes(c)} → {fmt_bytes(u)}")))
+        rows.append((L("  Effective ratio / saved"),
+                     R(t(f"{o / u if u else 0:.2f}×", OKB), t(" · ", D), t(f"+{fmt_bytes(max(o - u, 0))}", AB))))
+    return rows
+
+
+TUNABLES = {
+    "swappiness": "/proc/sys/vm/swappiness",
+    "page-cluster": "/proc/sys/vm/page-cluster",
+    "watermark_scale_factor": "/proc/sys/vm/watermark_scale_factor",
+    "watermark_boost_factor": "/proc/sys/vm/watermark_boost_factor",
+    "vfs_cache_pressure": "/proc/sys/vm/vfs_cache_pressure",
+    "compaction_proactiveness": "/proc/sys/vm/compaction_proactiveness",
+    "compact_unevictable_allowed": "/proc/sys/vm/compact_unevictable_allowed",
+    "min_free_kbytes": "/proc/sys/vm/min_free_kbytes",
+    "overcommit_memory": "/proc/sys/vm/overcommit_memory",
+    "stat_interval": "/proc/sys/vm/stat_interval",
+    "dirty_writeback_centisecs": "/proc/sys/vm/dirty_writeback_centisecs",
+    "dirty_expire_centisecs": "/proc/sys/vm/dirty_expire_centisecs",
+    "dirty_background_bytes": "/proc/sys/vm/dirty_background_bytes",
+    "dirty_background_ratio": "/proc/sys/vm/dirty_background_ratio",
+    "dirty_bytes": "/proc/sys/vm/dirty_bytes",
+    "dirty_ratio": "/proc/sys/vm/dirty_ratio",
+    "max_map_count": "/proc/sys/vm/max_map_count",
+    "lru_gen": "/sys/kernel/mm/lru_gen/enabled",
+    "lru_gen_ttl": "/sys/kernel/mm/lru_gen/min_ttl_ms",
+    "thp": "/sys/kernel/mm/transparent_hugepage/enabled",
+    "thp_defrag": "/sys/kernel/mm/transparent_hugepage/defrag",
+    "thp_shmem": "/sys/kernel/mm/transparent_hugepage/shmem_enabled",
+    "khuge_ptes_none": "/sys/kernel/mm/transparent_hugepage/khugepaged/max_ptes_none",
+    "zswap": "/sys/module/zswap/parameters/enabled",
+}
+
+
+def _num(raw: str, fmt: Callable[[int], str], style: Style | None = None) -> tuple[Segment, ...]:
+    try:
+        return (t(fmt(int(raw)), style or V),)
+    except ValueError:
+        return cell(raw)
+
+
+def _dirty_limit(v: dict[str, str], stem: str) -> tuple[Segment, ...]:
+    """The kernel uses *_bytes when non-zero, otherwise *_ratio."""
+    try:
+        b = int(v[f"{stem}_bytes"])
+    except ValueError:
+        b = 0
+    return (t(fmt_bytes(b)),) if b else _num(v[f"{stem}_ratio"], lambda x: f"{x}% of dirtyable")
+
+
+def rows_vm(v: dict[str, str]) -> list[Row]:
+    pc, boost, zswap = v["page-cluster"], v["watermark_boost_factor"], v["zswap"]
+    secs = lambda x: f"{x / 100:.1f} s"   # noqa: E731
+    if zswap in (MISSING, DENIED):
+        zcell = cell(zswap)
+    elif zswap.upper().startswith("Y"):
+        zcell = (t("on ", WB), t("(double-compresses in front of ZRAM!)", EB))
+    else:
+        zcell = (t("off", OK), t(" (clean)", D))
+    return [
+        (L("vm.swappiness"), cell(v["swappiness"])),
+        (L("vm.page-cluster", "0 = no swap readahead"), cell(pc, OKB if pc == "0" else WB)),
+        (L("vm.watermark_scale_factor"), cell(v["watermark_scale_factor"])),
+        (L("vm.watermark_boost_factor"), cell(boost, OKB if boost == "0" else None)),
+        (L("vm.vfs_cache_pressure"), cell(v["vfs_cache_pressure"])),
+        (L("vm.compaction_proactiveness"), cell(v["compaction_proactiveness"])),
+        (L("vm.compact_unevictable_allowed"), cell(v["compact_unevictable_allowed"])),
+        (L("vm.min_free_kbytes"), _num(v["min_free_kbytes"], lambda x: fmt_bytes(x << 10))),
+        (L("vm.overcommit_memory"), cell(v["overcommit_memory"])),
+        (L("vm.stat_interval"), _num(v["stat_interval"], lambda x: f"{x} s")),
+        (L("vm.dirty_writeback / expire"),
+         (*_num(v["dirty_writeback_centisecs"], secs), t(" / ", D), *_num(v["dirty_expire_centisecs"], secs))),
+        (L("vm.dirty_background", "writeback starts"), _dirty_limit(v, "dirty_background")),
+        (L("vm.dirty", "writer throttling"), _dirty_limit(v, "dirty")),
+        (L("vm.max_map_count"), _num(v["max_map_count"], lambda x: f"{x:,}")),
+        GAP,
+        (L("mglru.enabled"), cell(v["lru_gen"], OK)),
+        (L("mglru.min_ttl_ms"), cell(v["lru_gen_ttl"])),
+        (L("thp.enabled"), cell(selected(v["thp"]))),
+        (L("thp.defrag"), cell(selected(v["thp_defrag"]))),
+        (L("thp.shmem_enabled"), cell(selected(v["thp_shmem"]))),
+        (L("khugepaged.max_ptes_none"), cell(v["khuge_ptes_none"])),
+        (L("zswap"), zcell),
+    ]
+
+
+# --------------------------------------------------------------------------- #
+#  Sampler thread                                                             #
+# --------------------------------------------------------------------------- #
+class SampleReady(Message):
+    def __init__(self, panels: dict[str, list[Row]]) -> None:
+        super().__init__()
+        self.panels = panels
+
+
+class Toast(Message):
+    def __init__(self, text: str, severity: str = "information", timeout: float = 3.0) -> None:
+        super().__init__()
+        self.text, self.severity, self.timeout = text, severity, timeout
+
+
+class ZDev:
+    __slots__ = ("name", "mm", "ds", "algo_f", "disksize", "algo")
+
+    def __init__(self, name: str) -> None:
+        base = f"/sys/block/{name}"
+        self.name = name
+        self.mm = KFile(f"{base}/mm_stat", 256)
+        self.ds = KFile.maybe(f"{base}/disksize", 64)
+        self.algo_f = KFile.maybe(f"{base}/comp_algorithm", 512)
+        self.disksize, self.algo = 0, "?"
+        self.refresh_meta()
+
+    def refresh_meta(self) -> None:
+        if self.ds:
+            self.disksize = int(self.ds.read() or 0)
+        if self.algo_f:
+            self.algo = selected(self.algo_f.read().decode(errors="replace").strip())
+
+    def close(self) -> None:
+        for kf in (self.mm, self.ds, self.algo_f):
+            if kf:
+                kf.close()
+
+
+class Sampler(threading.Thread):
+    """Fixed-cadence collector. Hot files are persistent fds (one pread each per tick);
+    tunables, zram metadata and the oomd probe run on a 5 s cadence; the process ranking
+    runs every max(2 s, interval). Rows are built here, so the UI thread only swaps them."""
+
+    def __init__(self, post: Callable[[Message], None], interval: float) -> None:
+        super().__init__(name="dusky-sampler", daemon=True)
+        self.post, self.interval = post, interval
+        self.halt, self.kick = threading.Event(), threading.Event()
+        self.slow_every = max(1, round(5.0 / interval))
+        self.scan_every = max(1, round(max(2.0, interval) / interval))
+        self.meminfo = KFile("/proc/meminfo", 8192)
+        self.vmstat = KFile("/proc/vmstat", 16384)
+        self.swaps = KFile("/proc/swaps", 4096)
+        self.psi = {r: f for r in ("memory", "cpu", "io") if (f := KFile.maybe(f"/proc/pressure/{r}", 512))}
+        self.cg_label, self.cg = pick_cgroup()
+        self.mounts = KFile("/proc/self/mounts", 16384)
+        self.poller = select.poll()                      # mount-table changes raise POLLPRI|POLLERR
+        self.poller.register(self.mounts.fd, select.POLLPRI | select.POLLERR)
+        self.mount_map = parse_mounts(self.mounts.read())
+        self.tun = {k: KFile.state(p) for k, p in TUNABLES.items()}
+        self.tun_vals: dict[str, str] | None = None
+        self.zdevs: dict[str, ZDev] = {}
+        self.zdirty = True
+        self.rates = RateMeter()
+        self.oomd_on = oomd_active()
+        self.oomd = load_oomd_conf()
+        self.oom_base: int | None = None
+        self.over_since: float | None = None
+        self.last_error = ""
+
+    def run(self) -> None:
+        tick, deadline = 0, time.monotonic()
+        while not self.halt.is_set():
+            forced = self.kick.is_set()
+            self.kick.clear()
+            try:
+                panels = self.sample(forced or tick % self.slow_every == 0,
+                                     forced or tick % self.scan_every == 0, forced)
+            except Exception as exc:                     # keep sampling; report each new error once
+                if (msg := f"sampler: {exc!r}") != self.last_error:
+                    self.last_error = msg
+                    self.post(Toast(msg, "error", 6.0))
+            else:
+                self.last_error = ""
+                self.post(SampleReady(panels))
+            tick += 1
+            deadline += self.interval
+            now = time.monotonic()
+            if deadline <= now:                          # overran: re-phase instead of bursting
+                deadline = now + self.interval
+            self.kick.wait(deadline - now)
+
+    def sample(self, slow: bool, scan: bool, forced: bool) -> dict[str, list[Row]]:
+        now = time.monotonic()
+        mem = parse_meminfo(self.meminfo.read())
+        vm = parse_vmstat(self.vmstat.read())
+        psi = {r: parse_psi(f.read()) for r, f in self.psi.items()}
+        cg = parse_psi(self.cg.read()) if self.cg else {}
+        sw, swapdevs = parse_swaps(self.swaps.read())
+        if any(ev & (select.POLLPRI | select.POLLERR) for _, ev in self.poller.poll(0)):
+            self.mount_map = parse_mounts(self.mounts.read())
+        if slow or self.zdirty:
+            self._discover_zram()
+        zram = self._read_zram(slow, swapdevs)
+
+        counters: dict[str, float] = dict(vm)
+        for res, d in psi.items():
+            for kind, v in d.items():
+                counters[f"{res}.{kind}"] = v[3]
+        for kind, v in cg.items():
+            counters[f"cg.{kind}"] = v[3]
+        rates = self.rates.update(counters, now)
+
+        if slow:
+            on_now = oomd_active()
+            if forced or on_now != self.oomd_on:
+                self.oomd = load_oomd_conf()
+            self.oomd_on = on_now
+        kills = vm.get("oom_kill", 0)
+        if self.oom_base is None:
+            self.oom_base = kills
+        panels = {
+            "p_mem": rows_memory(mem, sw),
+            "p_psi": rows_pressure(psi, cg, self.cg_label, rates, vm, self.oomd_on, self.oomd,
+                                   self._risk(mem, psi, cg, rates, now), kills - self.oom_base),
+            "p_zram": rows_zram(zram),
+        }
+        if scan:
+            panels["p_proc"] = rows_procs(scan_top(TOP_N), mem.get("MemTotal", 0))
+        if slow:
+            if forced:                                   # e.g. zswap module loaded after start
+                self.tun = {k: f if isinstance(f, KFile) else KFile.state(TUNABLES[k]) for k, f in self.tun.items()}
+            vals = {k: f.text() if isinstance(f, KFile) else f for k, f in self.tun.items()}
+            if vals != self.tun_vals:
+                self.tun_vals = vals
+                panels["p_vm"] = rows_vm(vals)
+        return panels
+
+    def _discover_zram(self) -> None:
+        try:
+            names = {n for n in os.listdir("/sys/block") if n.startswith("zram") and n[4:].isdigit()}
+        except OSError:
+            names = set()
+        for n in self.zdevs.keys() - names:
+            self.zdevs.pop(n).close()
+        for n in names - self.zdevs.keys():
+            try:
+                self.zdevs[n] = ZDev(n)
+            except (OSError, ValueError):
+                pass
+        self.zdirty = False
+
+    def _read_zram(self, slow: bool, swapdevs: frozenset[str]) -> list[ZStat]:
+        out = []
+        for name in sorted(self.zdevs, key=lambda n: int(n[4:])):
+            d = self.zdevs[name]
+            try:
+                if slow:
+                    d.refresh_meta()
+                v = [int(x) for x in d.mm.read().split()]
+            except (OSError, ValueError):                # hot-removed / reset mid-read
+                self.zdirty = True
+                continue
+            v += [0] * (9 - len(v))
+            dev = f"/dev/{name}"
+            role = "SWAP" if dev in swapdevs else self.mount_map.get(dev, "idle")
+            out.append(ZStat(name, role, d.algo, d.disksize, v[0], v[1], v[2], v[3], v[4],
+                             v[5] * PAGE, v[6] * PAGE, v[7] * PAGE))
+        return out
+
+    def _risk(self, mem: dict[str, int], psi: dict[str, Psi], cg: Psi,
+              rates: dict[str, float], now: float) -> tuple[str, Style, str]:
+        """Mirror systemd-oomd's triggers: SwapUsedLimit needs BOTH memory-used and
+        swap-used fractions above the limit; pressure uses cgroup PSI 'full avg10'
+        sustained for DefaultMemoryPressureDurationSec; *.oomrule rules AND their terms."""
+        c = self.oomd
+        total = mem.get("MemTotal", 0)
+        mem_f = (total - mem.get("MemAvailable", 0)) / total if total else 0.0
+        st = mem.get("SwapTotal", 0)
+        swap_f = (st - mem.get("SwapFree", 0)) / st if st else 0.0
+        full = (cg or psi.get("memory", {})).get("full", (0.0,))[0] / 100.0
+        some = psi.get("memory", {}).get("some", (0.0,))[0]
+        over = full > c.psi_limit
+        self.over_since = (self.over_since or now) if over else None
+        over_for = now - self.over_since if self.over_since else 0.0
+        swap_trip = st > 0 and mem_f > c.swap_limit and swap_f > c.swap_limit
+        hits = [r.name for r in c.rules
+                if (r.swap_max is None or swap_f > r.swap_max) and (r.psi_above is None or full > r.psi_above)]
+        if swap_trip or (over and over_for >= c.psi_duration) or hits:
+            why = ("mem∧swap > limit" if swap_trip
+                   else f"full {full:.0%} > {c.psi_limit:.0%} for {over_for:.0f}s" if over else f"rule {hits[0]}")
+            return ("CRITICAL" if self.oomd_on else "TRIPPED (oomd off)", CRIT, why)
+        if over:
+            return ("HIGH", EB, f"full {full:.0%} > {c.psi_limit:.0%} for {over_for:.0f}/{c.psi_duration:.0f}s")
+        if st and mem_f > 0.9 * c.swap_limit and swap_f > 0.9 * c.swap_limit:
+            return ("HIGH", EB, f"mem {mem_f:.0%} · swap {swap_f:.0%} near {c.swap_limit:.0%}")
+        if rates.get("pgscan_direct", 0.0) > 0 or full > 0.10 or some > 20.0:
+            return ("ELEVATED", WB, f"direct reclaim / stalls (full {full:.0%}, some {some:.0f}%)")
+        return ("NORMAL", OKB, f"mem {mem_f:.0%} · swap {swap_f:.0%} · full {full:.0%}")
+
+
+# --------------------------------------------------------------------------- #
+#  RAM ballooning engine                                                      #
+# --------------------------------------------------------------------------- #
+CAT_META = {
+    "dormant": ("[1] Dormant Anon", "MADV_COLD · p=PAGEOUT"),
+    "active": ("[2] Active Anon", "1 store/page per 1.5 s"),
+    "clean": ("[3] Clean Cache", "O_TMPFILE · fdatasync"),
+    "dirty": ("[4] Dirty Cache", "re-dirtied per 1.5 s"),
+    "shmem": ("[5] Shmem memfd", "tmpfs · swap-backed"),
+    "thrash": ("[6] Thrash Stress", "continuous RW cycling"),
+}
+
+
+class Block:
+    """One balloon chunk. `lock` serialises the owner's close() against the pressure loop;
+    `anchor`/`mv` hold buffer exports so the mmap cannot be unmapped underneath a raw
+    address (mmap.close() raises BufferError while exports exist)."""
+
+    __slots__ = ("cat", "size", "fd", "mm", "mv", "anchor", "addr", "lock", "alive")
+
+    def __init__(self, cat: str, size: int, fd: int = -1, mm: mmap.mmap | None = None) -> None:
+        self.cat, self.size, self.fd, self.mm = cat, size, fd, mm
+        self.lock = threading.Lock()
+        self.alive = True
+        if mm is not None:
+            self.mv = memoryview(mm)
+            self.anchor = ctypes.c_char.from_buffer(mm)
+            self.addr = ctypes.addressof(self.anchor)
+        else:
+            self.mv = self.anchor = None
+            self.addr = 0
+
+    def close(self) -> None:
+        with self.lock:
+            if not self.alive:
+                return
+            self.alive = False
+            if self.mm is not None:
+                self.mv.release()
+                self.mv = self.anchor = None              # drop exports before munmap
+                self.mm.close()                           # munmap runs with the GIL released
+                self.mm = None
+            if self.fd >= 0:
+                os.close(self.fd)                         # O_TMPFILE/memfd inode freed here
+                self.fd = -1
+
+
+@dataclass(slots=True, frozen=True)
+class CatStat:
+    blocks: int = 0
+    size: int = 0
+    resident: int = 0      # bytes; -1 = kernel query unavailable
+    dirty: int = 0
+    writeback: int = 0
+
+
+@dataclass(slots=True, frozen=True)
+class BalloonStats:
+    cats: dict[str, CatStat]
+    total_mb: int
+    tmpl_ratio: float
+    touch_errors: int
+
+
+class BalloonUpdate(Message):
+    def __init__(self, stats: BalloonStats) -> None:
+        super().__init__()
+        self.stats = stats
+
+
+class PressureLoop(threading.Thread):
+    """Active touch (1.5 s), dirty re-dirty (1.5 s) and round-robin thrash.
+    Per 8 MiB slice: MADV_POPULATE_WRITE faults every evicted page back in and write-
+    faults clean shared-file pages inside the kernel (GIL released), then — for anon
+    categories — one strided memoryview store per page sets the hardware accessed/dirty
+    bits that MGLRU aging actually samples. Pages are resident at that point, so the
+    GIL-held store is ~2048 byte writes, never a chain of major faults."""
+
+    def __init__(self, engine: "BalloonEngine") -> None:
+        super().__init__(name="dusky-pressure", daemon=True)
+        self.engine = engine
+        self.wake, self.halt = threading.Event(), threading.Event()
+        self.errors = 0          # written by this thread only
+        self.stamp = 0
+        self.rr = 0
+
+    def request_stop(self) -> None:
+        self.halt.set()
+        self.wake.set()
+
+    def run(self) -> None:
+        eng = self.engine
+        due = time.monotonic() + TOUCH_PERIOD
+        while not self.halt.is_set():
+            if time.monotonic() >= due:
+                for b in eng.snapshot("active"):
+                    self._pass(b, store=True)
+                for b in eng.snapshot("dirty"):
+                    self._pass(b, store=False)
+                due = time.monotonic() + TOUCH_PERIOD
+            if thrash := eng.snapshot("thrash"):
+                self.rr %= len(thrash)
+                self._pass(thrash[self.rr], store=True)
+                self.rr += 1
+                self.halt.wait(THRASH_PAUSE)
+            else:
+                self.wake.wait(max(0.0, due - time.monotonic()))
+                self.wake.clear()
+
+    def _pass(self, b: Block, store: bool) -> None:
+        self.stamp = (self.stamp + 1) & 0xFF
+        fill = memoryview(bytes((self.stamp,)) * (SLICE // PAGE))
+        for off in range(0, b.size, SLICE):
+            if self.halt.is_set():
+                return
+            with b.lock:
+                if not b.alive:
+                    return
+                n = min(SLICE, b.size - off)
+                if madvise(b.addr + off, n, MADV_POPULATE_WRITE):
+                    self.errors += 1                     # ENOMEM/EINTR under OOM: skip the store
+                    continue
+                if store:
+                    b.mv[off:off + n:PAGE] = fill[: n // PAGE]
+
+
+class BalloonEngine:
+    """Single owner thread for every block: allocation, free, pageout, sync, drop,
+    compact and residency accounting are serialised through one command queue, so block
+    lifetime needs no cross-thread reasoning except the pressure loop's per-block lock."""
+
+    def __init__(self, chunk_mb: int, cache_dir: str, post: Callable[[Message], None]) -> None:
+        self.chunk_mb, self.chunk = chunk_mb, chunk_mb * MIB
+        self.cache_dir, self.post = cache_dir, post
+        self.blocks: dict[str, list[Block]] = {c: [] for c in CATS}
+        self.q: queue.SimpleQueue[tuple] = queue.SimpleQueue()
+        self._lock = threading.Lock()
+        self._gen = 0
+        self.pending = dict.fromkeys(CATS, 0)
+        self.current = ""                    # op in progress (engine writes, UI reads)
+        self.released_mb = 0
+        self.tmpl_ratio = 0.0
+        self.thread = threading.Thread(target=self._run, name="dusky-balloon", daemon=True)
+        self.pressure = PressureLoop(self)
+        self._vec = bytearray(self.chunk // PAGE)
+        self._vec_anchor = ctypes.c_char.from_buffer(self._vec)     # export pins the buffer (no resize)
+        self._vec_addr = ctypes.addressof(self._vec_anchor)
+        self._crange, self._cstat = _CacheRange(0, 0), _CacheStat()
+
+    # -- UI-thread API --------------------------------------------------------
+    def start(self) -> None:
+        self.thread.start()
+        self.pressure.start()
+
+    def submit(self, *cmd: object) -> None:
+        self.q.put(cmd)
+
+    def submit_add(self, cat: str) -> int:
+        with self._lock:
+            self.pending[cat] += 1
+            gen, n = self._gen, sum(self.pending.values())
+        self.q.put(("add", cat, gen))
+        return n
+
+    def cancel_pending(self) -> None:
+        with self._lock:
+            self._gen += 1
+            self.pending = dict.fromkeys(CATS, 0)
+
+    def pending_snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self.pending)
+
+    def snapshot(self, cat: str) -> tuple[Block, ...]:
+        return tuple(self.blocks[cat])
+
+    def shutdown(self, timeout: float = 15.0) -> int:
+        self.pressure.request_stop()
+        if self.thread.is_alive():
+            self.q.put(("stop",))
+            self.thread.join(timeout)
+        else:
+            self.released_mb = self._close_all()
+        if self.pressure.is_alive():
+            self.pressure.join(2.0)
+        return self.released_mb
+
+    # -- engine thread ---------------------------------------------------------
+    @property
+    def total_mb(self) -> int:
+        return sum(map(len, self.blocks.values())) * self.chunk_mb
+
+    def _toast(self, text: str, severity: str = "information", timeout: float = 3.0) -> None:
+        self.post(Toast(text, severity, timeout))
+
+    def _run(self) -> None:
+        self._init_template()
+        self._publish()
+        while True:
+            try:
+                cmd = self.q.get(timeout=STATS_PERIOD)
+            except queue.Empty:
+                self._publish()
+                continue
+            op = cmd[0]
+            if op == "stop":
+                break
+            self.current = f"{op} {cmd[1]}" if len(cmd) > 1 else op
+            try:
+                getattr(self, f"_op_{op}")(*cmd[1:])
+            except Exception as exc:                     # the owner thread must never die
+                self._toast(f"{op} failed: {exc}", "error", 5.0)
+            self.current = ""
+            self._publish()
+        self.released_mb = self._close_all()
+
+    def _init_template(self) -> None:
+        """2 MiB template, per-page mix: 1/3 fresh entropy + 2/3 repeating pattern, so every
+        4 KiB page compresses ~3:1 on its own (zram compresses page by page)."""
+        rnd = PAGE // 3
+        pattern = (b"DUSKY_ZRAM_" * (PAGE // 11 + 1))[: PAGE - rnd]
+        entropy = os.urandom(rnd * (TEMPLATE // PAGE))
+        mm = mmap.mmap(-1, TEMPLATE, flags=mmap.MAP_PRIVATE)
+        for i in range(TEMPLATE // PAGE):
+            o = i * PAGE
+            mm[o:o + rnd] = entropy[i * rnd:(i + 1) * rnd]
+            mm[o + rnd:o + PAGE] = pattern
+        self.tmpl = mm
+        self.tmpl_view = memoryview(mm)
+        self._tmpl_anchor = ctypes.c_char.from_buffer(mm)
+        self.tmpl_addr = ctypes.addressof(self._tmpl_anchor)
+        name_vma(self.tmpl_addr, TEMPLATE, b"dusky:template")
+        try:
+            from compression import zstd                 # PEP 784 (3.14): per-page estimate, zram-style
+            comp = sum(len(zstd.compress(self.tmpl_view[o:o + PAGE], level=3)) for o in range(0, TEMPLATE, PAGE))
+            self.tmpl_ratio = TEMPLATE / comp
+        except ImportError:
+            self.tmpl_ratio = 0.0
+
+    # -- fill paths (GIL released for all bulk work) ----------------------------
+    def _fill_map(self, b: Block) -> None:
+        if err := madvise(b.addr, b.size, MADV_POPULATE_WRITE):   # one syscall instead of 64k faults
+            raise OSError(err, f"MADV_POPULATE_WRITE: {os.strerror(err)}")
+        dst, src, end = b.addr, self.tmpl_addr, b.size
+        full = end - end % TEMPLATE
+        for off in range(0, full, TEMPLATE):
+            _memmove(dst + off, src, TEMPLATE)
+        if full < end:
+            _memmove(dst + full, src, end - full)
+
+    def _fill_fd(self, fd: int, size: int) -> None:
+        off = 0
+        while off < size:
+            n = min(size - off, IOV_SPAN)
+            whole, rem = divmod(n, TEMPLATE)
+            iov = [self.tmpl_view] * whole
+            if rem:
+                iov.append(self.tmpl_view[:rem])
+            written = os.pwritev(fd, iov, off)           # kernel copies the template n/2MiB times
+            if written <= 0:
+                raise OSError(errno.EIO, "short pwritev")
+            off += written
+
+    def _create(self, cat: str) -> Block:
+        size = self.chunk
+        if cat in ("dormant", "active", "thrash"):
+            b = Block(cat, size, -1, mmap.mmap(-1, size, flags=mmap.MAP_PRIVATE))
+            name_vma(b.addr, size, f"dusky:{cat}".encode())
+            try:
+                self._fill_map(b)
+                if cat == "dormant" and (err := madvise(b.addr, size, MADV_COLD)):
+                    raise OSError(err, f"MADV_COLD: {os.strerror(err)}")
+            except BaseException:
+                b.close()
+                raise
+            return b
+        if cat == "shmem":
+            fd = os.memfd_create("dusky:shmem", os.MFD_CLOEXEC | MFD_NOEXEC_SEAL)
+        else:
+            fd = os.open(self.cache_dir, os.O_TMPFILE | os.O_RDWR | os.O_CLOEXEC, 0o600)
+        try:
+            self._fill_fd(fd, size)
+            if cat == "clean":
+                os.fdatasync(fd)                         # make every page clean
+            mm = (mmap.mmap(fd, size, flags=mmap.MAP_SHARED, trackfd=False)
+                  if cat == "dirty" else None)           # mapping only needed for re-dirtying
+        except BaseException:
+            os.close(fd)
+            raise
+        return Block(cat, size, fd, mm)
+
+    # -- residency accounting ---------------------------------------------------
+    def _cachestat(self, fd: int) -> _CacheStat | None:
+        rc = _libc.syscall(ctypes.c_long(NR_CACHESTAT), ctypes.c_long(fd), ctypes.byref(self._crange),
+                           ctypes.byref(self._cstat), ctypes.c_long(0))
+        return self._cstat if rc == 0 else None
+
+    def _mincore(self, b: Block) -> int:
+        pages = b.size // PAGE
+        if _libc.mincore(b.addr, b.size, self._vec_addr) != 0:
+            return -1
+        return self._vec[:pages].translate(_LSB).count(1) * PAGE
+
+    def _cat_stat(self, cat: str) -> CatStat:
+        blocks = self.blocks[cat]
+        if not blocks:
+            return CatStat()
+        res = dirty = wb = 0
+        for b in blocks:
+            if b.fd >= 0:
+                if (cs := self._cachestat(b.fd)) is None:
+                    res = -1
+                    break
+                res, dirty, wb = res + cs.cache * PAGE, dirty + cs.dirty * PAGE, wb + cs.writeback * PAGE
+            elif (r := self._mincore(b)) >= 0:
+                res += r
+            else:
+                res = -1
+                break
+        return CatStat(len(blocks), len(blocks) * self.chunk, res, dirty, wb)
+
+    def _publish(self) -> None:
+        self.post(BalloonUpdate(BalloonStats({c: self._cat_stat(c) for c in CATS}, self.total_mb,
+                                             self.tmpl_ratio, self.pressure.errors)))
+
+    def _close_all(self) -> int:
+        mb = self.total_mb
+        for blocks in self.blocks.values():
+            while blocks:
+                blocks.pop().close()
+        return mb
+
+    # -- commands -----------------------------------------------------------------
+    def _op_add(self, cat: str, gen: int) -> None:
+        with self._lock:
+            if gen != self._gen:
+                return                                   # cancelled by clear / earlier failure
+            self.pending[cat] -= 1
+        t0 = time.perf_counter()
+        try:
+            b = self._create(cat)
+        except (OSError, MemoryError, ValueError) as exc:
+            self.cancel_pending()
+            self._toast(f"Allocation refused for {cat.upper()}: {exc} — queue cancelled", "error", 6.0)
+            return
+        self.blocks[cat].append(b)
+        if cat == "thrash":
+            self.pressure.wake.set()
+        left = sum(self.pending_snapshot().values())
+        self._toast(f"+{self.chunk_mb} MiB {cat.upper()} in {(time.perf_counter() - t0) * 1e3:.0f} ms · "
+                    f"total {self.total_mb} MiB" + (f" · {left} queued" if left else ""))
+
+    def _op_free(self, cat: str) -> None:
+        if not self.blocks[cat]:
+            self._toast(f"No {cat.upper()} blocks to free", "warning")
+            return
+        self.blocks[cat].pop().close()
+        self._toast(f"-{self.chunk_mb} MiB {cat.upper()} · total {self.total_mb} MiB")
+
+    def _op_clear(self) -> None:
+        self._toast(f"Cleared all balloon blocks ({self._close_all()} MiB released)", "warning")
+
+    def _op_stats(self) -> None:
+        pass                                             # _run publishes after every command
+
+    def _op_pageout(self) -> None:
+        blocks = self.blocks["dormant"]
+        if not blocks:
+            self._toast("No DORMANT blocks to page out", "warning")
+            return
+        before = sum(max(self._mincore(b), 0) for b in blocks)
+        t0 = time.perf_counter()
+        errs = sum(1 for b in blocks if madvise(b.addr, b.size, MADV_PAGEOUT))
+        dt = time.perf_counter() - t0
+        after = sum(max(self._mincore(b), 0) for b in blocks)
+        self._toast(f"MADV_PAGEOUT: {fmt_bytes(max(before - after, 0))} left RAM in {dt * 1e3:.0f} ms · "
+                    f"{fmt_bytes(after)} still resident" + (f" · {errs} errors" if errs else ""),
+                    "error" if errs else "information", 4.0)
+
+    def _op_sync(self) -> None:
+        blocks = self.blocks["dirty"]
+        if not blocks:
+            self._toast("No DIRTY blocks to sync", "warning")
+            return
+        dirty = sum(cs.dirty * PAGE for b in blocks if (cs := self._cachestat(b.fd)) is not None)
+        t0 = time.perf_counter()
+        for b in blocks:
+            os.fdatasync(b.fd)                           # GIL released; page cache knows every dirty page
+        self._toast(f"fdatasync ×{len(blocks)}: {fmt_bytes(dirty)} dirty flushed in {time.perf_counter() - t0:.2f} s")
+
+    def _op_drop(self) -> None:
+        t0 = time.perf_counter()
+        os.sync()                                        # unprivileged; makes dirty pages droppable
+        ok, msg = priv_write(["/proc/sys/vm/drop_caches"], "3\n")
+        self._toast(f"drop_caches=3 done in {time.perf_counter() - t0:.2f} s" if ok else f"drop_caches: {msg}",
+                    "information" if ok else "error", 5.0)
+
+    def _op_compact(self) -> None:
+        try:
+            paths = sorted(f"/sys/block/{n}/compact" for n in os.listdir("/sys/block")
+                           if n.startswith("zram") and os.path.exists(f"/sys/block/{n}/compact"))
+        except OSError:
+            paths = []
+        if not paths:
+            self._toast("No ZRAM devices to compact", "warning")
+            return
+        ok, msg = priv_write(paths, "1\n")
+        self._toast(f"Compacted {len(paths)} ZRAM device(s)" if ok else f"compact: {msg}",
+                    "information" if ok else "error", 5.0)
+
+
+def priv_write(paths: list[str], value: str) -> tuple[bool, str]:
+    """Root: direct writes. Otherwise one `sudo -n tee` (NOPASSWD rule or cached ticket);
+    DUSKY_SUDO_PASSWORD, if exported, primes the ticket once via `sudo -S -v`."""
+    if os.geteuid() == 0:
+        errs = []
+        for p in paths:
+            try:
+                fd = os.open(p, os.O_WRONLY)
+                try:
+                    os.write(fd, value.encode())
+                finally:
+                    os.close(fd)
+            except OSError as exc:
+                errs.append(f"{p}: {exc.strerror}")
+        return not errs, "; ".join(errs)
+    if (sudo := shutil.which("sudo")) is None:
+        return False, "not root and sudo not found (run with --root)"
+    tee = shutil.which("tee") or "/usr/bin/tee"
+    try:
+        if pw := os.environ.get("DUSKY_SUDO_PASSWORD"):
+            subprocess.run([sudo, "-S", "-p", "", "-v"], input=f"{pw}\n".encode(),
+                           capture_output=True, timeout=15)
+        r = subprocess.run([sudo, "-n", tee, *paths], input=value.encode(),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    if r.returncode == 0:
+        return True, ""
+    err = r.stderr.decode(errors="replace").strip().splitlines()
+    return False, (err[-1] if err else f"sudo exit {r.returncode}") + " (use --root or `sudo -v`)"
+
+
+def rows_balloon(stats: BalloonStats | None, pending: dict[str, int], sel: str,
+                 chunk_mb: int, backing: str, busy: str) -> list[Row]:
+    rows: list[Row] = []
+    for c in CATS:
+        name, desc = CAT_META[c]
+        cs = stats.cats[c] if stats else CatStat()
+        on_ = c == sel
+        left = (t("▶ " if on_ else "  ", OKB), t(name, OKB if on_ else FGS), t(f" ({desc})", D))
+        right: list[Segment] = []
+        if cs.blocks:
+            right += [t(f"{cs.blocks}×{chunk_mb}M ", V), t(f"{cs.blocks * chunk_mb} MiB", WB)]
+            if cs.resident >= 0:
+                right.append(t(f" · {cs.resident / cs.size:.0%} res", D))
+                if c == "dirty":
+                    right.append(t(f" · {cs.dirty / cs.size:.0%} dirty · {cs.writeback / cs.size:.0%} wb", W))
+        else:
+            right.append(t("0 MiB", D))
+        if p := pending.get(c):
+            right.append(t(f" +{p} queued", A))
+        rows.append((left, tuple(right)))
+    rows.append(GAP)
+    total_mb = stats.total_mb if stats else 0
+    nblocks = sum(s.blocks for s in stats.cats.values()) if stats else 0
+    rows.append((L("Total injected load"), R(t(f"{total_mb} MiB", WB), t(f" ({nblocks} blocks)", D))))
+    rows.append((L("Engine"), R(t(f"running: {busy}", A) if busy else t("idle", D))))
+    rows.append((L("Page-cache backing"), R(t(backing, D))))
+    if stats and stats.tmpl_ratio:
+        rows.append((L("Template", "per-page 1/3 entropy"), R(t(f"zstd-3 est. {stats.tmpl_ratio:.2f}× per page", D))))
+    if stats and stats.touch_errors:
+        rows.append((L("Pressure-loop populate errors"), R(t(str(stats.touch_errors), EB))))
+    rows.append((L("Quick actions", style=D), R(t("p=PageOut s=Sync d=Drop k=Compact c=Clear", D))))
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+#  Textual UI                                                                 #
+# --------------------------------------------------------------------------- #
+class KVPanel(Widget):
+    """Line-API key/value panel: no Rich Table measurement, no markup parsing, no
+    double render for height:auto. Unchanged rows skip the refresh; relayout happens
+    only when the row count changes."""
+
+    def __init__(self, title: str, *, id: str) -> None:
+        super().__init__(id=id)
+        self.border_title = title
+        self._rows: list[Row] = [(L("sampling …", style=D), ())]
+
+    def set_rows(self, rows: list[Row]) -> None:
+        if rows == self._rows:
+            return
+        relayout = len(rows) != len(self._rows)
+        self._rows = rows
+        self.refresh(layout=relayout)
+
+    def get_content_height(self, container, viewport, width: int) -> int:
+        return max(1, len(self._rows))
+
+    def render_line(self, y: int) -> Strip:
+        width = self.size.width
+        base = self.visual_style.rich_style
+        if y >= len(self._rows):
+            return Strip.blank(width, base)
+        left, right = self._rows[y]
+        rs = Strip(right)
+        ls = Strip(left)
+        room = width - rs.cell_length - (1 if right else 0)
+        if ls.cell_length > room:
+            ls = ls.crop(0, max(room, 0))
+        pad = width - ls.cell_length - rs.cell_length
+        return Strip([*ls, Segment(" " * max(pad, 0)), *rs]).crop(0, width).apply_style(base)
+
+
+HELP_TEXT = Text.assemble(
+    ("Synthetic balloon categories\n", f"bold {ACCENT}"),
+    "  1 Dormant anon (MADV_COLD)          2 Active anon (kept hot)\n"
+    "  3 Clean cache (fdatasync'd)          4 Dirty cache (re-dirtied)\n"
+    "  5 Shmem (memfd / tmpfs)              6 Thrash (continuous cycling)\n\n",
+    ("Memory pressure actions\n", f"bold {ACCENT}"),
+    "  + / =  allocate one chunk            - / _  free one chunk\n"
+    "  p      MADV_PAGEOUT dormant          s      fdatasync dirty blocks\n"
+    "  d      sync + drop_caches (root)     k      compact ZRAM (root)\n"
+    "  c      clear all balloons + queue\n\n",
+    ("Navigation\n", f"bold {ACCENT}"),
+    "  r      immediate full poll           F1 / ? toggle this help\n"
+    "  q/Esc  release all memory and quit",
+)
+
+
+class HelpScreen(ModalScreen[None]):
+    BINDINGS = [Binding("escape,f1,question_mark,q,enter,space", "close_help", "Close", show=False, priority=True)]
+
+    def compose(self) -> ComposeResult:
+        with Container(id="help_dialog"):
+            yield Static("󰌌 Dusky RAM Analyzer & ZRAM Benchmark — Shortcuts", id="modal-title")
+            yield Static(HELP_TEXT, id="modal-text")
+            with Horizontal(id="modal_btn_container"):
+                yield Button("Close (F1 / Esc)", id="btn_modal_close", action="screen.close_help")
+
+    def action_close_help(self) -> None:
+        self.dismiss(None)
+
+    def on_click(self, event: events.Click) -> None:
+        if event.widget is self:                         # click outside the dialog
+            self.dismiss(None)
+
+
+def _css() -> str:
+    btn = {
+        "btn_help": ("#1e293b", "#38bdf8", "#0284c7", "#ffffff"),
+        "btn_quit": ("#3f1d24", "#fca5a5", "#b91c1c", "#ffffff"),
+        "btn_add": ("#14532d", "#bbf7d0", "#22c55e", "#000000"),
+        "btn_free": ("#713f12", "#fef08a", "#f59e0b", "#000000"),
+        "btn_pageout": ("#581c87", "#f3e8ff", "#a855f7", "#ffffff"),
+        "btn_sync": ("#0369a1", "#e0f2fe", "#38bdf8", "#000000"),
+        "btn_drop": ("#9a3412", "#ffedd5", "#ea580c", "#ffffff"),
+        "btn_compact": ("#064e3b", "#a7f3d0", "#10b981", "#000000"),
+        "btn_clear": ("#881337", "#ffe4e6", "#f43f5e", "#ffffff"),
+        "btn_refresh": ("#334155", "#cbd5e1", "#64748b", "#ffffff"),
+    }
+    buttons = "\n".join(
+        f"#{i} {{ background: {bg}; color: {fg}; }}\n#{i}:hover, #{i}:focus {{ background: {hbg}; color: {hfg}; }}"
+        for i, (bg, fg, hbg, hfg) in btn.items())
+    return f"""
+    Screen {{ layout: vertical; background: {BG}; }}
+    #main_container {{ layout: horizontal; height: 1fr; padding: 0 1; }}
+    .column {{ width: 1fr; height: 100%; padding: 0 1; scrollbar-size: 1 1;
+               scrollbar-background: {BG}; scrollbar-color: {MUTED}; scrollbar-color-hover: {ACCENT}; }}
+    KVPanel {{ height: auto; margin-bottom: 1; padding: 0 1; background: {BG}; color: {FG};
+               border-title-style: bold; }}
+    #p_mem, #p_zram {{ border: round {ACCENT}; border-title-color: {ACCENT}; }}
+    #p_psi {{ border: round {WARNING}; border-title-color: {WARNING}; }}
+    #p_proc {{ border: round {MUTED}; border-title-color: {ACCENT}; }}
+    #p_vm, #p_balloon {{ border: round {SUCCESS}; border-title-color: {SUCCESS}; }}
+    #controls_container {{ dock: bottom; height: auto; background: {BG}; }}
+    .btn-row {{ layout: horizontal; width: 100%; height: 1; padding: 0 1; }}
+    .btn-group {{ width: auto; height: 1; }}
+    .spacer {{ width: 1fr; height: 1; }}
+    Button {{ height: 1; min-height: 1; min-width: 0; width: auto; border: none; padding: 0;
+              margin-right: 1; text-style: bold; }}
+    Button:last-child {{ margin-right: 0; }}
+    .type-btn {{ background: #221c20; color: #a89ba0; }}
+    .type-btn:hover, .type-btn:focus {{ background: #3b2d35; color: {FG}; }}
+    .type-btn.active-type {{ background: {ACCENT}; color: {BG}; }}
+    .type-btn.active-type:hover, .type-btn.active-type:focus {{ background: {SUCCESS}; color: {BG}; }}
+    {buttons}
+    HelpScreen {{ align: center middle; }}
+    #help_dialog {{ width: 76; height: auto; max-height: 95%; overflow-y: auto; background: {BG};
+                    border: heavy {ACCENT}; padding: 0 1; }}
+    #modal-title {{ color: {ACCENT}; text-style: bold; text-align: center; }}
+    #modal-text {{ color: {FG}; }}
+    #modal_btn_container {{ height: 1; align-horizontal: center; margin-top: 1; }}
+    Button#btn_modal_close {{ background: {ACCENT}; color: {BG}; padding: 0 1; margin: 0; }}
+    Button#btn_modal_close:hover, Button#btn_modal_close:focus {{ background: {SUCCESS}; color: {BG}; }}
+    """
+
+
+class DuskyRAMAnalyzer(App):
+    TITLE = "DUSKY RAM ANALYZER & BALLOON BENCHMARK"
+    ENABLE_COMMAND_PALETTE = False
+    CSS = _css()
+    BINDINGS = [
+        Binding("f1,question_mark", "help", "Help", priority=True),
+        *(Binding(str(i), f"set_type('{c}')", c.title(), show=False) for i, c in enumerate(CATS, 1)),
+        Binding("plus,equals_sign", "add_chunk", "Add"),
+        Binding("minus,underscore", "free_chunk", "Free"),
+        Binding("p", "pageout", "PageOut"),
+        Binding("s", "sync_dirty", "Sync"),
+        Binding("d", "drop_caches", "Drop"),
+        Binding("k", "compact_zram", "Compact"),
+        Binding("c", "clear_all", "Clear"),
+        Binding("r", "refresh_now", "Refresh"),
+        Binding("q,escape", "quit_app", "Quit"),
+    ]
+
+    def __init__(self, interval: float = 1.0, chunk_mb: int = 250,
+                 cache_dir: str = "/var/tmp", cache_fs: str = "?") -> None:
+        super().__init__()
+        self.chunk_mb = chunk_mb
+        self.category = "dormant"
+        self.backing = f"{cache_dir} ({cache_fs})"
+        self.bstats: BalloonStats | None = None
+        self.engine = BalloonEngine(chunk_mb, cache_dir, self._post)
+        self.sampler = Sampler(self._post, interval)
+
+    def _post(self, msg: Message) -> None:
+        try:
+            self.post_message(msg)                       # thread-safe: call_soon_threadsafe
+        except RuntimeError:
+            pass                                         # loop already closed during shutdown
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="main_container"):
+            with VerticalScroll(classes="column"):
+                yield KVPanel("System Memory Topology", id="p_mem")
+                yield KVPanel("Memory Pressure (PSI) & OOM Dynamics", id="p_psi")
+                yield KVPanel("Top Memory Consumers (RSS & VmSwap)", id="p_proc")
+            with VerticalScroll(classes="column"):
+                yield KVPanel("ZRAM Multi-Device Diagnostics", id="p_zram")
+                yield KVPanel("Live Kernel VM Policies & Tunables", id="p_vm")
+                yield KVPanel("RAM Ballooning Engine", id="p_balloon")
+        chunk = self.chunk_mb
+        with Container(id="controls_container"):
+            with Horizontal(classes="btn-row"):
+                with Horizontal(classes="btn-group"):
+                    for i, c in enumerate(CATS, 1):
+                        yield Button(f"{i}:{c.title()}", id=f"type_{c}",
+                                     classes="type-btn active-type" if c == self.category else "type-btn",
+                                     action=f"app.set_type('{c}')")
+                yield Static(classes="spacer")
+                with Horizontal(classes="btn-group"):
+                    yield Button("󰌌 F1 Help", id="btn_help", action="app.help")
+                    yield Button("q Quit", id="btn_quit", action="app.quit_app")
+            with Horizontal(classes="btn-row"):
+                with Horizontal(classes="btn-group"):
+                    yield Button(f"+ {chunk}M", id="btn_add", action="app.add_chunk")
+                    yield Button(f"- {chunk}M", id="btn_free", action="app.free_chunk")
+                yield Static(classes="spacer")
+                with Horizontal(classes="btn-group"):
+                    yield Button("p PageOut", id="btn_pageout", action="app.pageout")
+                    yield Button("s Sync", id="btn_sync", action="app.sync_dirty")
+                    yield Button("d Drop", id="btn_drop", action="app.drop_caches")
+                    yield Button("k Compact", id="btn_compact", action="app.compact_zram")
+                yield Static(classes="spacer")
+                with Horizontal(classes="btn-group"):
+                    yield Button("c Clear", id="btn_clear", action="app.clear_all")
+                    yield Button("r Ref", id="btn_refresh", action="app.refresh_now")
+
+    def on_mount(self) -> None:
+        self.register_theme(Theme(name="dusky", primary=ACCENT, secondary=WARNING, accent=ACCENT,
+                                  warning=WARNING, error=ERROR, success=SUCCESS, foreground=FG,
+                                  background=BG, surface=BG, dark=True))
+        self.theme = "dusky"                             # toasts/scrollbars follow the Matugen palette
+        self.panels = {p.id: p for p in self.query(KVPanel)}
+        self._render_balloon()
+        self.engine.start()
+        self.sampler.start()
+
+    def shutdown(self) -> int:
+        self.sampler.halt.set()
+        self.sampler.kick.set()
+        if self.sampler.is_alive():
+            self.sampler.join(2.0)
+        return self.engine.shutdown()
+
+    # -- message handlers (UI thread) -------------------------------------------
+    @on(SampleReady)
+    def _on_sample(self, msg: SampleReady) -> None:
+        for pid, rows in msg.panels.items():
+            self.panels[pid].set_rows(rows)
+        self._render_balloon()                           # keeps "engine running: …" live
+
+    @on(BalloonUpdate)
+    def _on_balloon(self, msg: BalloonUpdate) -> None:
+        self.bstats = msg.stats
+        self._render_balloon()
+
+    @on(Toast)
+    def _on_toast(self, msg: Toast) -> None:
+        self.notify(msg.text, severity=msg.severity, timeout=msg.timeout, markup=False)
+
+    def _render_balloon(self) -> None:
+        panel = self.panels["p_balloon"]
+        title = f"RAM Ballooning Engine — selected: {self.category.upper()}"
+        if panel.border_title != title:
+            panel.border_title = title
+        panel.set_rows(rows_balloon(self.bstats, self.engine.pending_snapshot(), self.category,
+                                    self.chunk_mb, self.backing, self.engine.current))
+
+    def _say(self, text: str, severity: str = "information", timeout: float = 1.5) -> None:
+        self.notify(text, severity=severity, timeout=timeout, markup=False)
+
+    # -- actions -----------------------------------------------------------------
+    def action_help(self) -> None:
+        if isinstance(self.screen, HelpScreen):
+            self.screen.dismiss(None)
+        else:
+            self.push_screen(HelpScreen())
+
+    def action_set_type(self, cat: str) -> None:
+        if cat not in CATS or cat == self.category:
+            return
+        self.query_one(f"#type_{self.category}", Button).remove_class("active-type")
+        self.query_one(f"#type_{cat}", Button).add_class("active-type")
+        self.category = cat
+        self._render_balloon()
+
+    def action_add_chunk(self) -> None:
+        n = self.engine.submit_add(self.category)
+        self._say(f"Queued +{self.chunk_mb} MiB {self.category.upper()} ({n} pending)", "warning")
+        self._render_balloon()
+
+    def action_free_chunk(self) -> None:
+        self.engine.submit("free", self.category)
+
+    def action_pageout(self) -> None:
+        self._say("MADV_PAGEOUT on dormant blocks …")
+        self.engine.submit("pageout")
+
+    def action_sync_dirty(self) -> None:
+        self._say("fdatasync on dirty blocks …")
+        self.engine.submit("sync")
+
+    def action_drop_caches(self) -> None:
+        self._say("sync + drop_caches …", "warning")
+        self.engine.submit("drop")
+
+    def action_compact_zram(self) -> None:
+        self._say("Compacting ZRAM …", "warning")
+        self.engine.submit("compact")
+
+    def action_clear_all(self) -> None:
+        self.engine.cancel_pending()                     # queued adds die before they allocate
+        self.engine.submit("clear")
+        self._render_balloon()
+
+    def action_refresh_now(self) -> None:
+        self.sampler.kick.set()
+        self.engine.submit("stats")
+
+    def action_quit_app(self) -> None:
+        self.exit()
+
+
+# --------------------------------------------------------------------------- #
+#  privilege escalation, page-cache backing, CLI                              #
+# --------------------------------------------------------------------------- #
+_KEEP_ENV = {"TERM", "COLORTERM", "TERMINFO", "TERMINFO_DIRS", "LANG", "LC_ALL", "LC_CTYPE",
+             "PATH", "XDG_CONFIG_HOME", "DUSKY_CACHE_DIR"}
+
+
 def elevate() -> None:
-    """Opt-in privilege escalation. Preserves full terminal color environment."""
+    """Opt-in re-exec under sudo; forwards terminal/colour/locale (+ TEXTUAL_*) variables."""
     if os.geteuid() == 0:
         return
-    sudo = shutil.which("sudo")
-    if sudo is None:
+    if (sudo := shutil.which("sudo")) is None:
         print("[warn] sudo not found; continuing unprivileged.", file=sys.stderr)
         return
-    # Preserve environment variables via child env wrapper so COLORTERM is retained
-    keep = [f"{k}={v}" for k in ("TERM", "COLORTERM", "TERMINFO", "LANG", "PATH")
-            if (v := os.environ.get(k))]
-    argv = [sudo, "--", "/usr/bin/env", *keep,
-            sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]]
+    keep = [f"{k}={v}" for k, v in os.environ.items() if k in _KEEP_ENV or k.startswith("TEXTUAL_")]
+    argv = [sudo, "--", "/usr/bin/env", *keep, sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]]
     try:
         os.execv(sudo, argv)
     except OSError as exc:
         print(f"[warn] escalation failed ({exc}); continuing unprivileged.", file=sys.stderr)
 
 
-# --------------------------------------------------------------------------- #
-#  low level readers & formatters                                             #
-# --------------------------------------------------------------------------- #
-def read_str(path: str) -> str:
+def pick_cache_dir() -> tuple[str, str]:
+    """A disk-backed directory for page-cache balloons: on tmpfs/ramfs (or a zram-backed
+    fs) the 'file cache' categories would silently become shmem."""
+    table = []
     try:
-        return Path(path).read_text().strip()
-    except PermissionError:
-        return DENIED
-    except OSError:
-        return MISSING
-
-
-def read_int(path: str) -> int | None:
-    try:
-        val = read_str(path)
-        return int(val) if val not in (MISSING, DENIED) else None
-    except (ValueError, TypeError):
-        return None
-
-
-def read_selected(path: str) -> str:
-    """'lzo [zstd] lz4' -> 'zstd'. Strips Rich brackets."""
-    raw = read_str(path)
-    if raw in (MISSING, DENIED):
-        return raw
-    m = re.search(r"\[([^\]]+)\]", raw)
-    return m.group(1) if m else raw
-
-
-def fmt_bytes(num: float | int | None) -> str:
-    if num is None:
-        return "n/a"
-    val = float(num)
-    for suffix in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if abs(val) < 1024.0:
-            return f"{val:.0f} {suffix}" if suffix == "B" else f"{val:.2f} {suffix}"
-        val /= 1024.0
-    return f"{val:.2f} PiB"
-
-
-def plain(value: str) -> str:
-    if value == MISSING:
-        return "n/a"
-    if value == DENIED:
-        return "root"
-    return escape(value)
-
-
-def cell(value: str, style: str = "") -> str:
-    if value == MISSING:
-        return "[dim]n/a[/dim]"
-    if value == DENIED:
-        return "[dim]root only[/dim]"
-    text = escape(value)
-    return f"[{style}]{text}[/{style}]" if style else text
-
-
-def bar(fraction: float, width: int = 14) -> str:
-    fraction = min(max(fraction, 0.0), 1.0)
-    filled = int(round(fraction * width))
-    colour = SUCCESS if fraction < 0.70 else WARNING if fraction < 0.90 else ERROR
-    return f"[{colour}]{'#' * filled}[/{colour}][{MUTED}]{'-' * (width - filled)}[/{MUTED}]"
-
-
-def new_table() -> Table:
-    table = Table(expand=True, box=None, show_header=False, pad_edge=False)
-    table.add_column("k", style=f"bold {FG}", ratio=1)
-    table.add_column("v", justify="right", style=f"{SUCCESS}", ratio=1, no_wrap=True)
-    return table
-
-
-# --------------------------------------------------------------------------- #
-#  collectors & parsers                                                       #
-# --------------------------------------------------------------------------- #
-def get_meminfo() -> dict[str, int]:
-    """All values in bytes. Unitless counters (HugePages_*) stay raw counts."""
-    data: dict[str, int] = {}
-    try:
-        text = Path("/proc/meminfo").read_text()
-    except OSError:
-        return data
-    for line in text.splitlines():
-        key, sep, rest = line.partition(":")
-        if not sep:
-            continue
-        fields = rest.split()
-        if not fields:
-            continue
-        try:
-            val = int(fields[0])
-        except ValueError:
-            continue
-        data[key] = val * 1024 if fields[-1] == "kB" else val
-    return data
-
-
-def get_swaps() -> dict[str, int]:
-    stats = {"zram_total": 0, "zram_used": 0, "zram_devs": 0,
-             "disk_total": 0, "disk_used": 0, "disk_devs": 0}
-    try:
-        lines = Path("/proc/swaps").read_text().splitlines()[1:]
-    except OSError:
-        return stats
-    for line in lines:
-        fields = line.rsplit(None, 4)
-        if len(fields) != 5:
-            continue
-        try:
-            size = int(fields[2]) * 1024
-            used = int(fields[3]) * 1024
-        except ValueError:
-            continue
-        prefix = "zram" if fields[0].startswith("/dev/zram") else "disk"
-        stats[f"{prefix}_total"] += size
-        stats[f"{prefix}_used"] += used
-        stats[f"{prefix}_devs"] += 1
-    return stats
-
-
-def get_mount_map() -> dict[str, str]:
-    mounts: dict[str, str] = {}
-    try:
-        for line in Path("/proc/mounts").read_text().splitlines():
-            parts = line.split()
-            if len(parts) >= 2 and parts[0].startswith("/dev/zram"):
-                mounts[parts[0]] = parts[1]
+        for line in Path("/proc/self/mountinfo").read_text().splitlines():
+            left, _, right = line.partition(" - ")
+            lf, rf = left.split(), right.split()
+            if len(lf) >= 5 and len(rf) >= 2:
+                table.append((lf[4].replace("\\040", " "), rf[0], rf[1]))
     except OSError:
         pass
-    return mounts
 
+    def fs_of(path: str) -> tuple[str, str]:
+        real, best = os.path.realpath(path), ("", "?", "?")
+        for mnt, fstype, src in table:
+            if (real == mnt or real.startswith(mnt.rstrip("/") + "/")) and len(mnt) >= len(best[0]):
+                best = (mnt, fstype, src)
+        return best[1], best[2]
+
+    xdg_cache = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    for cand in (os.environ.get("DUSKY_CACHE_DIR"), "/var/tmp", xdg_cache):
+        if cand and os.path.isdir(cand) and os.access(cand, os.W_OK):
+            fstype, src = fs_of(cand)
+            if fstype not in ("tmpfs", "ramfs") and not src.startswith("/dev/zram"):
+                return cand, fstype
+    return "/var/tmp", fs_of("/var/tmp")[0]
 
-def get_zram_devices() -> list[Path]:
-    try:
-        devices = [p for p in Path("/sys/block").glob("zram[0-9]*")
-                   if (p / "mm_stat").is_file()]
-    except OSError:
-        return []
-    return sorted(devices, key=lambda p: int(p.name[4:]))
 
-
-def get_zram() -> dict:
-    """Detailed statistics per ZRAM device plus aggregated totals."""
-    devices_data: list[dict] = []
-    mount_map = get_mount_map()
-    swaps_text = read_str("/proc/swaps")
-
-    agg = {
-        "devices": devices_data,
-        "count": 0,
-        "orig_total": 0,
-        "compr_total": 0,
-        "used_total": 0,
-        "used_max_total": 0,
-        "disksize_total": 0,
-        "same_total": 0,
-        "huge_total": 0,
-    }
-
-    for dev in get_zram_devices():
-        raw_stat = read_str(str(dev / "mm_stat"))
-        if raw_stat in (MISSING, DENIED):
-            continue
-        try:
-            vals = [int(x) for x in raw_stat.split()]
-        except ValueError:
-            continue
-        vals += [0] * (9 - len(vals))
-
-        dev_path = f"/dev/{dev.name}"
-        role = mount_map.get(dev_path)
-        if not role:
-            if dev_path in swaps_text:
-                role = "[SWAP]"
-            else:
-                role = "[idle/unmounted]"
-
-        disksize = read_int(str(dev / "disksize")) or 0
-        algo = read_selected(str(dev / "comp_algorithm"))
-
-        d_orig = vals[0]
-        d_compr = vals[1]
-        d_used = vals[2]
-        d_limit = vals[3]
-        d_max = vals[4]
-        d_same = vals[5] * PAGE_SIZE
-        d_compacted = vals[6] * PAGE_SIZE
-        d_huge = vals[7] * PAGE_SIZE
-
-        codec_ratio = (d_orig / d_compr) if d_compr > 0 else 0.0
-        eff_ratio = (d_orig / d_used) if d_used > 0 else 0.0
-        saved = max(d_orig - d_used, 0)
-
-        dev_info = {
-            "name": dev.name,
-            "role": role,
-            "algo": algo,
-            "disksize": disksize,
-            "orig": d_orig,
-            "compr": d_compr,
-            "used": d_used,
-            "used_max": d_max,
-            "limit": d_limit,
-            "same": d_same,
-            "huge": d_huge,
-            "compacted": d_compacted,
-            "codec_ratio": codec_ratio,
-            "eff_ratio": eff_ratio,
-            "saved": saved,
-        }
-        devices_data.append(dev_info)
-
-        agg["orig_total"] += d_orig
-        agg["compr_total"] += d_compr
-        agg["used_total"] += d_used
-        agg["used_max_total"] += d_max
-        agg["disksize_total"] += disksize
-        agg["same_total"] += d_same
-        agg["huge_total"] += d_huge
-
-    agg["count"] = len(devices_data)
-    agg["codec_ratio"] = (agg["orig_total"] / agg["compr_total"]) if agg["compr_total"] > 0 else 0.0
-    agg["eff_ratio"] = (agg["orig_total"] / agg["used_total"]) if agg["used_total"] > 0 else 0.0
-    agg["saved_total"] = max(agg["orig_total"] - agg["used_total"], 0)
-    return agg
-
-
-def parse_psi_text(text: str, prefix: str) -> dict[str, float]:
-    out: dict[str, float] = {}
-    for line in text.splitlines():
-        parts = line.split()
-        if not parts:
-            continue
-        kind = parts[0]  # 'some' or 'full'
-        for item in parts[1:]:
-            key, sep, val = item.partition("=")
-            if sep:
-                try:
-                    out[f"{prefix}.{kind}.{key}"] = float(val)
-                except ValueError:
-                    pass
-    return out
-
-
-def get_psi() -> dict:
-    """Collects Pressure Stall Information across memory, cpu, io, and user cgroups."""
-    out: dict = {}
-    for res in ("memory", "cpu", "io"):
-        try:
-            p = Path(f"/proc/pressure/{res}")
-            if p.is_file():
-                out.update(parse_psi_text(p.read_text(), res))
-        except OSError:
-            pass
-
-    # Inspect CGroup memory pressure for the active user slice / desktop application slice
-    uid = os.getuid()
-    cgroup_paths = [
-        ("app.slice", Path(f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/memory.pressure")),
-        (f"user-{uid}.slice", Path(f"/sys/fs/cgroup/user.slice/user-{uid}.slice/memory.pressure")),
-        ("user.slice", Path("/sys/fs/cgroup/user.slice/memory.pressure")),
-        ("system.slice", Path("/sys/fs/cgroup/system.slice/memory.pressure")),
-    ]
-    for label, cp in cgroup_paths:
-        try:
-            if cp.is_file():
-                cg_data = parse_psi_text(cp.read_text(), "cgroup")
-                out.update(cg_data)
-                out["cgroup.label"] = label
-                break
-        except OSError:
-            continue
-    return out
-
-
-VMSTAT_KEYS = (
-    "pswpin",
-    "pswpout",
-    "pgmajfault",
-    "oom_kill",
-    "pgscan_kswapd",
-    "pgscan_direct",
-    "compact_stall",
-)
-
-
-def get_vmstat() -> dict[str, int]:
-    out: dict[str, int] = {}
-    try:
-        text = Path("/proc/vmstat").read_text()
-    except OSError:
-        return out
-    for line in text.splitlines():
-        key, sep, val = line.partition(" ")
-        if sep and key in VMSTAT_KEYS:
-            try:
-                out[key] = int(val)
-            except ValueError:
-                pass
-    return out
-
-
-def get_oomd_info() -> dict:
-    """Zero-fork inspection of systemd-oomd daemon state and configured slice rules."""
-    active = False
-    if Path("/run/systemd/units/invocation:systemd-oomd.service").is_symlink() or \
-       Path("/run/systemd/units/invocation:systemd-oomd.service").exists():
-        active = True
-    else:
-        try:
-            for p in Path("/proc").iterdir():
-                if p.name.isdigit():
-                    comm_path = p / "comm"
-                    if comm_path.is_file() and comm_path.read_text().strip() == "systemd-oomd":
-                        active = True
-                        break
-        except OSError:
-            pass
-
-    rules: list[dict[str, str]] = []
-    for rdir in (Path("/etc/systemd/oomd/rules.d"), Path("/usr/lib/systemd/oomd/rules.d")):
-        try:
-            if rdir.is_dir():
-                for rf in sorted(rdir.glob("*.oomrule")):
-                    content = rf.read_text()
-                    r_swap = re.search(r"SwapUsageMax\s*=\s*([0-9%]+)", content)
-                    r_psi = re.search(r"MemoryPressureAbove\s*=\s*([0-9%]+)", content)
-                    r_last = re.search(r"LastingSec\s*=\s*([0-9a-zA-Z]+)", content)
-                    r_act = re.search(r"Action\s*=\s*([^\s\n]+)", content)
-                    rules.append({
-                        "name": rf.stem,
-                        "swap_max": r_swap.group(1) if r_swap else "",
-                        "psi_above": r_psi.group(1) if r_psi else "",
-                        "lasting": r_last.group(1) if r_last else "",
-                        "action": r_act.group(1) if r_act else "",
-                    })
-        except OSError:
-            pass
-
-    return {
-        "active": active,
-        "rules": rules,
-    }
-
-
-class RateMeter:
-    """Tracks per-second throughput rates of monotonic kernel counters and PSI total stalls."""
-
-    def __init__(self) -> None:
-        self._prev: dict[str, int | float] = {}
-        self._stamp = time.monotonic()
-
-    def update(self, sample: dict[str, int | float]) -> dict[str, float]:
-        now = time.monotonic()
-        span = now - self._stamp
-        rates: dict[str, float] = {}
-        if self._prev and span > 0.0:
-            for key, val in sample.items():
-                prev_val = self._prev.get(key)
-                if prev_val is not None and val >= prev_val:
-                    rates[key] = (val - prev_val) / span
-        self._prev = sample
-        self._stamp = now
-        return rates
-
-
-def scan_processes(limit: int = 7) -> list[tuple[int, int, int, str]]:
-    """Inspects top memory consumers directly from /proc with zero external forks."""
-    rows: list[tuple[int, int, int, str]] = []
-    try:
-        entries = list(os.scandir("/proc"))
-    except OSError:
-        return rows
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        name = ""
-        rss = -1
-        swap = 0
-        try:
-            with open(f"/proc/{entry.name}/status", "r") as handle:
-                for line in handle:
-                    if line.startswith("Name:"):
-                        name = line.partition(":")[2].strip()
-                    elif line.startswith("VmRSS:"):
-                        rss = int(line.split()[1]) * 1024
-                    elif line.startswith("VmSwap:"):
-                        swap = int(line.split()[1]) * 1024
-                        break
-        except (OSError, ValueError):
-            continue
-        if rss < 0:
-            continue
-        rows.append((rss, swap, int(entry.name), name))
-    rows.sort(reverse=True)
-    return rows[:limit]
-
-
-def collect() -> dict:
-    """Coherent snapshot collected in a single tick."""
-    return {
-        "mem": get_meminfo(),
-        "swaps": get_swaps(),
-        "zram": get_zram(),
-        "psi": get_psi(),
-        "vmstat": get_vmstat(),
-        "oomd": get_oomd_info(),
-    }
-
-
-# --------------------------------------------------------------------------- #
-#  RAM Ballooning & Synthetic Stress Engine                                   #
-# --------------------------------------------------------------------------- #
-class BalloonManager:
-    """Multi-category synthetic memory generator for empirical kernel testing:
-
-    1. DORMANT ANON: Cold anonymous memory (MADV_COLD), prime swap candidate.
-                     Forces immediately into ZRAM via MADV_PAGEOUT on demand.
-    2. ACTIVE ANON:  Foreground persistent memory. Daemon thread touches 1 byte
-                     per page every 1.5s to keep it young in MGLRU.
-    3. CLEAN CACHE:  File-backed page cache (/var/tmp), fsynced clean.
-                     Instantly dropped by the kernel under memory pressure.
-    4. DIRTY CACHE:  File-backed unflushed writes (/var/tmp), periodically redirtied.
-                     Tests background writeback (dirty_background_bytes).
-    5. SHMEM / TMPFS:Shared memory (/dev/shm). Must be swapped out to ZRAM.
-    6. THRASH/STRESS:Rapid cyclic anonymous page touching loop. Induces direct
-                     memory pressure, page scanning, and swap I/O thrashing.
-    """
-
-    PATTERN = b"DUSKY_ZRAM_"
-
-    def __init__(self, chunk_mb: int = 250) -> None:
-        self.chunk_mb = chunk_mb
-
-        self.dormant_blocks: list[mmap.mmap] = []
-        self.active_blocks: list[bytearray] = []
-        self.clean_files: list[tuple[tempfile._TemporaryFileWrapper, int]] = []
-        self.dirty_files: list[tuple[tempfile._TemporaryFileWrapper, mmap.mmap]] = []
-        # Store (path, file_obj, mmap_buf) for shmem to ensure robust unlinking
-        self.shmem_files: list[tuple[str, object, mmap.mmap]] = []
-        self.thrash_blocks: list[bytearray] = []
-
-        self._touch_running = True
-        self._touch_thread = threading.Thread(target=self._touch_loop, daemon=True)
-        self._touch_thread.start()
-        self._thrash_thread = threading.Thread(target=self._thrash_loop, daemon=True)
-        self._thrash_thread.start()
-        atexit.register(self.cleanup)
-
-    def _touch_loop(self) -> None:
-        while self._touch_running:
-            time.sleep(1.5)
-            # Actively touch 1 byte per page of active anonymous blocks
-            for block in list(self.active_blocks):
-                try:
-                    for off in range(0, len(block), 4096):
-                        block[off] ^= 1
-                except Exception:
-                    pass
-            # Periodically re-dirty dirty page cache blocks
-            for _, buf in list(self.dirty_files):
-                try:
-                    for off in range(0, len(buf), 4096):
-                        buf[off] = (buf[off] + 1) % 256
-                except Exception:
-                    pass
-
-    def _thrash_loop(self) -> None:
-        while self._touch_running:
-            if not self.thrash_blocks:
-                time.sleep(0.2)
-                continue
-            for block in list(self.thrash_blocks):
-                try:
-                    blen = len(block)
-                    # Rapid cyclic stride touching to actively dirty pages and trigger page faults / swap thrash
-                    for off in range(0, blen, 4096):
-                        block[off] = (block[off] + 1) & 0xFF
-                        if off + 64 < blen:
-                            block[off + 64] ^= 0xAA
-                    time.sleep(0.02)
-                except Exception:
-                    pass
-
-    def _template(self) -> bytes:
-        """1 MiB block: 1/3 random entropy + 2/3 repeating pattern (~3:1 ratio)."""
-        ent = MIB // 3
-        body = MIB - ent
-        filler = (self.PATTERN * (body // len(self.PATTERN) + 1))[:body]
-        return os.urandom(ent) + filler
-
-    # --- Add Chunks ---
-    def add_dormant(self) -> bool:
-        size = self.chunk_mb * MIB
-        try:
-            buf = mmap.mmap(-1, size, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
-            tmpl = self._template()
-            for off in range(0, size, MIB):
-                buf.write(tmpl)
-            addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
-            libc.madvise(addr, size, MADV_COLD)
-            self.dormant_blocks.append(buf)
-            return True
-        except (MemoryError, OSError):
-            return False
-
-    def add_active(self) -> bool:
-        size = self.chunk_mb * MIB
-        try:
-            block = bytearray(size)
-            tmpl = self._template()
-            for off in range(0, size, MIB):
-                block[off:off + MIB] = tmpl
-            self.active_blocks.append(block)
-            return True
-        except MemoryError:
-            return False
-
-    def add_clean(self) -> bool:
-        size = self.chunk_mb * MIB
-        try:
-            target_dir = "/var/tmp" if os.path.exists("/var/tmp") else "/tmp"
-            tf = tempfile.NamedTemporaryFile(dir=target_dir, prefix="zram_balloon_clean_", delete=False)
-            tmpl = self._template()
-            for _ in range(0, size, MIB):
-                tf.write(tmpl)
-            tf.flush()
-            os.fsync(tf.fileno())
-            self.clean_files.append((tf, size))
-            return True
-        except (MemoryError, OSError):
-            return False
-
-    def add_dirty(self) -> bool:
-        size = self.chunk_mb * MIB
-        try:
-            target_dir = "/var/tmp" if os.path.exists("/var/tmp") else "/tmp"
-            tf = tempfile.NamedTemporaryFile(dir=target_dir, prefix="zram_balloon_dirty_", delete=False)
-            tf.truncate(size)
-            buf = mmap.mmap(tf.fileno(), size, mmap.MAP_SHARED, mmap.PROT_WRITE)
-            tmpl = self._template()
-            for off in range(0, size, MIB):
-                buf[off:off + MIB] = tmpl
-            self.dirty_files.append((tf, buf))
-            return True
-        except (MemoryError, OSError):
-            return False
-
-    def add_shmem(self) -> bool:
-        size = self.chunk_mb * MIB
-        target_dir = "/dev/shm" if os.path.exists("/dev/shm") else "/tmp"
-        path = f"{target_dir}/zram_balloon_shm_{os.getpid()}_{time.time_ns()}"
-        try:
-            f = open(path, "wb+")
-            f.truncate(size)
-            buf = mmap.mmap(f.fileno(), size, mmap.MAP_SHARED, mmap.PROT_WRITE)
-            tmpl = self._template()
-            for off in range(0, size, MIB):
-                buf[off:off + MIB] = tmpl
-            self.shmem_files.append((path, f, buf))
-            return True
-        except (MemoryError, OSError):
-            return False
-
-    def add_thrash(self) -> bool:
-        size = self.chunk_mb * MIB
-        try:
-            block = bytearray(size)
-            tmpl = self._template()
-            for off in range(0, size, MIB):
-                block[off:off + MIB] = tmpl
-            self.thrash_blocks.append(block)
-            return True
-        except MemoryError:
-            return False
-
-    # --- Free Chunks ---
-    def free_dormant(self) -> bool:
-        if not self.dormant_blocks:
-            return False
-        b = self.dormant_blocks.pop()
-        try:
-            b.close()
-        except Exception:
-            pass
-        return True
-
-    def free_active(self) -> bool:
-        if not self.active_blocks:
-            return False
-        self.active_blocks.pop()
-        return True
-
-    def free_clean(self) -> bool:
-        if not self.clean_files:
-            return False
-        tf, _ = self.clean_files.pop()
-        path = tf.name
-        try:
-            tf.close()
-        except Exception:
-            pass
-        try:
-            if os.path.exists(path):
-                os.unlink(path)
-        except Exception:
-            pass
-        return True
-
-    def free_dirty(self) -> bool:
-        if not self.dirty_files:
-            return False
-        tf, buf = self.dirty_files.pop()
-        path = tf.name
-        try:
-            buf.close()
-        except Exception:
-            pass
-        try:
-            tf.close()
-        except Exception:
-            pass
-        try:
-            if os.path.exists(path):
-                os.unlink(path)
-        except Exception:
-            pass
-        return True
-
-    def free_shmem(self) -> bool:
-        if not self.shmem_files:
-            return False
-        path, f, buf = self.shmem_files.pop()
-        try:
-            buf.close()
-        except Exception:
-            pass
-        try:
-            f.close()
-        except Exception:
-            pass
-        try:
-            if os.path.exists(path):
-                os.unlink(path)
-        except Exception:
-            pass
-        return True
-
-    def free_thrash(self) -> bool:
-        if not self.thrash_blocks:
-            return False
-        self.thrash_blocks.pop()
-        return True
-
-    # --- Actions ---
-    def pageout_dormant(self) -> int:
-        """Invokes MADV_PAGEOUT on dormant anonymous blocks to immediately push into ZRAM."""
-        size = self.chunk_mb * MIB
-        pushed = 0
-        for buf in self.dormant_blocks:
-            try:
-                addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
-                if libc.madvise(addr, size, MADV_PAGEOUT) == 0:
-                    pushed += self.chunk_mb
-            except Exception:
-                pass
-        return pushed
-
-    def sync_dirty(self) -> int:
-        """Flushes dirty page cache to disk."""
-        synced = 0
-        for tf, buf in self.dirty_files:
-            try:
-                buf.flush()
-                os.fdatasync(tf.fileno())
-                synced += self.chunk_mb
-            except Exception:
-                pass
-        return synced
-
-    def drop_caches(self) -> tuple[bool, str]:
-        """Flushes and drops clean caches."""
-        if os.geteuid() == 0:
-            try:
-                os.sync()
-                Path("/proc/sys/vm/drop_caches").write_text("3\n")
-                return True, "Caches dropped (kernel drop_caches=3)"
-            except Exception as exc:
-                return False, f"drop_caches failed: {exc}"
-        try:
-            proc = subprocess.run(
-                ["sudo", "-S", "bash", "-c", "sync && echo 3 > /proc/sys/vm/drop_caches"],
-                input="2345\n",
-                capture_output=True,
-                text=True,
-                timeout=3.0,
-            )
-            if proc.returncode == 0:
-                return True, "Caches dropped via sudo"
-            return False, "sudo drop_caches failed"
-        except Exception as exc:
-            return False, f"drop_caches error: {exc}"
-
-    def compact_zram(self) -> tuple[int, str]:
-        """Triggers memory compaction on all active ZRAM devices via sysfs."""
-        compacted = 0
-        for p in Path("/sys/block").glob("zram[0-9]*"):
-            c_file = p / "compact"
-            if c_file.is_file():
-                if os.geteuid() == 0:
-                    try:
-                        c_file.write_text("1\n")
-                        compacted += 1
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        proc = subprocess.run(
-                            ["sudo", "-S", "bash", "-c", f"echo 1 > {c_file}"],
-                            input="2345\n",
-                            capture_output=True,
-                            text=True,
-                            timeout=2.0,
-                        )
-                        if proc.returncode == 0:
-                            compacted += 1
-                    except Exception:
-                        pass
-        if compacted > 0:
-            return compacted, f"Compacted {compacted} ZRAM device(s)"
-        return 0, "ZRAM compaction unavailable or permission denied"
-
-    def clear(self, cat: str | None = None) -> None:
-        if cat in (None, "dormant"):
-            while self.free_dormant():
-                pass
-        if cat in (None, "active"):
-            while self.free_active():
-                pass
-        if cat in (None, "clean"):
-            while self.free_clean():
-                pass
-        if cat in (None, "dirty"):
-            while self.free_dirty():
-                pass
-        if cat in (None, "shmem"):
-            while self.free_shmem():
-                pass
-        if cat in (None, "thrash"):
-            while self.free_thrash():
-                pass
-
-    def cleanup(self) -> None:
-        self._touch_running = False
-        self.clear(None)
-
-    @property
-    def total_mb(self) -> int:
-        return (
-            len(self.dormant_blocks)
-            + len(self.active_blocks)
-            + len(self.clean_files)
-            + len(self.dirty_files)
-            + len(self.shmem_files)
-            + len(self.thrash_blocks)
-        ) * self.chunk_mb
-
-    @property
-    def counts(self) -> dict[str, int]:
-        return {
-            "dormant": len(self.dormant_blocks),
-            "active": len(self.active_blocks),
-            "clean": len(self.clean_files),
-            "dirty": len(self.dirty_files),
-            "shmem": len(self.shmem_files),
-            "thrash": len(self.thrash_blocks),
-        }
-
-
-# --------------------------------------------------------------------------- #
-#  UI Panel Builders                                                          #
-# --------------------------------------------------------------------------- #
-def panel_memory(snap: dict) -> Panel:
-    mem = snap["mem"]
-    if not mem:
-        return Panel("[red]/proc/meminfo unreadable[/red]", title="[bold cyan]System Memory Topology", border_style="red")
-
-    swaps = snap["swaps"]
-    total = mem.get("MemTotal", 0)
-    available = mem.get("MemAvailable", 0)
-    free = mem.get("MemFree", 0)
-    used = max(total - available, 0)
-    used_frac = used / total if total else 0.0
-
-    anon = mem.get("AnonPages", 0)
-    shmem = mem.get("Shmem", 0)
-    cached = mem.get("Cached", 0)
-    file_cache = max(cached - shmem, 0)
-    buffers = mem.get("Buffers", 0)
-    s_recl = mem.get("SReclaimable", 0)
-    dirty = mem.get("Dirty", 0)
-    unevictable = mem.get("Unevictable", 0)
-
-    swap_total = mem.get("SwapTotal", 0)
-    swap_free = mem.get("SwapFree", 0)
-    swap_used = max(swap_total - swap_free, 0)
-    swap_frac = swap_used / swap_total if swap_total else 0.0
-
-    table = new_table()
-    table.add_row("Total Physical RAM", f"[bold white]{fmt_bytes(total)}[/bold white]")
-    table.add_row("Used RAM [dim](Total - Avail)[/dim]", f"{fmt_bytes(used)} [dim]({used_frac * 100:.1f}%)[/dim]")
-    table.add_row("", bar(used_frac))
-    table.add_row("Available [dim](Reclaim Buffer)[/dim]", f"[bold green]{fmt_bytes(available)}[/bold green]")
-    table.add_row("Free RAM [dim](Strict)[/dim]", fmt_bytes(free))
-    table.add_row("  ↳ AnonPages [dim](Apps)[/dim]", fmt_bytes(anon))
-    table.add_row("  ↳ Clean Page Cache", fmt_bytes(file_cache))
-    table.add_row("  ↳ Shmem / Tmpfs [dim](Shared)[/dim]", fmt_bytes(shmem))
-    table.add_row("  ↳ Buffers + Reclaimable Slab", fmt_bytes(buffers + s_recl))
-    table.add_row("  ↳ Dirty Pages [dim](Unwritten)[/dim]", f"[yellow]{fmt_bytes(dirty)}[/yellow]" if dirty > 10 * MIB else fmt_bytes(dirty))
-    table.add_row("  ↳ Unevictable [dim](Pinned)[/dim]", fmt_bytes(unevictable))
-    table.add_row("", "")
-    table.add_row("[bold]Total Swap Space[/bold]", f"[bold white]{fmt_bytes(swap_total)}[/bold white]")
-    table.add_row("Total Swap Used", f"{fmt_bytes(swap_used)} [dim]({swap_frac * 100:.1f}%)[/dim]")
-    table.add_row("", bar(swap_frac))
-    table.add_row(
-        "  ↳ [magenta]ZRAM Swap Pool[/magenta]",
-        f"[magenta]{fmt_bytes(swaps['zram_used'])} / {fmt_bytes(swaps['zram_total'])}[/magenta]",
-    )
-    table.add_row(
-        "  ↳ [red]Disk Swap Spillover[/red]",
-        f"[red]{fmt_bytes(swaps['disk_used'])} / {fmt_bytes(swaps['disk_total'])}[/red]",
-    )
-    table.add_row("  ↳ SwapCached", fmt_bytes(mem.get("SwapCached", 0)))
-
-    return Panel(table, title=f"[bold {ACCENT}]System Memory Topology", border_style=ACCENT, padding=(0, 1))
-
-
-def panel_pressure(snap: dict) -> Panel:
-    psi = snap["psi"]
-    rates = snap.get("rates", {})
-    mem = snap.get("mem", {})
-    oomd = snap.get("oomd", {})
-    table = new_table()
-
-    if psi:
-        mem_some_live = min(100.0, rates.get("memory.some.total", 0.0) / 10000.0)
-        mem_full_live = min(100.0, rates.get("memory.full.total", 0.0) / 10000.0)
-
-        ms10 = psi.get("memory.some.avg10", 0.0)
-        ms60 = psi.get("memory.some.avg60", 0.0)
-        ms300 = psi.get("memory.some.avg300", 0.0)
-        mf10 = psi.get("memory.full.avg10", 0.0)
-        mf60 = psi.get("memory.full.avg60", 0.0)
-        mf300 = psi.get("memory.full.avg300", 0.0)
-
-        ms_color = SUCCESS if ms10 < 5.0 and mem_some_live < 5.0 else WARNING if ms10 < 20.0 and mem_some_live < 20.0 else f"bold {ERROR}"
-        mf_color = SUCCESS if mf10 < 1.0 and mem_full_live < 1.0 else WARNING if mf10 < 10.0 and mem_full_live < 10.0 else f"bold {ERROR}"
-
-        table.add_row(
-            "Memory PSI Some [dim](10s/60s/300s)[/dim]",
-            f"[{ms_color}]{mem_some_live:4.1f}% live[/{ms_color}] • [{ms_color}]{ms10:4.2f}[/{ms_color}]/{ms60:.2f}/{ms300:.2f}",
-        )
-        table.add_row(
-            "Memory PSI Full [dim](OOM Thrash)[/dim]",
-            f"[{mf_color}]{mem_full_live:4.1f}% live[/{mf_color}] • [{mf_color}]{mf10:4.2f}[/{mf_color}]/{mf60:.2f}/{mf300:.2f}",
-        )
-
-        cpu_live = min(100.0, rates.get("cpu.some.total", 0.0) / 10000.0)
-        cpu10 = psi.get("cpu.some.avg10", 0.0)
-        cpu60 = psi.get("cpu.some.avg60", 0.0)
-        cpu_color = SUCCESS if cpu10 < 15.0 and cpu_live < 25.0 else WARNING if cpu10 < 50.0 else f"bold {ERROR}"
-        table.add_row(
-            "CPU PSI Some [dim](Contention)[/dim]",
-            f"[{cpu_color}]{cpu_live:4.1f}% live[/{cpu_color}] • [{cpu_color}]{cpu10:4.2f}[/{cpu_color}]/{cpu60:.2f}",
-        )
-
-        io_live = min(100.0, rates.get("io.some.total", 0.0) / 10000.0)
-        io10 = psi.get("io.some.avg10", 0.0)
-        io_f10 = psi.get("io.full.avg10", 0.0)
-        table.add_row(
-            "I/O PSI Some / Full [dim](Disk/Swap)[/dim]",
-            f"{io_live:4.1f}% live • {io10:.2f} [dim]some[/dim] / {io_f10:.2f} [dim]full[/dim]",
-        )
-
-        if "cgroup.some.avg10" in psi:
-            cg_lbl = psi.get("cgroup.label", "app.slice")
-            cg10 = psi.get("cgroup.some.avg10", 0.0)
-            cg_live = min(100.0, rates.get("cgroup.some.total", 0.0) / 10000.0)
-            cg_color = SUCCESS if cg10 < 10.0 else WARNING if cg10 < 30.0 else f"bold {ERROR}"
-            table.add_row(
-                f"CGroup PSI [dim]({cg_lbl})[/dim]",
-                f"[{cg_color}]{cg_live:4.1f}% live • {cg10:.2f} avg10[/{cg_color}]",
-            )
-    else:
-        table.add_row("Pressure (PSI)", "[dim]kernel PSI disabled or unavailable[/dim]")
-
-    table.add_row("", "")
-    swap_in = rates.get("pswpin", 0.0) * PAGE_SIZE
-    swap_out = rates.get("pswpout", 0.0) * PAGE_SIZE
-    table.add_row(
-        "Swap I/O [dim](Decompr / Compr)[/dim]",
-        f"In: {fmt_bytes(swap_in)}/s • Out: [bold {ACCENT}]{fmt_bytes(swap_out)}/s[/bold {ACCENT}]",
-    )
-
-    pg_direct = rates.get("pgscan_direct", 0.0)
-    pg_kswapd = rates.get("pgscan_kswapd", 0.0)
-    if pg_direct > 0:
-        scan_str = f"[bold {ERROR}]{pg_direct:.0f}/s direct (thrash!)[/bold {ERROR}] • {pg_kswapd:.0f}/s kswapd"
-    else:
-        scan_str = f"0/s direct • {pg_kswapd:.0f}/s kswapd"
-    table.add_row("Page Reclaim [dim](Direct vs Async)[/dim]", scan_str)
-
-    maj_fault = rates.get("pgmajfault", 0.0)
-    comp_stall = rates.get("compact_stall", 0.0)
-    table.add_row(
-        "Faults / Compaction Stalls",
-        f"{maj_fault:.0f}/s faults • {comp_stall:.0f}/s stalls",
-    )
-
-    table.add_row("", "")
-    oomd_act = oomd.get("active", False)
-    oomd_lbl = f"[bold {SUCCESS}]active (monitoring)[/bold {SUCCESS}]" if oomd_act else "[dim]inactive[/dim]"
-    table.add_row("systemd-oomd Daemon", oomd_lbl)
-
-    rules = oomd.get("rules", [])
-    if rules:
-        rule_snippets = []
-        for r in rules:
-            if r.get("swap_max"):
-                rule_snippets.append(f"Swap≥{r['swap_max']}")
-            if r.get("psi_above"):
-                rule_snippets.append(f"PSI≥{r['psi_above']}({r.get('lasting','')})")
-        tw_str = " • ".join(rule_snippets[:3])
-        table.add_row("Active Kill Tripwires", f"[dim]{tw_str}[/dim]")
-    else:
-        table.add_row("Default Kill Tripwires", "[dim]Swap≥90% • PSI≥60% (30s)[/dim]")
-
-    sw_tot = mem.get("SwapTotal", 0)
-    sw_free = mem.get("SwapFree", 0)
-    sw_used = max(sw_tot - sw_free, 0)
-    sw_frac = sw_used / sw_tot if sw_tot else 0.0
-
-    mem_some_10 = psi.get("memory.some.avg10", 0.0) if psi else 0.0
-    mem_some_cur = rates.get("memory.some.total", 0.0) / 10000.0 if rates else 0.0
-    effective_psi = max(mem_some_10, mem_some_cur)
-
-    if sw_frac >= 0.85 and effective_psi >= 10.0:
-        risk_str = f"[bold white on {ERROR}] CRITICAL (Kill Imminent - Tripwire Active) [/bold white on {ERROR}]"
-    elif sw_frac >= 0.85 or effective_psi >= 35.0:
-        risk_str = f"[bold {ERROR}] HIGH (Tripwire Proximity) [/bold {ERROR}]"
-    elif sw_frac >= 0.70 or effective_psi >= 15.0 or pg_direct > 0:
-        risk_str = f"[{WARNING}] ELEVATED (Reclaim Thrash) [/{WARNING}]"
-    else:
-        risk_str = f"[{SUCCESS}] NORMAL (Safe) [/{SUCCESS}]"
-
-    oom_kills = snap["vmstat"].get("oom_kill", 0)
-    kill_cnt_str = f"[bold {ERROR}]{oom_kills}[/bold {ERROR}]" if oom_kills else "0"
-    table.add_row("OOM Risk / Kills (Boot)", f"{risk_str} • {kill_cnt_str} kills")
-
-    return Panel(table, title=f"[bold {WARNING}]Memory Pressure (PSI) & OOM Dynamics", border_style=WARNING, padding=(0, 1))
-
-
-def panel_processes(procs: list[tuple[int, int, int, str]], total_ram: int) -> Panel:
-    table = Table(expand=True, box=None, pad_edge=False, header_style="bold dim", show_edge=False)
-    table.add_column("PID", style=f"dim {ACCENT}", ratio=1)
-    table.add_column("PROCESS", style=f"bold {FG}", ratio=3)
-    table.add_column("RSS", justify="right", style=f"{WARNING}", ratio=2)
-    table.add_column("SWAP", justify="right", style=f"{ACCENT}", ratio=2)
-    table.add_column("%", justify="right", style=f"{ERROR}", ratio=1)
-
-    if not procs:
-        table.add_row("", "[dim]scanning /proc...[/dim]", "", "", "")
-    else:
-        for rss, swap, pid, name in procs:
-            share = (rss / total_ram * 100.0) if total_ram else 0.0
-            swp_str = f"[bold {ACCENT}]{fmt_bytes(swap)}[/bold {ACCENT}]" if swap > 0 else "[dim]-[/dim]"
-            table.add_row(str(pid), escape(name[:18]), fmt_bytes(rss), swp_str, f"{share:.1f}")
-
-    return Panel(table, title=f"[bold {ACCENT}]Top Memory Consumers [dim](RSS & VmSwap)[/dim]", border_style=MUTED, padding=(0, 1))
-
-
-def panel_zram(snap: dict) -> Panel:
-    zdata = snap["zram"]
-    devices = zdata["devices"]
-
-    if not devices:
-        return Panel(
-            "[dim]No ZRAM devices detected on system.\n"
-            "Enable via: systemctl start systemd-zram-setup@zram0.service[/dim]",
-            title=f"[bold {ACCENT}]ZRAM Multi-Device Diagnostics",
-            border_style=ACCENT,
-        )
-
-    # 1:1 ratio guarantees balanced columns without horizontal text clipping
-    table = Table(expand=True, box=None, pad_edge=False, show_header=False)
-    table.add_column("k", style=f"bold {FG}", ratio=1)
-    table.add_column("v", justify="right", style=f"{SUCCESS}", ratio=1)
-
-    for i, d in enumerate(devices):
-        if i > 0:
-            table.add_section()
-        role_label = escape(d["role"])
-        table.add_row(f"[bold {ACCENT}]/dev/{d['name']}[/bold {ACCENT}] [{WARNING}]{role_label}[/{WARNING}]", f"[dim]{escape(d['algo'])} • {fmt_bytes(d['disksize'])}[/dim]")
-        codec_str = f"{d['codec_ratio']:.1f}x" if d["orig"] > 0 else "idle"
-        table.add_row("  Data → Compr", f"{fmt_bytes(d['orig'])} → {fmt_bytes(d['compr'])} [dim]({codec_str})[/dim]")
-        eff_str = f"{d['eff_ratio']:.2f}x" if d["orig"] > 0 else "idle"
-        table.add_row("  RAM Actually Used", f"{fmt_bytes(d['used'])} [dim]({eff_str} eff)[/dim]")
-        saved_str = fmt_bytes(d["saved"]) if d["orig"] > 0 else "0 B"
-        extra = f" [dim]({fmt_bytes(d['same'])} dedup)[/dim]" if d["same"] > 0 else ""
-        table.add_row("  RAM Saved / Dedup", f"[bold {SUCCESS}]+{saved_str}[/bold {SUCCESS}]{extra}")
-
-    # Total Pool Summary
-    if len(devices) > 1:
-        table.add_section()
-        table.add_row("[bold]Total ZRAM Pool[/bold]", f"[bold {FG}]{fmt_bytes(zdata['disksize_total'])} cap[/bold {FG}]")
-        table.add_row("  Total Stored → Compr", f"{fmt_bytes(zdata['orig_total'])} → {fmt_bytes(zdata['compr_total'])}")
-        table.add_row("  Total RAM Consumed", f"[bold]{fmt_bytes(zdata['used_total'])}[/bold]")
-        tot_eff_str = f"{zdata['eff_ratio']:.2f}x" if zdata["orig_total"] > 0 else "idle"
-        table.add_row("  Effective Ratio / Saved", f"[bold {SUCCESS}]{tot_eff_str}[/bold {SUCCESS}] ([bold {ACCENT}]+{fmt_bytes(zdata['saved_total'])}[/bold {ACCENT}])")
-
-    return Panel(table, title=f"[bold {ACCENT}]ZRAM Multi-Device Diagnostics", border_style=ACCENT, padding=(0, 1))
-
-
-def panel_vm(snap: dict) -> Panel:
-    table = new_table()
-
-    swappiness = read_str("/proc/sys/vm/swappiness")
-    page_cluster = read_str("/proc/sys/vm/page-cluster")
-    watermark = read_str("/proc/sys/vm/watermark_scale_factor")
-    watermark_boost = read_str("/proc/sys/vm/watermark_boost_factor")
-    vfs_pressure = read_str("/proc/sys/vm/vfs_cache_pressure")
-    proactiveness = read_str("/proc/sys/vm/compaction_proactiveness")
-    compact_unevict = read_str("/proc/sys/vm/compact_unevictable_allowed")
-    min_free = read_int("/proc/sys/vm/min_free_kbytes")
-    overcommit = read_str("/proc/sys/vm/overcommit_memory")
-    stat_interval = read_str("/proc/sys/vm/stat_interval")
-    dirty_writeback = read_int("/proc/sys/vm/dirty_writeback_centisecs")
-    max_map = read_int("/proc/sys/vm/max_map_count")
-
-    table.add_row("vm.swappiness", cell(swappiness))
-    table.add_row(
-        "vm.page-cluster [dim](0=opt)[/dim]",
-        cell(page_cluster, f"bold {SUCCESS}" if page_cluster == "0" else f"bold {WARNING}"),
-    )
-    table.add_row("vm.watermark_scale", cell(watermark, f"bold {SUCCESS}" if watermark == "10" else ""))
-    table.add_row("vm.watermark_boost", cell(watermark_boost, f"bold {SUCCESS}" if watermark_boost == "0" else ""))
-    table.add_row("vm.vfs_cache_pressure", cell(vfs_pressure))
-    table.add_row("vm.compaction_proact", cell(proactiveness))
-    table.add_row("vm.compact_unevict", cell(compact_unevict))
-    table.add_row("vm.min_free_kbytes", fmt_bytes(min_free * 1024) if min_free is not None else "[dim]n/a[/dim]")
-    table.add_row("vm.overcommit_memory", cell(overcommit))
-    table.add_row("vm.stat_interval", f"{stat_interval}s" if stat_interval not in (MISSING, DENIED) else cell(stat_interval))
-    if dirty_writeback is not None:
-        table.add_row("vm.dirty_writeback", f"{dirty_writeback / 100.0:.1f}s")
-    if max_map is not None:
-        table.add_row("vm.max_map_count", f"{max_map:,}")
-
-    dirty_bg = read_int("/proc/sys/vm/dirty_background_bytes")
-    dirty_limit = read_int("/proc/sys/vm/dirty_bytes")
-    if dirty_bg:
-        table.add_row("vm.dirty_background_bytes", fmt_bytes(dirty_bg))
-    if dirty_limit:
-        table.add_row("vm.dirty_bytes [dim](Throttle)[/dim]", fmt_bytes(dirty_limit))
-
-    table.add_row("", "")
-    lru_en = read_str("/sys/kernel/mm/lru_gen/enabled")
-    table.add_row("mglru.enabled", cell(lru_en, f"{SUCCESS}" if lru_en != MISSING else ""))
-    table.add_row("mglru.min_ttl_ms", cell(read_str("/sys/kernel/mm/lru_gen/min_ttl_ms")))
-
-    thp_en = read_selected("/sys/kernel/mm/transparent_hugepage/enabled")
-    table.add_row("thp.enabled", cell(thp_en))
-    thp_defrag = read_selected("/sys/kernel/mm/transparent_hugepage/defrag")
-    table.add_row("thp.defrag", cell(thp_defrag))
-    thp_shmem = read_selected("/sys/kernel/mm/transparent_hugepage/shmem_enabled")
-    table.add_row("thp.shmem_enabled", cell(thp_shmem))
-    khuge_ptes = read_str("/sys/kernel/mm/transparent_hugepage/khugepaged/max_ptes_none")
-    table.add_row("khugepaged.max_ptes_none", cell(khuge_ptes))
-
-    zswap = read_str("/sys/module/zswap/parameters/enabled")
-    if zswap not in (MISSING, DENIED) and zswap.upper().startswith("Y"):
-        table.add_row("zswap", f"[bold {WARNING}]on[/bold {WARNING}] [bold {ERROR}](conflicts with ZRAM!)[/bold {ERROR}]")
-    else:
-        table.add_row("zswap", cell(zswap) if zswap in (MISSING, DENIED) else "off [dim](clean)[/dim]")
-
-    return Panel(table, title=f"[bold {SUCCESS}]Live Kernel VM Policies & Tunables", border_style=SUCCESS, padding=(0, 1))
-
-
-def panel_balloon(mgr: BalloonManager, active_category: str) -> Panel:
-    counts = mgr.counts
-    chunk = mgr.chunk_mb
-    table = Table(expand=True, box=None, pad_edge=False, show_header=False)
-    table.add_column("cat", style=f"bold {FG}", ratio=1)
-    table.add_column("stat", justify="right", style=f"{WARNING}", ratio=1)
-
-    categories = [
-        ("dormant", "[1] Dormant Anon", "Cold/Swap Candidate"),
-        ("active", "[2] Active Anon", "Foreground Active"),
-        ("clean", "[3] Clean Cache", "Reclaimable File Cache"),
-        ("dirty", "[4] Dirty Cache", "Unwritten Disk Writes"),
-        ("shmem", "[5] Shmem Tmpfs", "/dev/shm Swappable"),
-        ("thrash", "[6] Thrash Stress", "Active Cyclic RW"),
-    ]
-
-    for key, name, desc in categories:
-        cnt = counts[key]
-        mb = cnt * chunk
-        is_sel = (key == active_category)
-        prefix = "▶ " if is_sel else "  "
-        title_style = f"bold {SUCCESS}" if is_sel else f"{FG}"
-        stat_str = f"{cnt} blocks [bold {WARNING}]({mb} MiB)[/bold {WARNING}]" if cnt > 0 else f"0 blocks [dim](0 MiB)[/dim]"
-        table.add_row(f"{prefix}[{title_style}]{name}[/{title_style}] [dim]({desc})[/dim]", stat_str)
-
-    table.add_section()
-    tot_cnt = sum(counts.values())
-    tot_mb = mgr.total_mb
-    table.add_row(
-        "[bold]Total Injected Load[/bold]",
-        f"[bold {WARNING}]{tot_mb} MiB[/bold {WARNING}] [dim]({tot_cnt} blocks)[/dim]",
-    )
-    table.add_row(
-        "[dim]Quick Actions:[/dim]",
-        "[dim]p=PageOut s=Sync d=Drop k=Compact[/dim]",
-    )
-
-    return Panel(
-        table,
-        title=f"[bold {SUCCESS}]RAM Ballooning Engine [dim](Selected: [{active_category.upper()}])[/dim]",
-        border_style=SUCCESS,
-        padding=(0, 1),
-    )
-
-
-# ============================================================================
-#  Shortcuts & Help Modal Dialog
-# ============================================================================
-class ShortcutsScreen(ModalScreen[None]):
-    BINDINGS = [
-        Binding("escape", "dismiss", "Dismiss", priority=True),
-        Binding("f1", "dismiss", "Dismiss", priority=True),
-        Binding("question_mark", "dismiss", "Dismiss", priority=True),
-        Binding("q", "dismiss", "Dismiss", priority=True),
-    ]
-
-    def compose(self) -> ComposeResult:
-        with Container(id="help_dialog"):
-            yield Static("󰌌 Dusky RAM Analyzer & ZRAM Benchmark Shortcuts", id="modal-title")
-
-            text = Text()
-            text.append("Synthetic Balloon Categories\n", style=f"bold {ACCENT}")
-            text.append("  1: Dormant Anon (Cold Swap)       2: Active Anon (Foreground LRU)\n")
-            text.append("  3: Clean Cache (Reclaimable)      4: Dirty Cache (Unwritten Disk)\n")
-            text.append("  5: Shmem / Tmpfs (/dev/shm)       6: Thrash / Stress (Cyclic Pressure)\n\n")
-
-            text.append("Memory Pressure Actions\n", style=f"bold {ACCENT}")
-            text.append("  + / =  Allocate +1 chunk          - / _  Free -1 chunk\n")
-            text.append("  p      PageOut (MADV_PAGEOUT)     s      Sync dirty cache to disk\n")
-            text.append("  d      Drop caches (root)         k      Compact ZRAM (root)\n")
-            text.append("  c      Clear all balloon memory\n\n")
-
-            text.append("Navigation & Controls\n", style=f"bold {ACCENT}")
-            text.append("  r      Immediate telemetry poll   F1 / ? Toggle this help modal\n")
-            text.append("  q/Esc  Clean up memory and quit")
-
-            yield Static(text, id="modal-text")
-
-            with Horizontal(id="modal_btn_container"):
-                yield Button("Close [F1 / Esc]", id="btn_modal_close")
-
-    def on_key(self, event: events.Key) -> None:
-        key = event.key.lower()
-        if key in ("escape", "f1", "question_mark", "q", "enter", "space", "?") or event.character in ("?", "q"):
-            self.dismiss(None)
-            event.stop()
-
-    @on(Button.Pressed, "#btn_modal_close")
-    def on_close_click(self) -> None:
-        self.dismiss(None)
-
-    @on(events.Click)
-    def on_background_click(self, event: events.Click) -> None:
-        if event.control is self:
-            self.dismiss(None)
-
-    def action_dismiss(self) -> None:
-        self.dismiss(None)
-
-
-# --------------------------------------------------------------------------- #
-#  Textual TUI Application                                                    #
-# --------------------------------------------------------------------------- #
-class DuskyRAMAnalyzer(App):
-    TITLE = "DUSKY RAM ANALYZER & BALLOON BENCHMARK"
-    ENABLE_COMMAND_PALETTE = False
-
-    CSS = f"""
-    Screen {{
-        layout: vertical;
-        background: {BG};
-    }}
-
-    #main_container {{
-        layout: horizontal;
-        height: 1fr;
-        padding: 0 1;
-    }}
-
-    .column {{
-        width: 1fr;
-        height: 100%;
-        padding: 0 1;
-        scrollbar-size: 1 1;
-        scrollbar-background: {BG};
-        scrollbar-color: {MUTED};
-        scrollbar-color-hover: {ACCENT};
-    }}
-
-    .panel {{
-        height: auto;
-        margin-bottom: 1;
-    }}
-
-    #controls_container {{
-        dock: bottom;
-        layout: vertical;
-        height: auto;
-        background: {BG};
-        padding: 0;
-        margin: 0;
-    }}
-
-    .btn-row {{
-        layout: horizontal;
-        width: 100%;
-        height: 1;
-        margin: 0;
-        padding: 0 1;
-    }}
-
-    .btn-group {{
-        width: auto;
-        height: 1;
-        margin: 0;
-    }}
-
-    .spacer {{
-        width: 1fr;
-        height: 1;
-    }}
-
-    /* Tight modern buttons: zero extra padding, auto-fit width, cohesive theme hover */
-    Button {{
-        height: 1;
-        min-height: 1;
-        min-width: 0;
-        width: auto;
-        border: none;
-        padding: 0;
-        margin-right: 1;
-        text-style: bold;
-    }}
-    Button:last-child {{
-        margin-right: 0;
-    }}
-
-    /* Row 1 - Left: Category Selector */
-    .type-btn {{
-        background: #221c20;
-        color: #a89ba0;
-    }}
-    .type-btn:hover, .type-btn:focus {{
-        background: #3b2d35;
-        color: {FG};
-    }}
-    .type-btn.active-type {{
-        background: {ACCENT};
-        color: {BG};
-        text-style: bold;
-    }}
-    .type-btn.active-type:hover, .type-btn.active-type:focus {{
-        background: {SUCCESS};
-        color: {BG};
-    }}
-
-    /* Row 1 - Right: Navigation & Help */
-    #btn_help {{
-        background: #1e293b;
-        color: #38bdf8;
-    }}
-    #btn_help:hover, #btn_help:focus {{
-        background: #0284c7;
-        color: #ffffff;
-    }}
-
-    #btn_quit {{
-        background: #3f1d24;
-        color: #fca5a5;
-    }}
-    #btn_quit:hover, #btn_quit:focus {{
-        background: #b91c1c;
-        color: #ffffff;
-    }}
-
-    /* Row 2 - Left: Load Adjustment */
-    #btn_add {{
-        background: #14532d;
-        color: #bbf7d0;
-    }}
-    #btn_add:hover, #btn_add:focus {{
-        background: #22c55e;
-        color: #000000;
-    }}
-
-    #btn_free {{
-        background: #713f12;
-        color: #fef08a;
-    }}
-    #btn_free:hover, #btn_free:focus {{
-        background: #f59e0b;
-        color: #000000;
-    }}
-
-    /* Row 2 - Center: Kernel VM & ZRAM Pressure Actions */
-    #btn_pageout {{
-        background: #581c87;
-        color: #f3e8ff;
-    }}
-    #btn_pageout:hover, #btn_pageout:focus {{
-        background: #a855f7;
-        color: #ffffff;
-    }}
-
-    #btn_sync {{
-        background: #0369a1;
-        color: #e0f2fe;
-    }}
-    #btn_sync:hover, #btn_sync:focus {{
-        background: #38bdf8;
-        color: #000000;
-    }}
-
-    #btn_drop {{
-        background: #9a3412;
-        color: #ffedd5;
-    }}
-    #btn_drop:hover, #btn_drop:focus {{
-        background: #ea580c;
-        color: #ffffff;
-    }}
-
-    #btn_compact {{
-        background: #064e3b;
-        color: #a7f3d0;
-    }}
-    #btn_compact:hover, #btn_compact:focus {{
-        background: #10b981;
-        color: #000000;
-    }}
-
-    /* Row 2 - Right: Maintenance & Refresh */
-    #btn_clear {{
-        background: #881337;
-        color: #ffe4e6;
-    }}
-    #btn_clear:hover, #btn_clear:focus {{
-        background: #f43f5e;
-        color: #ffffff;
-    }}
-
-    #btn_refresh {{
-        background: #334155;
-        color: #cbd5e1;
-    }}
-    #btn_refresh:hover, #btn_refresh:focus {{
-        background: #64748b;
-        color: #ffffff;
-    }}
-
-
-    /* Shortcuts modal dialog styling */
-    ShortcutsScreen {{
-        align: center middle;
-    }}
-
-    #help_dialog {{
-        width: 76;
-        height: auto;
-        max-height: 95%;
-        overflow-y: auto;
-        background: {BG};
-        border: heavy {ACCENT};
-        padding: 0 1;
-    }}
-
-    #modal-title {{
-        color: {ACCENT};
-        text-style: bold;
-        text-align: center;
-        margin: 0;
-    }}
-
-    #modal-text {{
-        color: {FG};
-        margin: 0;
-    }}
-
-    #modal_btn_container {{
-        height: 1;
-        align-horizontal: center;
-        margin-top: 1;
-    }}
-
-    Button#btn_modal_close {{
-        height: 1;
-        width: auto;
-        min-width: 0;
-        border: none;
-        background: {ACCENT};
-        color: {BG};
-        text-style: bold;
-        padding: 0 1;
-        margin: 0;
-    }}
-
-    Button#btn_modal_close:hover, Button#btn_modal_close:focus {{
-        background: {SUCCESS};
-        color: {BG};
-    }}
-    """
-
-    BINDINGS = [
-        Binding("f1", "help", "Help", priority=True),
-        Binding("question_mark", "help", "Help", priority=True),
-        ("1", "set_type('dormant')", "Dormant"),
-        ("2", "set_type('active')", "Active"),
-        ("3", "set_type('clean')", "Clean"),
-        ("4", "set_type('dirty')", "Dirty"),
-        ("5", "set_type('shmem')", "Shmem"),
-        ("6", "set_type('thrash')", "Thrash"),
-        ("+", "add_chunk", "Add"),
-        ("=", "add_chunk", "Add"),
-        ("-", "free_chunk", "Free"),
-        ("_", "free_chunk", "Free"),
-        ("p", "pageout_zram", "PageOut"),
-        ("s", "sync_dirty", "Sync"),
-        ("d", "drop_caches", "Drop"),
-        ("k", "compact_zram", "Compact"),
-        ("c", "clear_all", "Clear"),
-        ("r", "refresh_now", "Refresh"),
-        ("q", "bail_out", "Quit"),
-        Binding("escape", "bail_out", "Quit"),
-    ]
-
-    def __init__(self, interval: float = 1.0, chunk_mb: int = 250) -> None:
-        super().__init__()
-        self.interval = interval
-        self.balloon = BalloonManager(chunk_mb=chunk_mb)
-        self.active_category = "dormant"
-        self.rates = RateMeter()
-        self.procs: list[tuple[int, int, int, str]] = []
-
-        self._proc_busy = False
-        self._add_queue: list[str] = []
-        self._worker_running = False
-
-    def notify_status(self, message: str, severity: str = "information", timeout: float = 2.5) -> None:
-        """Non-intrusive floating toast notification; uses zero permanent screen space."""
-        clean = re.sub(r"\[/?.*?\]", "", message).strip()
-        if not clean:
-            return
-        if threading.current_thread() is threading.main_thread():
-            self.notify(clean, severity=severity, timeout=timeout)
-        else:
-            self.call_from_thread(self.notify, clean, severity=severity, timeout=timeout)
-
-    def action_help(self) -> None:
-        """Toggles the shortcuts and help modal dialog."""
-        if isinstance(self.screen, ModalScreen):
-            self.screen.dismiss(None)
-        else:
-            self.push_screen(ShortcutsScreen())
-
-    def compose(self) -> ComposeResult:
-        with Horizontal(id="main_container"):
-            with VerticalScroll(classes="column"):
-                yield Static(id="p_mem", classes="panel")
-                yield Static(id="p_psi", classes="panel")
-                yield Static(id="p_proc", classes="panel")
-            with VerticalScroll(classes="column"):
-                yield Static(id="p_zram", classes="panel")
-                yield Static(id="p_vm", classes="panel")
-                yield Static(id="p_balloon", classes="panel")
-
-        chunk = self.balloon.chunk_mb
-        with Static(id="controls_container"):
-            # Row 1: Category Selector (Left) <--- Spacer ---> Navigation & Help (Right)
-            with Horizontal(classes="btn-row"):
-                with Horizontal(classes="btn-group"):
-                    yield Button("1:Dormant", id="type_dormant", classes="type-btn active-type")
-                    yield Button("2:Active", id="type_active", classes="type-btn")
-                    yield Button("3:Clean", id="type_clean", classes="type-btn")
-                    yield Button("4:Dirty", id="type_dirty", classes="type-btn")
-                    yield Button("5:Shmem", id="type_shmem", classes="type-btn")
-                    yield Button("6:Thrash", id="type_thrash", classes="type-btn")
-                yield Static(classes="spacer")
-                with Horizontal(classes="btn-group"):
-                    yield Button("󰌌 F1 Help", id="btn_help")
-                    yield Button("q Quit", id="btn_quit")
-
-            # Row 2: Load Adjustment (Left) <--- Spacer ---> VM & ZRAM Actions (Center) <--- Spacer ---> Maintenance (Right)
-            with Horizontal(classes="btn-row"):
-                with Horizontal(classes="btn-group"):
-                    yield Button(f"+ {chunk}M", id="btn_add")
-                    yield Button(f"- {chunk}M", id="btn_free")
-                yield Static(classes="spacer")
-                with Horizontal(classes="btn-group"):
-                    yield Button("p PageOut", id="btn_pageout")
-                    yield Button("s Sync", id="btn_sync")
-                    yield Button("d Drop", id="btn_drop")
-                    yield Button("k Compact", id="btn_compact")
-                yield Static(classes="spacer")
-                with Horizontal(classes="btn-group"):
-                    yield Button("c Clear", id="btn_clear")
-                    yield Button("r Ref", id="btn_refresh")
-
-    def on_mount(self) -> None:
-        self.w_mem = self.query_one("#p_mem", Static)
-        self.w_psi = self.query_one("#p_psi", Static)
-        self.w_proc = self.query_one("#p_proc", Static)
-        self.w_zram = self.query_one("#p_zram", Static)
-        self.w_vm = self.query_one("#p_vm", Static)
-        self.w_balloon = self.query_one("#p_balloon", Static)
-
-        self.refresh_dashboards()
-        self.scan_now()
-        self.set_interval(self.interval, self.refresh_dashboards)
-        self.set_interval(max(self.interval, 2.0), self.scan_now)
-
-    # -- Rendering & Refresh -------------------------------------------------
-    def refresh_dashboards(self) -> None:
-        try:
-            snap = collect()
-            counters: dict[str, int | float] = dict(snap["vmstat"])
-            for k, v in snap["psi"].items():
-                if k.endswith(".total"):
-                    try:
-                        counters[k] = float(v)
-                    except (ValueError, TypeError):
-                        pass
-            snap["rates"] = self.rates.update(counters)
-            tot_ram = snap["mem"].get("MemTotal", 0)
-
-            self.w_mem.update(panel_memory(snap))
-            self.w_psi.update(panel_pressure(snap))
-            self.w_proc.update(panel_processes(self.procs, tot_ram))
-            self.w_zram.update(panel_zram(snap))
-            self.w_vm.update(panel_vm(snap))
-            self.w_balloon.update(panel_balloon(self.balloon, self.active_category))
-        except Exception as exc:
-            self.notify_status(f"Refresh error: {exc}", severity="error")
-
-    # -- Background Workers --------------------------------------------------
-    def scan_now(self) -> None:
-        if self._proc_busy:
-            return
-        self._proc_busy = True
-        self.run_worker(self._scan_worker, thread=True, exit_on_error=False, group="procs")
-
-    def _scan_worker(self) -> None:
-        try:
-            self.procs = scan_processes()
-        except Exception:
-            pass
-        finally:
-            self._proc_busy = False
-
-    def action_set_type(self, cat: str) -> None:
-        self.active_category = cat
-        for c in ("dormant", "active", "clean", "dirty", "shmem", "thrash"):
-            try:
-                btn = self.query_one(f"#type_{c}", Button)
-                if c == cat:
-                    btn.add_class("active-type")
-                else:
-                    btn.remove_class("active-type")
-            except Exception:
-                pass
-        self.refresh_dashboards()
-        self.notify_status(f"Category: {cat.upper()}", timeout=1.5)
-
-    # -- Queued Balloon Actions (Background Threads) -------------------------
-    def action_add_chunk(self) -> None:
-        cat = self.active_category
-        self._add_queue.append(cat)
-        self.notify_status(f"Queued +{self.balloon.chunk_mb} MiB {cat.upper()}...", severity="warning", timeout=1.5)
-        self.refresh_dashboards()
-
-        if not self._worker_running:
-            self._worker_running = True
-            self.run_worker(self._worker_add_loop, thread=True, exit_on_error=False, group="balloon")
-
-    def _worker_add_loop(self) -> None:
-        try:
-            while self._add_queue:
-                cat = self._add_queue.pop(0)
-                fn = {
-                    "dormant": self.balloon.add_dormant,
-                    "active": self.balloon.add_active,
-                    "clean": self.balloon.add_clean,
-                    "dirty": self.balloon.add_dirty,
-                    "shmem": self.balloon.add_shmem,
-                    "thrash": self.balloon.add_thrash,
-                }.get(cat)
-                success = fn() if fn else False
-                if success:
-                    rem = len(self._add_queue)
-                    rem_str = f" (remaining: {rem})" if rem > 0 else ""
-                    self.notify_status(f"Added +{self.balloon.chunk_mb} MiB {cat.upper()}{rem_str} (Total: {self.balloon.total_mb} MiB)")
-                else:
-                    self._add_queue.clear()
-                    self.notify_status(f"Allocation refused for {cat.upper()} (MemoryError/OSError)", severity="error", timeout=4.0)
-                    break
-                self.call_from_thread(self.refresh_dashboards)
-        finally:
-            self._worker_running = False
-            self.call_from_thread(self.refresh_dashboards)
-
-    def action_free_chunk(self) -> None:
-        cat = self.active_category
-        fn = {
-            "dormant": self.balloon.free_dormant,
-            "active": self.balloon.free_active,
-            "clean": self.balloon.free_clean,
-            "dirty": self.balloon.free_dirty,
-            "shmem": self.balloon.free_shmem,
-            "thrash": self.balloon.free_thrash,
-        }.get(cat)
-        if fn and fn():
-            self.notify_status(f"Freed -{self.balloon.chunk_mb} MiB {cat.upper()} (Total: {self.balloon.total_mb} MiB)")
-        else:
-            self.notify_status(f"No {cat.upper()} blocks to free.", severity="warning")
-        self.refresh_dashboards()
-
-    def action_pageout_zram(self) -> None:
-        self.notify_status("Paging out dormant memory to ZRAM (MADV_PAGEOUT)...", timeout=2.0)
-        self.refresh_dashboards()
-        self.run_worker(self._worker_pageout, thread=True, exit_on_error=False, group="balloon")
-
-    def _worker_pageout(self) -> None:
-        try:
-            mb = self.balloon.pageout_dormant()
-            self.notify_status(f"Pushed {mb} MiB dormant memory into ZRAM!")
-        finally:
-            self.call_from_thread(self.refresh_dashboards)
-
-    def action_sync_dirty(self) -> None:
-        mb = self.balloon.sync_dirty()
-        self.notify_status(f"Synced {mb} MiB dirty cache to disk.")
-        self.refresh_dashboards()
-
-    def action_drop_caches(self) -> None:
-        self.notify_status("Dropping caches...", severity="warning", timeout=2.0)
-        self.refresh_dashboards()
-        self.run_worker(self._worker_drop, thread=True, exit_on_error=False, group="balloon")
-
-    def _worker_drop(self) -> None:
-        try:
-            ok, msg = self.balloon.drop_caches()
-            self.notify_status(msg, severity="information" if ok else "error", timeout=3.5)
-        finally:
-            self.call_from_thread(self.refresh_dashboards)
-
-    def action_compact_zram(self) -> None:
-        self.notify_status("Compacting ZRAM memory...", severity="warning", timeout=2.0)
-        self.refresh_dashboards()
-        self.run_worker(self._worker_compact, thread=True, exit_on_error=False, group="balloon")
-
-    def _worker_compact(self) -> None:
-        try:
-            cnt, msg = self.balloon.compact_zram()
-            self.notify_status(msg, severity="information" if cnt > 0 else "error", timeout=3.5)
-        finally:
-            self.call_from_thread(self.refresh_dashboards)
-
-    def action_clear_all(self) -> None:
-        self._add_queue.clear()
-        self.balloon.clear()
-        self.notify_status("All synthetic balloon blocks cleared.", severity="warning")
-        self.refresh_dashboards()
-
-    def action_refresh_now(self) -> None:
-        self.refresh_dashboards()
-        self.scan_now()
-
-    def action_bail_out(self) -> None:
-        self.balloon.cleanup()
-        self.exit()
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        bid = event.button.id
-        if bid and bid.startswith("type_"):
-            self.action_set_type(bid[5:])
-            return
-        match bid:
-            case "btn_help":
-                self.action_help()
-            case "btn_quit":
-                self.action_bail_out()
-            case "btn_add":
-                self.action_add_chunk()
-            case "btn_free":
-                self.action_free_chunk()
-            case "btn_pageout":
-                self.action_pageout_zram()
-            case "btn_sync":
-                self.action_sync_dirty()
-            case "btn_drop":
-                self.action_drop_caches()
-            case "btn_compact":
-                self.action_compact_zram()
-            case "btn_clear":
-                self.action_clear_all()
-            case "btn_refresh":
-                self.action_refresh_now()
-
-
-# --------------------------------------------------------------------------- #
-#  CLI Entry Point                                                            #
-# --------------------------------------------------------------------------- #
 def main() -> int:
     parser = argparse.ArgumentParser(
-        prog="zram_test",
-        description="Dusky RAM Analyzer & Synthetic Memory Balloon Benchmark TUI.",
-    )
-    parser.add_argument(
-        "-i", "--interval", type=float, default=1.0,
-        help="Dashboard refresh interval in seconds (default: 1.0)"
-    )
-    parser.add_argument(
-        "-c", "--chunk", type=int, default=250,
-        help="MiB allocated per balloon chunk (default: 250)"
-    )
-    parser.add_argument(
-        "-r", "--root", action="store_true",
-        help="Opt-in privilege escalation via sudo (preserves terminal env)"
-    )
+        prog="zram_test", description="Dusky RAM Analyzer & Synthetic Memory Balloon Benchmark TUI.")
+    parser.add_argument("-i", "--interval", type=float, default=1.0,
+                        help="dashboard sampling interval in seconds (default: 1.0, min 0.25)")
+    parser.add_argument("-c", "--chunk", type=int, default=250,
+                        help="MiB allocated per balloon chunk (default: 250)")
+    parser.add_argument("-r", "--root", action="store_true",
+                        help="opt-in privilege escalation via sudo (preserves terminal env)")
     args = parser.parse_args()
-
     if args.root:
         elevate()
-
-    app = DuskyRAMAnalyzer(
-        interval=max(0.25, args.interval),
-        chunk_mb=max(1, args.chunk),
-    )
-    app.run()
-    print("\n[ok] Dusky RAM Analyzer terminated. All synthetic balloon blocks cleaned up.")
+    cache_dir, cache_fs = pick_cache_dir()
+    app = DuskyRAMAnalyzer(interval=max(0.25, args.interval), chunk_mb=max(1, args.chunk),
+                           cache_dir=cache_dir, cache_fs=cache_fs)
+    try:
+        app.run()
+    finally:
+        released = app.shutdown()
+    print(f"\n[ok] Dusky RAM Analyzer terminated; released {released} MiB of synthetic balloon memory.")
     return 0
 
 
