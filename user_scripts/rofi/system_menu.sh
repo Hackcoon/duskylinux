@@ -650,7 +650,7 @@ show_performance_menu() {
                 run_term_hold "zram_diag" "$SCRIPTS_DIR/arch_setup_scripts/scripts/208_check_zram0_zram1_setup.py"
                 ;;
             '  Kernel Compiler')
-                run_term_hold "dusky_kernel_compile" python3 "$SCRIPTS_DIR/kernel/dusky_kernal_compile.py"
+                run_term_hold "dusky_kernel_compile" python3 "$SCRIPTS_DIR/kernel/dusky_kernel_compiler/dusky_kernal_compile.py"
                 ;;
             '  Boot Manager')
                 run_term_hold "dusky_tui" python3 "$SCRIPTS_DIR/kernel/tui_kernal_systemd_boot.py"

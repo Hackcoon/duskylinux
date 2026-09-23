@@ -2,7 +2,7 @@
 
 ```mermaid
 flowchart TD
-    A[Launcher: bootstrap Python] --> B[Load TOML profile and schema]
+    A[Run Python compiler] --> B[Load TOML profile and schema]
     B --> C{Target hardware}
     C --> D[Inspect local CPU and hardware census]
     C --> E[Read complete exported target bundle]
@@ -24,7 +24,6 @@ flowchart TD
 
 | File | Responsibility |
 |---|---|
-| `kernel` | Python bootstrap and entry point |
 | `dusky_kernal_compile.py` | Hardware discovery, configuration, build and installation orchestration |
 | `kernel_profiles/schema.py` | Field defaults, validation and wizard metadata |
 | `kernel_profiles/*.toml` | Selectable tuning profiles |

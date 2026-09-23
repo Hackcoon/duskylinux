@@ -579,7 +579,7 @@ icon = "system-software-install-symbolic"
 style = "suggested"
 [pages.layout.items.on_press]
 type = "exec"
-command = "kitty --class dusky_kernel_compile --title \"Dusky Kernel Compiler\" --hold python3 $HOME/user_scripts/kernel/dusky_kernal_compile.py"
+command = "kitty --class dusky_kernel_compile --title \"Dusky Kernel Compiler\" --hold python3 $HOME/user_scripts/kernel/dusky_kernel_compiler/dusky_kernal_compile.py"
 
 
 [[pages]]

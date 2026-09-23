@@ -3,11 +3,11 @@
 Arch Linux, x86-64, Linux 7.2+, Python 3.14+, LLVM 21+ or current GCC. Keep this directory together: the engine loads its schema, runtime helper and optional patch files from adjacent paths.
 
 ```sh
-./kernel                         # Interactive menu; bootstraps Python if missing
-./kernel --doctor
-./kernel -p battery --wizard      # Review/override any exposed tuning option
-./kernel -p battery --no-install  # Build packages without installation
-./kernel -p battery --configure-only --print-matrix
+python3 dusky_kernal_compile.py                         # Interactive menu
+python3 dusky_kernal_compile.py --doctor
+python3 dusky_kernal_compile.py -p battery --wizard      # Review/override any exposed tuning option
+python3 dusky_kernal_compile.py -p battery --no-install  # Build packages without installation
+python3 dusky_kernal_compile.py -p battery --configure-only --print-matrix
 ```
 
 A build prompts to install missing Arch build dependencies and, when needed, modprobed-db from AUR. `--yes` authorizes automatic dependency installation. Strict pruning needs a census collected on the target with its relevant hardware/peripherals in use. The bundled `modules/modprobed.db` is never selected automatically for another machine.
@@ -42,14 +42,14 @@ Pruning is not just blindly deleting modules: root filesystem support, essential
 On the target:
 
 ```sh
-./kernel -p battery --export-bundle ~/target.tar.gz
+python3 dusky_kernal_compile.py -p battery --export-bundle ~/target.tar.gz
 ```
 
 On the build computer, import the bundled profile (or pass `-p NAME` to override it with a local profile):
 
 ```sh
-./kernel --import-bundle target.tar.gz
-./kernel -p remote_HOST --no-install
+python3 dusky_kernal_compile.py --import-bundle target.tar.gz
+python3 dusky_kernal_compile.py -p remote_HOST --no-install
 ```
 
 Import reports the exact generated profile name, such as `remote_oldpc_performance`. Package suffixes include both the source profile and target name, so target variants can coexist. Bundles require the current v3 format; re-export old bundles. They preserve CPU, memory, NUMA, GPU, filesystems, DKMS and module-census data. Unknown target CPUs fall back to the target's reported ISA level; export with Clang/GCC installed to capture the precise compiler CPU name. Remote builds automatically disable installation on the build computer. They cannot use `native` or fall back to the build computer's module list. Build parallelism uses the build computer's resources.
@@ -57,7 +57,7 @@ Import reports the exact generated profile name, such as `remote_oldpc_performan
 Copy the resulting kernel and headers packages to the target and install there:
 
 ```sh
-./kernel --install-pkg /path/to/linux-*.pkg.tar.zst
+python3 dusky_kernal_compile.py --install-pkg /path/to/linux-*.pkg.tar.zst
 ```
 
 Saved packages carry their resolved profile, including boot-entry preferences. Headers are required for target DKMS modules. Exact CPU targeting is for that target computer, not a general-purpose binary kernel.
