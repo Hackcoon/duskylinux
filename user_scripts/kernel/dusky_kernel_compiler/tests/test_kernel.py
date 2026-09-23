@@ -356,6 +356,25 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(first,mf.read_text());self.assertIn('LLVM ?= 1',first)
             self.assertIn('-march=core2',first);self.assertNotIn('KBUILD_CPPFLAGS',first)
 
+    def test_thinlto_policy_is_preflighted_before_makefile_injection(self):
+        with tempfile.TemporaryDirectory() as td:
+            tree = Path(td)
+            (tree / 'Makefile').write_text('VERSION = 7\nPATCHLEVEL = 3\n')
+            p = profile(); d = derived(p, tree=tree); d.lto = 'thin'
+            commands = []
+            def fake_run(cmd, **kwargs):
+                commands.append(cmd)
+                if cmd[0] == 'ld.lld':
+                    (kwargs['cwd'] / 'probe.so').write_bytes(b'linked')
+                return subprocess.CompletedProcess(cmd, 0, '')
+            with patch.object(k, 'THINLTO_CACHE_DIR', tree / 'persistent-cache'), \
+                 patch.object(k, 'host_facts', return_value=facts()), patch.object(k, 'run', side_effect=fake_run):
+                k.link_thinlto_cache(tree, p, d)
+            self.assertEqual([cmd[0] for cmd in commands], ['clang', 'ld.lld'])
+            policy = '--thinlto-cache-policy=cache_size=0%:cache_size_bytes=20g'
+            self.assertIn(policy, commands[1])
+            self.assertIn(policy, (tree / 'Makefile').read_text())
+
     def test_zero_job_override_restores_auto(self):
         p=profile();p.set('compiler','jobs',8)
         k.apply_overrides(p,k.Overrides(jobs=0))

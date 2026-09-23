@@ -4275,7 +4275,18 @@ def link_thinlto_cache(tree: Path, p: KernelProfile, d: Derived) -> None:
             raise BuildError(f"Expected a cache symlink, found {link}; use --fresh")
         link.symlink_to(cache, target_is_directory=True)
         size = p.g("compiler", "thinlto_cache_size_gb")
-        flags += f" --thinlto-cache-dir=.thinlto-cache --thinlto-cache-policy=cache_size=0:cache_size_bytes={size}g"
+        flags += f" --thinlto-cache-dir=.thinlto-cache --thinlto-cache-policy=cache_size=0%:cache_size_bytes={size}g"
+    # Exercise the exact flags with this host's Clang/LLD before a long kernel build.
+    with tempfile.TemporaryDirectory(prefix=".lld-probe-", dir=tree) as probe_dir:
+        probe = Path(probe_dir)
+        (probe / "probe.c").write_text("int dusky_lto_probe(void) { return 42; }\n")
+        if p.g("compiler", "thinlto_cache"):
+            (probe / ".thinlto-cache").mkdir()
+        run(["clang", "-flto=thin", "-fPIC", "-c", "probe.c", "-o", "probe.o"], cwd=probe, timeout=30)
+        cp = run(["ld.lld", "-shared", "probe.o", "-o", "probe.so", *shlex.split(flags)],
+                 cwd=probe, check=False, timeout=30)
+        if cp.returncode or not (probe / "probe.so").is_file():
+            raise BuildError(f"LLD rejected ThinLTO linker flags before kernel build: {cp.stdout.strip() or f'exit {cp.returncode}'}")
     makefile = tree / "Makefile"
     marker = "\n# Dusky LLD cache and parallelism\n"
     text = makefile.read_text().split(marker)[0]
