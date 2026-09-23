@@ -36,9 +36,11 @@ import collections
 import functools
 import fcntl
 from contextlib import contextmanager
+import gzip
 import hashlib
 import itertools
 import json
+import lzma
 import os
 import platform
 import re
@@ -2437,6 +2439,20 @@ def expected_sha256(archive_name: str, version: str) -> str | None:
     return None
 
 
+def archive_valid(path: Path, extension: str) -> bool:
+    """Check the tar header and read the entire compressed stream, including its checksum."""
+    try:
+        if not tarfile.is_tarfile(path):
+            return False
+        opener = gzip.open if extension == ".gz" else lzma.open if extension == ".xz" else open
+        with opener(path, "rb") as stream:
+            while stream.read(4 << 20):
+                pass
+        return True
+    except (OSError, EOFError, lzma.LZMAError, tarfile.TarError):
+        return False
+
+
 def download(url: str, dest: Path, fallback_urls: Sequence[str] = ()) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if not (have("aria2c") or have("curl")):
@@ -2466,7 +2482,7 @@ def download(url: str, dest: Path, fallback_urls: Sequence[str] = ()) -> None:
                    "--progress-bar", "-A", USER_AGENT, "-o", str(tmp), source]
         cp = run(cmd, check=False, capture=False)
         check_abort()
-        if cp.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0 and tarfile.is_tarfile(tmp):
+        if cp.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0 and archive_valid(tmp, dest.suffix):
             tmp.replace(dest)
             return
         if cp.returncode == 0:  # A successful HTTP response can still be an error page.

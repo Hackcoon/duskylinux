@@ -147,6 +147,17 @@ class AuditTests(unittest.TestCase):
             self.assertTrue(tarfile.is_tarfile(dest))
             self.assertEqual((Path(td) / (dest.name + '.part')).read_bytes(), b'incomplete')
 
+    def test_truncated_archive_is_rejected_before_caching(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive_path = Path(td) / 'linux.tar.gz'
+            with tarfile.open(archive_path, 'w:gz') as archive:
+                marker = tarfile.TarInfo('linux/')
+                marker.type = tarfile.DIRTYPE
+                archive.addfile(marker)
+            self.assertTrue(k.archive_valid(archive_path, '.gz'))
+            archive_path.write_bytes(archive_path.read_bytes()[:-8])
+            self.assertFalse(k.archive_valid(archive_path, '.gz'))
+
     def test_interactive_download_can_retry_original_then_switch_hosts(self):
         with tempfile.TemporaryDirectory() as td, patch.object(k, 'have', return_value=True), \
              patch.object(k, 'interactive', return_value=True), patch.object(k, 'ask', side_effect=['r', 'a']) as prompt:
