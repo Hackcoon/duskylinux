@@ -92,6 +92,8 @@ The mount name does not establish its storage type: `/mnt/zram1` on the audited 
 
 `boot.write_entries` controls systemd-boot entries; `boot.set_default` separately controls changing the default boot selection. GRUB/UKI installations retain their existing command-line integration. No runtime service is started on the build host during compilation.
 
+For LLVM/ThinLTO builds, generated headers force `ld.lld` for external modules even when a DKMS wrapper passes `LD=ld`. Before installing Linux 7.3+ with NVIDIA 615.71.09, the installer applies the exact-match compatibility patch in `compat/` for the changed dmem cgroup API; it stops before replacing boot images if that source no longer matches. A newer NVIDIA release may need different compatibility work. DKMS and boot success still need verification on each target machine.
+
 ## Validation
 
 ```sh

@@ -4502,7 +4502,10 @@ def prepare_extmod_build(tree: Path, d: Derived, env: Mapping[str, str]) -> None
     anchor = "export KBUILD_EXTMOD\n"
     if anchor not in text:
         raise BuildError("Kbuild external-module layout changed; cannot prepare headers")
-    toolchain = "LLVM ?= 1\n" if d.toolchain == "llvm" else "CC = gcc\nLD = ld.bfd\n"
+    # Some external-module wrappers (notably NVIDIA's) pass LD=ld on their
+    # command line. That overrides ordinary Makefile assignments and cannot
+    # link ThinLTO bitcode. Keep the linker paired with the built kernel.
+    toolchain = "LLVM ?= 1\noverride LD := ld.lld\n" if d.toolchain == "llvm" else "CC = gcc\nLD = ld.bfd\n"
     text = text.replace(anchor, anchor + start + "ifdef KBUILD_EXTMOD\n" + toolchain + "endif\n" + end, 1)
     marker = "\n# Dusky external-module CPU flags\n"
     text = text.split(marker)[0]
@@ -4641,56 +4644,67 @@ def _kernelreleases_for_pkgbases(pkgbases: set[str]) -> dict[str, str]:
     return found
 
 
-def audit_dkms(pkgbases: set[str]) -> bool:
-    """Ensure registered modules exist for each installed target kernel.
-
-    Missing target entries are covered by autoinstall; non-installed entries are
-    retried explicitly. Failures block boot promotion.
-    """
+def audit_dkms(krel: str, pkgbase: str) -> bool:
+    """Verify DKMS for the kernel just installed, never an older release of its flavor."""
     if not have("dkms"):
         return True
     try:
-        targets = _kernelreleases_for_pkgbases(set(pkgbases))
+        targets = _kernelreleases_for_pkgbases({pkgbase})
     except OSError:
         targets = {}
-    if not targets:
-        warn("No installed kernel module directories match " + ", ".join(sorted(pkgbases)))
+    if targets.get(krel) != pkgbase:
+        warn(f"Installed kernel {krel} has no matching pkgbase {pkgbase}")
         return False
-    PRIV.ensure()
-    for krel in sorted(targets):
-        if PRIV.run(["dkms", "autoinstall", "-k", krel], check=False).returncode:
-            warn(f"DKMS autoinstall failed for {krel}")
-            return False
-    try:
-        cp = run(["dkms", "status"], check=False, timeout=60)
+
+    def status() -> tuple[set[tuple[str, str]], dict[tuple[str, str], str]] | None:
+        try:
+            cp = run(["dkms", "status"], check=False, timeout=60)
+        except DuskyError as e:
+            warn(f"dkms status failed: {e}")
+            return None
         if cp.returncode:
             warn("dkms status failed; installed module state could not be verified")
-            return False
-    except DuskyError as e:
-        warn(f"DKMS status failed: {e}")
+            return None
+        registered: set[tuple[str, str]] = set()
+        current: dict[tuple[str, str], str] = {}
+        for line in (cp.stdout or "").splitlines():
+            head = re.match(r"^([^/,]+)/([^,:]+)", line.strip())
+            if head:
+                registered.add((head.group(1), head.group(2)))
+            match = _DKMS_STATUS_RE.match(line.strip())
+            if match and match.group(3) == krel:
+                current[(match.group(1), match.group(2))] = match.group(4).strip()
+        return registered, current
+
+    before = status()
+    if before is None:
         return False
-    stale: list[tuple[str, str, str, str]] = []
-    for line in (cp.stdout or "").splitlines():
-        m = _DKMS_STATUS_RE.match(line.strip())
-        if not m:
-            continue
-        mod, ver, krel, state = m.group(1), m.group(2), m.group(3), m.group(4)
-        if krel in targets and not state.startswith("installed"):
-            stale.append((mod, ver, krel, state))
-    if not stale:
-        ok("DKMS modules up to date for " + ", ".join(f"{k} ({b})" for k, b in sorted(targets.items())))
+    registered, current = before
+    if not registered or all(current.get(module, "").startswith("installed") for module in registered):
+        ok(f"DKMS modules up to date for {krel} ({pkgbase})")
         return True
     PRIV.ensure()
-    failed: list[str] = []
-    for mod, ver, krel, state in stale:
-        warn(f"DKMS {mod}/{ver} for {krel} is '{state.strip()}' (not installed) -- rebuilding")
-        r = PRIV.run(["dkms", "install", "--force", f"{mod}/{ver}", "-k", krel], check=False)
-        if r.returncode != 0:
-            failed.append(f"{mod}/{ver} for {krel}")
-    if failed:
-        warn("DKMS rebuild failed for: " + ", ".join(failed))
+    result = PRIV.run(["dkms", "autoinstall", "-k", krel], check=False)
+    after = status()
+    if after is None:
         return False
-    ok("DKMS modules rebuilt for " + ", ".join(sorted({k for _, _, k, _ in stale})))
+    registered, current = after
+    for mod, ver in sorted(registered):
+        if current.get((mod, ver), "").startswith("built"):
+            warn(f"DKMS {mod}/{ver} for {krel} is built but not installed; forcing installation")
+            PRIV.run(["dkms", "install", "--force", f"{mod}/{ver}", "-k", krel], check=False)
+    final = status()
+    if final is None:
+        return False
+    registered, current = final
+    missing = [f"{mod}/{ver} ({current.get((mod, ver), 'missing')})" for mod, ver in sorted(registered)
+               if not current.get((mod, ver), "").startswith("installed")]
+    if missing:
+        warn(f"DKMS missing for {krel}: {', '.join(missing)}")
+        if result.returncode:
+            warn(f"dkms autoinstall exited {result.returncode}; review /var/lib/dkms/<module>/<version>/build/make.log")
+        return False
+    ok(f"DKMS modules up to date for {krel} ({pkgbase})")
     return True
 
 
@@ -4705,9 +4719,29 @@ def ensure_install_dependencies(p: KernelProfile) -> None:
         PRIV.run(["pacman", "-S", "--needed", "--noconfirm", *missing], capture=False)
 
 
-def install_packages(pkgs: Sequence[Path], profile: KernelProfile) -> None:
+def prepare_nvidia_615_for_linux_73(kernelrelease: str) -> None:
+    """Adapt NVIDIA 615's old dmem API before pacman's DKMS hook runs."""
+    if version_tuple(kernelrelease) < (7, 3):
+        return
+    source = Path("/usr/src/nvidia-615.71.09")
+    if not (source / "kernel-open/nvidia/os-interface.c").is_file():
+        return
+    patch_file = SCRIPT_DIR / "compat/nvidia-615.71.09-linux-7.3.patch"
+    if not have("patch") or not patch_file.is_file():
+        raise DependencyError("NVIDIA 615 Linux 7.3 compatibility patch or patch tool is missing")
+    cmd = ["patch", "--batch", "--silent", "--dry-run", "-d", str(source), "-p1", "-i", str(patch_file)]
+    if run([*cmd, "--reverse"], check=False).returncode == 0:
+        return
+    if run([*cmd, "--forward"], check=False).returncode:
+        raise BuildError("NVIDIA 615 source does not match the validated Linux 7.3 compatibility patch; installation stopped before replacing boot images")
+    PRIV.run(["patch", "--batch", "--forward", "-d", str(source), "-p1", "-i", str(patch_file)])
+    ok("Adapted NVIDIA 615 dmem cgroup API for Linux 7.3+ DKMS")
+
+
+def install_packages(pkgs: Sequence[Path], profile: KernelProfile, kernelrelease: str) -> None:
     rule("Install packages (pacman -U)")
     ensure_install_dependencies(profile)
+    prepare_nvidia_615_for_linux_73(kernelrelease)
     PRIV.ensure()
     # Ensure /etc/mkinitcpio.d/<pkgbase>.preset exists so the pacman mkinitcpio hook runs for this kernel
     preset_path = Path(f"/etc/mkinitcpio.d/{profile.pkgbase}.preset")
@@ -4733,7 +4767,7 @@ def install_packages(pkgs: Sequence[Path], profile: KernelProfile) -> None:
         ensure_modprobed_db_service(prompt=False)
     # Same-version reinstalls can leave DKMS objects stale ("built" instead of
     # "installed", then Exec format error at modprobe). Audit and force-rebuild.
-    if not audit_dkms({profile.pkgbase}):
+    if not audit_dkms(kernelrelease, profile.pkgbase):
         raise BuildError("Kernel installed, but DKMS failed; boot configuration was not promoted. Review DKMS logs before rebooting.")
 
     # DKMS repairs happen after pacman hooks: include their resulting modules.
@@ -5214,7 +5248,7 @@ def do_build(args: argparse.Namespace) -> int:
             say(f"  {C.CYAN}⏱ Total process time:{C.RESET} {fmt_duration(total_wall)}")
             send_notification("Kernel build complete", f"{d.kernelrelease} ({profile.name}) compiled in {fmt_duration(d.compile_duration)}", icon="dialog-information")
             return 0
-        install_packages(pkgs, profile)
+        install_packages(pkgs, profile, d.kernelrelease)
         refresh_boot(profile, facts, d, kernel_install=bool(args.kernel_install))
         total_wall = time.time() - compile_wall_start
         rule("Done")
@@ -5520,6 +5554,23 @@ def packaged_profile(pkgs: Sequence[Path], pkgbase: str) -> KernelProfile | None
     return None
 
 
+def packaged_kernelrelease(pkgs: Sequence[Path], pkgbase: str) -> str:
+    """Read the exact kernel release from the package, not old installed module trees."""
+    for pkg in pkgs:
+        try:
+            with tarfile.open(pkg, "r:*") as archive:
+                for member in archive:
+                    match = re.fullmatch(r"usr/lib/modules/([^/]+)/pkgbase", member.name.removeprefix("./"))
+                    if not match or not member.isfile():
+                        continue
+                    with archive.extractfile(member) as stream:
+                        if stream.read().decode("utf-8", "replace").strip() == pkgbase:
+                            return match.group(1)
+        except (tarfile.TarError, OSError, EOFError) as e:
+            raise ProfileError(f"Cannot read kernel release from {pkg}: {e}") from e
+    raise ProfileError(f"Kernel package for {pkgbase} has no usr/lib/modules/<release>/pkgbase")
+
+
 def do_install_pkg(args: argparse.Namespace) -> int:
     banner()
     rule("Install saved kernel packages")
@@ -5543,17 +5594,13 @@ def do_install_pkg(args: argparse.Namespace) -> int:
     for pkgbase, pkgs in sorted(groups.items()):
         wanted = getattr(args, "profile", None)
         profile = (packaged_profile(pkgs, pkgbase) if wanted is None else None) or _resolve_install_profile(pkgbase, wanted, facts)
+        krel = packaged_kernelrelease(pkgs, pkgbase)
         info(f"{pkgbase}: using profile '{profile.name}' for preset and boot entries")
-        install_packages(sorted(pkgs), profile)
-        krels = sorted(_kernelreleases_for_pkgbases({pkgbase}))
-        if not krels:
-            warn(f"No /usr/lib/modules/<krel> with pkgbase {pkgbase} after install; skipping bootloader refresh")
-            continue
-        for krel in krels:
-            d = Derived(facts=facts, idx=KconfigIndex(frozenset(), 3), tree=Path("."), version=krel, sched="eevdf",
-                        toolchain="llvm", lto="none", btf=False, tracing="minimal", rust=False, rust_reason="",
-                        fdo="none", fdo_reason="", kernelrelease=krel)
-            refresh_boot(profile, facts, d, kernel_install=bool(getattr(args, "kernel_install", False)))
+        install_packages(sorted(pkgs), profile, krel)
+        d = Derived(facts=facts, idx=KconfigIndex(frozenset(), 3), tree=Path("."), version=krel, sched="eevdf",
+                    toolchain="llvm", lto="none", btf=False, tracing="minimal", rust=False, rust_reason="",
+                    fdo="none", fdo_reason="", kernelrelease=krel)
+        refresh_boot(profile, facts, d, kernel_install=bool(getattr(args, "kernel_install", False)))
     rule("Done")
     ok("Saved packages installed; reboot to test.")
     send_notification("Kernel packages installed", ", ".join(sorted(groups)), icon="dialog-information")

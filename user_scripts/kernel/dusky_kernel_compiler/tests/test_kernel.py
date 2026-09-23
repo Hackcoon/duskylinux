@@ -354,6 +354,7 @@ class AuditTests(unittest.TestCase):
             tree=Path(td);mf=tree/'Makefile';mf.write_text('export KBUILD_EXTMOD\n')
             k.prepare_extmod_build(tree,d,env);first=mf.read_text();k.prepare_extmod_build(tree,d,env)
             self.assertEqual(first,mf.read_text());self.assertIn('LLVM ?= 1',first)
+            self.assertIn('override LD := ld.lld',first)
             self.assertIn('-march=core2',first);self.assertNotIn('KBUILD_CPPFLAGS',first)
 
     def test_thinlto_policy_is_preflighted_before_makefile_injection(self):
@@ -516,14 +517,38 @@ class AuditTests(unittest.TestCase):
             self.assertEqual((policy / 'scaling_governor').read_text().strip(), 'powersave')
 
     def test_dkms_autoinstall_covers_missing_target_entries(self):
+        old = subprocess.CompletedProcess([], 0, 'nvidia/1.0, 7.2-old, x86_64: installed\n')
+        new = subprocess.CompletedProcess([], 0, 'nvidia/1.0, 7.3-test, x86_64: installed\n')
         done = subprocess.CompletedProcess([], 0, '')
-        with patch.object(k, 'have', return_value=True), patch.object(k, '_kernelreleases_for_pkgbases', return_value={'7.3-test':'linux-test'}), patch.object(k.PRIV, 'ensure'), patch.object(k.PRIV, 'run', return_value=done) as privileged, patch.object(k, 'run', return_value=done):
-            self.assertTrue(k.audit_dkms({'linux-test'}))
+        with patch.object(k, 'have', return_value=True), patch.object(k, '_kernelreleases_for_pkgbases', return_value={'7.2-old':'linux-test', '7.3-test':'linux-test'}), patch.object(k.PRIV, 'ensure'), patch.object(k.PRIV, 'run', return_value=done) as privileged, patch.object(k, 'run', side_effect=[old, new, new]):
+            self.assertTrue(k.audit_dkms('7.3-test', 'linux-test'))
             privileged.assert_called_once_with(['dkms', 'autoinstall', '-k', '7.3-test'], check=False)
 
     def test_dkms_status_failure_is_not_success(self):
         with patch.object(k, 'have', return_value=True), patch.object(k, '_kernelreleases_for_pkgbases', return_value={'7.3-test':'linux-test'}), patch.object(k.PRIV, 'ensure'), patch.object(k.PRIV, 'run', return_value=subprocess.CompletedProcess([], 0, '')), patch.object(k, 'run', return_value=subprocess.CompletedProcess([], 1, 'broken status')):
-            self.assertFalse(k.audit_dkms({'linux-test'}))
+            self.assertFalse(k.audit_dkms('7.3-test', 'linux-test'))
+
+    def test_dkms_ignores_old_kernel_with_same_pkgbase(self):
+        statuses = subprocess.CompletedProcess([], 0, 'nvidia/1.0, 7.2-old, x86_64: built\nnvidia/1.0, 7.3-test, x86_64: installed\n')
+        with patch.object(k, 'have', return_value=True), patch.object(k, '_kernelreleases_for_pkgbases', return_value={'7.2-old':'linux-test', '7.3-test':'linux-test'}), patch.object(k.PRIV, 'run') as privileged, patch.object(k, 'run', return_value=statuses):
+            self.assertTrue(k.audit_dkms('7.3-test', 'linux-test'))
+            privileged.assert_not_called()
+
+    def test_dkms_missing_new_kernel_module_fails_even_if_old_is_installed(self):
+        statuses = subprocess.CompletedProcess([], 0, 'nvidia/1.0, 7.2-old, x86_64: installed\n')
+        failed = subprocess.CompletedProcess([], 10, '')
+        with patch.object(k, 'have', return_value=True), patch.object(k, '_kernelreleases_for_pkgbases', return_value={'7.2-old':'linux-test', '7.3-test':'linux-test'}), patch.object(k.PRIV, 'ensure'), patch.object(k.PRIV, 'run', return_value=failed), patch.object(k, 'run', return_value=statuses):
+            self.assertFalse(k.audit_dkms('7.3-test', 'linux-test'))
+
+    def test_saved_package_identifies_exact_kernelrelease(self):
+        with tempfile.TemporaryDirectory() as td:
+            pkg = Path(td) / 'linux-test.pkg.tar.gz'
+            with tarfile.open(pkg, 'w:gz') as archive:
+                content = b'linux-test\n'
+                member = tarfile.TarInfo('./usr/lib/modules/7.3-test/pkgbase')
+                member.size = len(content)
+                archive.addfile(member, io.BytesIO(content))
+            self.assertEqual(k.packaged_kernelrelease([pkg], 'linux-test'), '7.3-test')
 
     def test_manifest_rejects_corrupt_cpu_count(self):
         with tempfile.TemporaryDirectory() as td:
