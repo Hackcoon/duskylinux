@@ -76,6 +76,19 @@ class AuditTests(unittest.TestCase):
         p.set('release', 'pin', '7.3-rc4'); p.set('release', 'allow_rc', False)
         with self.assertRaises(k.ProfileError): k.cross_validate(p)
 
+    def test_included_profiles_default_to_stable_without_automatic_rc(self):
+        releases = [k.Release('7.3-rc4', 'mainline', '', 'rc', None),
+                    k.Release('7.2.7', 'stable', '', 'stable', None)]
+        for name in ('battery', 'performance', 'extreme_power', 'low_memory'):
+            with self.subTest(profile=name):
+                p = k.load_profile(k.SCRIPT_DIR / 'kernel_profiles' / f'{name}.toml')
+                self.assertEqual(p.g('release', 'channel'), 'stable')
+                self.assertFalse(p.g('release', 'allow_rc'))
+                with patch.object(k, 'interactive', return_value=True), patch.object(k, 'table'), \
+                     patch.object(k, 'ask_index', side_effect=lambda _label, _maximum, default: default):
+                    self.assertEqual(k.choose_release(p, releases).version, '7.2.7')
+                with patch.object(k, 'interactive', return_value=False):
+                    self.assertEqual(k.choose_release(p, releases).version, '7.2.7')
     def test_release_picker_shows_supported_channels_and_profile_default(self):
         releases = [k.Release('7.3-rc4', 'mainline', '2026-09-20', 'rc', None),
                     k.Release('7.2.7', 'stable', '2026-09-21', 'stable', None),

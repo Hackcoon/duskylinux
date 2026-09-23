@@ -16,9 +16,9 @@ portable_package = false        # Allows native CPU instruction optimization on 
 # [release] — Upstream Branch & Integrity
 # ==============================================================================
 [release]
-channel = "mainline"            # Track latest mainline (currently 7.3-rc; advances with upstream)
+channel = "stable"              # Default to the newest stable release; RCs remain manual choices
 pin = ""
-allow_rc = true                 # Allow mainline release candidates
+allow_rc = false                # Never select an RC automatically
 min_version = "7.2"
 require_signature = true        # Verify PGP signatures with kernel.org release keys
 

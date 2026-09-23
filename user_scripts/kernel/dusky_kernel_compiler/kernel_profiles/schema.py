@@ -43,8 +43,8 @@ CMDLINE_CHOICES: Final = ("bake", "entry", "print")
 # Per-choice context shown by the wizard (section, key) -> {value: explanation}
 CHOICE_HELP: Final[dict[tuple[str, str], dict[str, str]]] = {
     ("release", "channel"): {
-        "mainline": "Linus' tree: newest features; 7.3-rc snapshots when allow_rc=true",
-        "stable": "latest stable point release (7.2.y) -- recommended for daily drivers",
+        "mainline": "Linus' tree: newest features and release candidates when allow_rc=true",
+        "stable": "latest stable point release -- recommended for daily drivers",
         "longterm": "LTS branch (still subject to the >= 7.2 floor)",
     },
     ("cpu", "arch"): {
@@ -240,9 +240,9 @@ PROFILE_SPEC: Final[dict[str, tuple[FieldSpec, ...]]] = {
         F("manifest_path", "str", "", "Path to target hardware manifest.json for remote builds", wizard=False),
     ),
     "release": (
-        F("channel", "str", "mainline", "Preferred upstream release channel for the interactive picker", CHANNEL_CHOICES),
+        F("channel", "str", "stable", "Preferred upstream release channel for the interactive picker", CHANNEL_CHOICES),
         F("pin", "str", "", "Exact unattended version; preselected in the interactive picker (e.g. 7.2.3 or 7.3-rc2)"),
-        F("allow_rc", "bool", True, "Allow -rc as the automatic mainline choice; interactive selection can override"),
+        F("allow_rc", "bool", False, "Allow -rc as the automatic mainline choice; interactive selection can override"),
         F("min_version", "str", "7.2", "Hard floor; anything older is rejected", wizard=False),
         F("require_signature", "bool", True, "Require PGP or SHA256 verification of release tarballs"),
     ),
@@ -486,4 +486,3 @@ SECURITY_BUNDLES: Final[dict[str, dict[str, Any]]] = {
                  "slab_freelist_hardened": True, "slab_freelist_random": True, "randomize_kstack": True, "ubsan_bounds": True, "lockdown_early": True},
 }
 FOOTPRINT_RANK: Final = {name: i for i, name in enumerate(FOOTPRINT_CHOICES)}
-

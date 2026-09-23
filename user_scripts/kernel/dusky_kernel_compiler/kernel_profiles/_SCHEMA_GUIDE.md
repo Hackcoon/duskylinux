@@ -27,11 +27,11 @@ manifest_path = ""
 
 [release]
 # Upstream release channel | choices: mainline | stable | longterm
-channel = "mainline"
+channel = "stable"
 # Exact version pin (e.g. 7.2.3 or 7.3-rc2); empty = newest in channel
 pin = ""
 # Allow -rc snapshot tarballs (mainline)
-allow_rc = true
+allow_rc = false
 # Hard floor; anything older is rejected
 min_version = "7.2"
 # Require PGP or SHA256 verification of release tarballs
