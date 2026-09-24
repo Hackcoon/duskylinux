@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dusky Drive Health v2.4.0 (Arch Linux Kernel 7.1+ / Python 3.14.6+ Edition)
+Dusky Drive Health v2.5.0 (Arch Linux Kernel 7.3+ / Python 3.14.6+ Edition)
 
 Multi-interface SSD wear-leveling & FTL over-provisioning diagnostic suite.
 Audits NVMe and SATA/SCSI SSD SMART logs, resolves partition extents and
@@ -8,7 +8,12 @@ unallocated gaps, samples read-only unallocated sector content, and executes
 erase-block aligned and hardware-chunked blkdiscards to clear dirty free space.
 
 Design principles:
-  * Arch Linux rolling baseline (Kernel 7.1+, Python 3.14.6+, util-linux 2.42+).
+  * Arch Linux rolling baseline (Kernel 7.3+, Python 3.14.6+, util-linux 2.42+).
+  * Modern nvme-cli 2.x/3.x syntax (`nvme log smart`, `nvme id ctrl`).
+  * Rotational media (mechanical HDD) auto-detection and TRIM/discard safety guards.
+  * Multi-format encryption detection (LUKS1/LUKS2 and BitLocker).
+  * 4Kn dynamic sector size awareness for unallocated gap calculations.
+  * DLFEAT-compliant deallocation verification (both 0x00 and 0xFF unmapped blocks).
   * PEP 695 type statements (`type SectorRange = ...`).
   * Discard requests aligned to 4 MiB erase-block safety floor and chunked to
     the device's `queue/discard_max_bytes` to prevent kernel ioctl EINVAL failures.
@@ -56,7 +61,7 @@ except ImportError:
     )
     sys.exit(1)
 
-VERSION: Final[str] = "2.4.0"
+VERSION: Final[str] = "2.5.0"
 console: Final[Console] = Console()
 PANEL_WIDTH: Final[int] = min(console.width if console.is_terminal else 132, 132)
 
@@ -92,11 +97,22 @@ class PartitionInfo:
     is_luks: bool = False
     allow_discards: bool = False
     discard_mounted: bool = False
+    crypto_type: str = ""
 
     @property
     def number(self) -> int:
         m = re.search(r"(\d+)$", self.name)
         return int(m.group(1)) if m else 0
+
+    @property
+    def is_encrypted(self) -> bool:
+        return self.is_luks or bool(self.crypto_type)
+
+    @property
+    def resolved_crypto_type(self) -> str:
+        if self.crypto_type:
+            return self.crypto_type
+        return "LUKS" if self.is_luks else ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,8 +142,10 @@ QLC_PATTERNS: Final[tuple[str, ...]] = (
 
 FS_COLORS: Final[dict[str, str]] = {
     "btrfs": "green", "ext4": "cyan", "ext3": "cyan", "ext2": "cyan",
-    "xfs": "blue", "f2fs": "magenta", "vfat": "yellow", "ntfs": "red",
-    "swap": "bright_red", "crypto_LUKS": "bright_magenta",
+    "xfs": "blue", "f2fs": "magenta", "vfat": "yellow", "fat32": "yellow",
+    "fat16": "yellow", "ntfs": "red", "exfat": "yellow", "bcachefs": "bright_green",
+    "nilfs2": "bright_blue", "swap": "bright_red", "crypto_LUKS": "bright_magenta",
+    "BitLocker": "bright_magenta", "bitlk": "bright_magenta", "zfs": "bright_cyan",
 }
 
 # =============================================================================
@@ -224,7 +242,28 @@ def _read_text(path: str) -> str | None:
 # =============================================================================
 # Hardware Helper Calculations
 # =============================================================================
-def detect_flash_type(model: str, percentage_used: int, tbw_written: float, capacity_tb: float) -> str:
+def is_rotational(device: str, is_mock: bool = False) -> bool:
+    if is_mock:
+        return False
+    dev_name = os.path.basename(device)
+    m = re.match(r"^(nvme\d+n\d+|sd[a-z]+|vd[a-z]+|hd[a-z]+|xvd[a-z]+|mmcblk\d+)", dev_name)
+    base_dev = m.group(1) if m else dev_name
+
+    if content := _read_text(f"/sys/block/{base_dev}/queue/rotational"):
+        return content.strip() == "1"
+
+    res = _run_json(["lsblk", "-d", "-J", "-o", "ROTA", f"/dev/{base_dev}"])
+    if res and isinstance(res, dict):
+        devs = res.get("blockdevices", [])
+        if devs:
+            rota = str(devs[0].get("rota", "0")).lower()
+            return rota in ("1", "true")
+    return False
+
+
+def detect_flash_type(model: str, percentage_used: int, tbw_written: float, capacity_tb: float, is_hdd: bool = False) -> str:
+    if is_hdd:
+        return "Magnetic Platter (HDD)"
     m = model.upper()
     if any(pat in m for pat in QLC_PATTERNS):
         return "QLC"
@@ -333,10 +372,17 @@ def get_mount_discards() -> dict[str, bool]:
         for line in content.splitlines():
             parts = line.split()
             if len(parts) >= 4:
+                src = parts[0]
                 options = parts[3].split(",")
-                discards[parts[0]] = any(
+                has_discard = any(
                     opt == "discard" or opt.startswith("discard=") for opt in options
                 )
+                discards[src] = has_discard
+                if src.startswith("/dev/"):
+                    with suppress(OSError):
+                        real_src = os.path.realpath(src)
+                        if real_src != src:
+                            discards[real_src] = has_discard
     return discards
 
 
@@ -381,13 +427,21 @@ def resolve_mountpoints(part_name: str, tree: DeviceTree) -> list[str]:
     return list(seen)
 
 
-def analyze_partition_discard(part_name: str, tree: DeviceTree, mount_discards: dict[str, bool]) -> tuple[bool, bool]:
+def analyze_partition_discard(part_name: str, tree: DeviceTree, mount_discards: dict[str, bool]) -> tuple[bool, bool, str]:
     node = tree.get(part_name, {})
-    fstype = node.get("fstype", "")
-    is_luks = "crypto_LUKS" in fstype or "luks" in fstype.lower()
+    fstype = str(node.get("fstype") or "")
+    node_type = str(node.get("type") or "")
 
-    if not is_luks:
-        return False, mount_discards.get(f"/dev/{part_name}", False)
+    crypto_type = ""
+    if "crypto_LUKS" in fstype or "luks" in fstype.lower():
+        crypto_type = "LUKS"
+    elif "bitlocker" in fstype.lower() or "bitlk" in fstype.lower():
+        crypto_type = "BitLocker"
+    elif node_type == "crypt":
+        crypto_type = "Crypt"
+
+    if not crypto_type:
+        return False, mount_discards.get(f"/dev/{part_name}", False), ""
 
     allow_discards, discard_mounted = False, False
 
@@ -402,12 +456,13 @@ def analyze_partition_discard(part_name: str, tree: DeviceTree, mount_discards: 
             walk(child)
 
     walk(part_name)
-    return allow_discards, discard_mounted
+    return allow_discards, discard_mounted, crypto_type
 
 
-def _compute_gaps_from_json(pt_json: dict[str, Any], total_sectors: int) -> list[SectorRange]:
+def _compute_gaps_from_json(pt_json: dict[str, Any], total_sectors: int, sector_size: int = 512) -> list[SectorRange]:
     pt = pt_json.get("partitiontable", {})
-    firstlba = int(pt.get("firstlba", 2048))
+    min_gap_sectors = max(1, (1024 * 1024) // sector_size)
+    firstlba = int(pt.get("firstlba", min_gap_sectors))
     lastlba = int(pt.get("lastlba", total_sectors - 1))
     partitions = pt.get("partitions", [])
 
@@ -423,11 +478,11 @@ def _compute_gaps_from_json(pt_json: dict[str, Any], total_sectors: int) -> list
         p_size = int(p.get("size", 0))
         p_end = p_start + p_size - 1
 
-        if p_start > curr:
+        if p_start > curr and (p_start - curr) >= min_gap_sectors:
             gaps.append((curr, p_start - 1))
         curr = max(curr, p_end + 1)
 
-    if curr <= lastlba:
+    if curr <= lastlba and (lastlba - curr + 1) >= min_gap_sectors:
         gaps.append((curr, lastlba))
 
     return gaps
@@ -462,13 +517,13 @@ def parse_partition_table(device: str) -> DiskLayout | None:
         fstype = root.get("fstype", "")
         if fstype:
             mps = list(dict.fromkeys(root.get("mountpoints", [])))
-            allow_d, disc_m = analyze_partition_discard(dev_name, tree, get_mount_discards())
+            allow_d, disc_m, crypto_type = analyze_partition_discard(dev_name, tree, get_mount_discards())
             partitions = [
                 PartitionInfo(
                     name=dev_name, start_sector=0, end_sector=total_sectors - 1,
                     size_sectors=total_sectors, fs_type=fstype,
                     mountpoint=", ".join(mps) if mps else "unmounted",
-                    is_luks="crypto_LUKS" in fstype or "luks" in fstype.lower(),
+                    is_luks=(crypto_type == "LUKS"), crypto_type=crypto_type,
                     allow_discards=allow_d, discard_mounted=disc_m,
                 )
             ]
@@ -483,6 +538,7 @@ def parse_partition_table(device: str) -> DiskLayout | None:
             unallocated_gaps=[(0, total_sectors - 1)], discard_granularity=disc_gran, discard_max_bytes=disc_max,
         )
 
+    min_gap_sectors = max(1, (1024 * 1024) // sector_size)
     gaps: list[SectorRange] = []
     res_free = _run(["sfdisk", "--list-free", device])
     if res_free and res_free.returncode == 0 and res_free.stdout:
@@ -490,11 +546,11 @@ def parse_partition_table(device: str) -> DiskLayout | None:
             parts = line.strip().split()
             if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit() and parts[2].isdigit():
                 start, end, sectors = int(parts[0]), int(parts[1]), int(parts[2])
-                if sectors >= 2048:
+                if sectors >= min_gap_sectors:
                     gaps.append((start, end))
 
     if not gaps:
-        gaps = _compute_gaps_from_json(pt_data, total_sectors)
+        gaps = _compute_gaps_from_json(pt_data, total_sectors, sector_size)
 
     pt = pt_data.get("partitiontable", {})
     tree = build_device_tree(device)
@@ -509,11 +565,12 @@ def parse_partition_table(device: str) -> DiskLayout | None:
         fs_type = node.get("fstype") or "unknown"
         mps = resolve_mountpoints(name, tree)
         mp = "[SWAP]" if not mps and fs_type == "swap" else (", ".join(mps) if mps else "unmounted")
-        allow_discards, discard_mounted = analyze_partition_discard(name, tree, mount_discards)
+        allow_discards, discard_mounted, crypto_type = analyze_partition_discard(name, tree, mount_discards)
 
         partitions.append(PartitionInfo(
             name=name, start_sector=start, end_sector=start + size - 1, size_sectors=size,
-            fs_type=fs_type, mountpoint=mp, is_luks=("crypto_LUKS" in fs_type or "luks" in fs_type.lower()),
+            fs_type=fs_type, mountpoint=mp, is_luks=(crypto_type == "LUKS"),
+            crypto_type=crypto_type,
             allow_discards=allow_discards, discard_mounted=discard_mounted,
         ))
 
@@ -528,6 +585,22 @@ def parse_partition_table(device: str) -> DiskLayout | None:
 # =============================================================================
 # SMART Telemetry
 # =============================================================================
+def _nvme_smart_log(ctrl: str) -> Any | None:
+    # Modern nvme-cli 2.x/3.x syntax first, fallback to legacy
+    res = _run_json(["nvme", "log", "smart", ctrl, "-o", "json"])
+    if res is not None:
+        return res
+    return _run_json(["nvme", "smart-log", ctrl, "-o", "json"])
+
+
+def _nvme_id_ctrl(ctrl: str) -> Any | None:
+    # Modern nvme-cli 2.x/3.x syntax first, fallback to legacy
+    res = _run_json(["nvme", "id", "ctrl", ctrl, "-o", "json"])
+    if res is not None:
+        return res
+    return _run_json(["nvme", "id-ctrl", ctrl, "-o", "json"])
+
+
 def _query_nvme_smart(device: str) -> SmartData | None:
     m = re.search(r"(nvme\d+)", device)
     ctrl = f"/dev/{m.group(1)}" if m else None
@@ -535,8 +608,8 @@ def _query_nvme_smart(device: str) -> SmartData | None:
         return None
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        log_future = pool.submit(_run_json, ["nvme", "smart-log", ctrl, "-o", "json"])
-        id_future = pool.submit(_run_json, ["nvme", "id-ctrl", ctrl, "-o", "json"])
+        log_future = pool.submit(_nvme_smart_log, ctrl)
+        id_future = pool.submit(_nvme_id_ctrl, ctrl)
         log = log_future.result()
         ident = id_future.result()
 
@@ -610,6 +683,7 @@ def _query_block_smart(device: str) -> SmartData | None:
         return None
 
     capacity_tb = get_device_capacity_tb(device)
+    hdd = is_rotational(device)
 
     for args in (["smartctl", "-x", "--json", device], ["smartctl", "-x", "--json", "-d", "sat", device]):
         data = _run_json(args, timeout=10.0)
@@ -620,8 +694,9 @@ def _query_block_smart(device: str) -> SmartData | None:
             continue
 
         smart: SmartData = {
-            "device": device, "interface": "SATA",
-            "model": data.get("model_name", "Unknown SSD"),
+            "device": device,
+            "interface": "SATA (Rotational HDD)" if hdd else "SATA",
+            "model": data.get("model_name", "Unknown HDD" if hdd else "Unknown SSD"),
             "serial": data.get("serial_number", "N/A"),
             "firmware": data.get("firmware_version", "N/A"),
             "temp": float((data.get("temperature") or {}).get("current") or 0)
@@ -641,14 +716,14 @@ def _query_block_smart(device: str) -> SmartData | None:
 
             poh_val = (attrs.get(9) or {}).get("raw", {}).get("value")
             smart["power_on_hours"] = int(poh_val) if poh_val is not None else 0
-            smart["percentage_used"] = _extract_sata_wear_percentage(attrs)
+            smart["percentage_used"] = 0 if hdd else _extract_sata_wear_percentage(attrs)
             smart["tbw_written"] = _extract_sata_tbw(attrs, capacity_tb)
 
-            usd_val = (attrs.get(174) or {}).get("raw", {}).get("value")
+            usd_val = (attrs.get(174) or {}).get("raw", {}).get("value") or (attrs.get(192) or {}).get("raw", {}).get("value")
             smart["unsafe_shutdowns"] = int(usd_val) if usd_val is not None else 0
 
             realloc = int((attrs.get(5) or {}).get("raw", {}).get("value") or 0)
-            uncorr = int((attrs.get(187) or {}).get("raw", {}).get("value") or 0)
+            uncorr = int((attrs.get(187) or {}).get("raw", {}).get("value") or (attrs.get(197) or {}).get("raw", {}).get("value") or 0)
             smart["media_errors"] = realloc + uncorr
         else:
             smart.update({
@@ -657,21 +732,29 @@ def _query_block_smart(device: str) -> SmartData | None:
                 "media_errors": int(data.get("scsi_grown_defect_list") or 0)
             })
 
-        smart["flash_type"] = detect_flash_type(smart.get("model", ""), smart.get("percentage_used", 0), smart.get("tbw_written", 0.0), capacity_tb)
-        smart["tbw_rated"] = estimate_tbw_rated(capacity_tb, smart["flash_type"])
+        smart["flash_type"] = detect_flash_type(smart.get("model", ""), smart.get("percentage_used", 0), smart.get("tbw_written", 0.0), capacity_tb, is_hdd=hdd)
+        smart["tbw_rated"] = 0.0 if hdd else estimate_tbw_rated(capacity_tb, smart["flash_type"])
         return smart
 
     return None
 
 
 def query_live_smart_data(device: str) -> SmartData | None:
-    return _query_nvme_smart(device) if re.search(r"nvme\d+n\d+", device) else _query_block_smart(device)
+    if re.search(r"nvme\d+n\d+", device):
+        if smart := _query_nvme_smart(device):
+            return smart
+        return _query_block_smart(device)
+    return _query_block_smart(device)
 
 
 # =============================================================================
 # Sector Content Sampling
 # =============================================================================
 def scan_unallocated_regions(dev_path: str, gaps: list[SectorRange], sector_size: int = 512, total_samples: int = 500) -> float:
+    if is_rotational(dev_path):
+        console.print(f"[dim yellow]Notice: {dev_path} is rotational media (mechanical HDD). Skipping sector deallocation scan (no FTL/TRIM).[/]")
+        return 0.0
+
     valid_gaps: list[tuple[int, int, int]] = [(s, e, e - s + 1) for s, e in gaps if e >= s]
     total_unalloc_sectors = sum(g[2] for g in valid_gaps)
     if total_unalloc_sectors <= 0:
@@ -701,7 +784,8 @@ def scan_unallocated_regions(dev_path: str, gaps: list[SectorRange], sector_size
     if actual_total <= 0:
         return 0.0
 
-    zero_block = bytes(4096)
+    zero_block_4k = b"\x00" * 4096
+    ff_block_4k = b"\xff" * 4096
     dirty_count, tested = 0, 0
 
     progress = Progress(
@@ -746,8 +830,14 @@ def scan_unallocated_regions(dev_path: str, gaps: list[SectorRange], sector_size
 
                     if not block:
                         break
-                    if (len(block) == 4096 and block != zero_block) or (len(block) != 4096 and block != bytes(len(block))):
-                        dirty_count += 1
+
+                    # Modern NVMe DLFEAT compliance: clean deallocated blocks return 0x00 or 0xFF
+                    if len(block) == 4096:
+                        if block != zero_block_4k and block != ff_block_4k:
+                            dirty_count += 1
+                    else:
+                        if block != (b"\x00" * len(block)) and block != (b"\xff" * len(block)):
+                            dirty_count += 1
 
                     tested += 1
                     progress.update(task, advance=1)
@@ -885,7 +975,9 @@ def align_gap_to_erase_blocks(gap: SectorRange, sector_size: int = 512, disc_gra
     return None
 
 
-def _build_discard_commands(layout: DiskLayout, force: bool = False) -> list[str]:
+def _build_discard_commands(layout: DiskLayout, force: bool = False, is_mock: bool = False) -> list[str]:
+    if is_rotational(layout.device, is_mock=is_mock):
+        return []
     commands: list[str] = []
     flag = "-f " if force else ""
     max_chunk_bytes = layout.discard_max_bytes if layout.discard_max_bytes > 0 else DEFAULT_MAX_DISCARD_CHUNK
@@ -905,24 +997,57 @@ def _build_discard_commands(layout: DiskLayout, force: bool = False) -> list[str
     return commands
 
 
-def _build_smart_table(smart: SmartData) -> Table:
-    health = max(0, min(100, 100 - smart.get("percentage_used", 0)))
+def _build_smart_table(smart: SmartData, is_mock: bool = False) -> Table:
+    hdd = False if is_mock else ("Rotational" in smart.get("interface", "") or "HDD" in smart.get("flash_type", ""))
+    pct_used = smart.get("percentage_used", 0)
+    health = max(0, min(100, 100 - pct_used))
     filled = int(20 * health / 100)
     health_bar = f"[green]{'█' * filled}[/][red]{'░' * (20 - filled)}[/]"
-    health_str = f"[bold green]{health}%[/]" if health >= 90 else f"[bold yellow]{health}%[/]" if health >= 75 else f"[bold red]{health}%[/] [blink][WARNING][/]"
+
+    if hdd:
+        media_err = smart.get("media_errors", 0)
+        if media_err == 0:
+            health_str = "[bold green]100% (Healthy Platter)[/]"
+            health_bar = f"[green]{'█' * 20}[/]"
+        elif media_err < 10:
+            health_str = f"[bold yellow]Warning ({media_err} Bad Sectors)[/]"
+            health_bar = f"[yellow]{'█' * 15}[/][red]{'░' * 5}[/]"
+        else:
+            health_str = f"[bold red]Critical ({media_err} Bad Sectors)[/] [blink][WARNING][/]"
+            health_bar = f"[red]{'█' * 20}[/]"
+    else:
+        health_str = f"[bold green]{health}%[/]" if health >= 90 else f"[bold yellow]{health}%[/]" if health >= 75 else f"[bold red]{health}%[/] [blink][WARNING][/]"
+
     unsafe, media_err = smart.get("unsafe_shutdowns", 0), smart.get("media_errors", 0)
     flash_type, interface = smart.get("flash_type", "TLC"), smart.get("interface", "NVMe")
 
     table = Table.grid(padding=(0, 2))
     table.add_column("Key", style="dim", width=23)
     table.add_column("Value", style="bold")
+
+    flash_cell_repr = (
+        "[bold cyan]Magnetic Platter (Rotational)[/]" if hdd
+        else f"[bold {'magenta' if flash_type == 'QLC' else 'green'}]{flash_type}[/]"
+    )
+    rated_endurance_repr = (
+        "[dim]N/A (Magnetic Media)[/]" if hdd
+        else f"[bold bright_cyan]{smart.get('tbw_rated', 0):.0f} TBW[/]"
+    )
+    writes_repr = (
+        f"[bold bright_cyan]{smart.get('tbw_written', 0):.2f} TB[/]" if smart.get("tbw_written", 0) > 0
+        else "[dim]N/A (Unrecorded)[/]"
+    )
+
     for k, v in [
         ("Model / Silicon:", smart.get("model", "N/A")), ("Serial Number:", smart.get("serial", "N/A")),
         ("Firmware Version:", smart.get("firmware", "N/A")), ("Interface Bus:", f"[bold blue]{interface}[/]"),
-        ("Flash Cell Type:", f"[bold {'magenta' if flash_type == 'QLC' else 'green'}]{flash_type}[/]"),
-        ("Controller Temp:", f"[bold bright_yellow]{smart.get('temp', 0):.1f}°C[/]"), ("Total Host Writes:", f"[bold bright_cyan]{smart.get('tbw_written', 0):.2f} TB[/]"),
-        ("Device Rated Endurance:", f"[bold bright_cyan]{smart.get('tbw_rated', 0):.0f} TBW[/]"), ("SMART Health Remaining:", health_str),
-        ("Health Bar Representation:", health_bar), ("Power On Hours:", f"[bold blue]{smart.get('power_on_hours', 0):,}[/] hours"),
+        ("Flash Cell Type:", flash_cell_repr),
+        ("Controller Temp:", f"[bold bright_yellow]{smart.get('temp', 0):.1f}°C[/]"),
+        ("Total Host Writes:", writes_repr),
+        ("Device Rated Endurance:", rated_endurance_repr),
+        ("SMART Health Remaining:", health_str),
+        ("Health Bar Representation:", health_bar),
+        ("Power On Hours:", f"[bold blue]{smart.get('power_on_hours', 0):,}[/] hours"),
         ("Unsafe Power Cuts:", f"[red]{unsafe:,}[/]" if unsafe > 100 else f"[bold yellow]{unsafe:,}[/]"),
         ("Physical Media Errors:", f"[bold red]{media_err}[/]" if media_err > 0 else "[bold green]0 (Healthy)[/]")
     ]:
@@ -930,7 +1055,8 @@ def _build_smart_table(smart: SmartData) -> Table:
     return table
 
 
-def _build_op_table(layout: DiskLayout, smart: SmartData, scan_ratio: float | None, is_cleared: bool = False) -> Table:
+def _build_op_table(layout: DiskLayout, smart: SmartData, scan_ratio: float | None, is_cleared: bool = False, is_mock: bool = False) -> Table:
+    hdd = is_rotational(layout.device, is_mock=is_mock)
     total_sec = layout.total_sectors
     part_sec = sum(p.size_sectors for p in layout.partitions)
     unalloc_sec = sum((g[1] - g[0] + 1) for g in layout.unallocated_gaps)
@@ -944,6 +1070,15 @@ def _build_op_table(layout: DiskLayout, smart: SmartData, scan_ratio: float | No
     table.add_row("Total Block Capacity:", f"[bold bright_cyan]{total_sec * ss / (1 << 30):.2f} GiB[/] ([bold blue]{total_sec:,}[/] sectors)")
     table.add_row("Partitioned Extents:", f"[bold bright_cyan]{part_sec * ss / (1 << 30):.2f} GiB[/] ([bold blue]{part_sec:,}[/] sectors)")
     table.add_row("Unallocated Free Extents:", f"[bold bright_cyan]{unalloc_sec * ss / (1 << 30):.2f} GiB[/] ([bold blue]{unalloc_sec:,}[/] sectors)")
+
+    if hdd:
+        table.add_row("Raw Free Space Ratio:", f"[bold cyan]{op_raw_pct:.2f}%[/] of disk")
+        table.add_row("FTL Allocation Status:", "[dim]N/A (Mechanical Direct Addressing)[/]")
+        table.add_row("Steady-State WAF:", "[bold green]1.00[/] (No Flash Write Amplification)")
+        table.add_row("TRIM / Deallocate Status:", "[dim]N/A (Rotational Media does not use TRIM)[/]")
+        table.add_row("Wear-Leveling Requirement:", "[bold green]None (Magnetic storage wear is mechanical)[/]")
+        return table
+
     table.add_row("Raw Over-Provisioning Limit:", f"[bold yellow]{op_raw_pct:.2f}%[/] of disk")
 
     if is_cleared:
@@ -964,19 +1099,63 @@ def _build_op_table(layout: DiskLayout, smart: SmartData, scan_ratio: float | No
     return table
 
 
-def _build_partition_table(layout: DiskLayout) -> Table:
-    table = Table(title="Partition Discard & Encryption Configuration", header_style="bold cyan", border_style="dim", show_lines=False, expand=True, width=PANEL_WIDTH)
-    for col, st, rt, ju in [("Partition", "bold green", 1, "left"), ("Type", "blue", 1, "left"), ("Mountpoint", "white", 2, "left"), ("LUKS?", "magenta", 1, "center"), ("LUKS Discard Passthrough", "yellow", 2, "center"), ("FS Mount Discard Flag", "cyan", 2, "center")]:
+def _build_partition_table(layout: DiskLayout, is_mock: bool = False) -> Table:
+    hdd = is_rotational(layout.device, is_mock=is_mock)
+    table = Table(
+        title="Partition Discard & Encryption Configuration",
+        header_style="bold cyan",
+        border_style="dim",
+        show_lines=False,
+        expand=True,
+        width=PANEL_WIDTH,
+    )
+    for col, st, rt, ju in [
+        ("Partition", "bold green", 1, "left"),
+        ("Type", "blue", 1, "left"),
+        ("Mountpoint", "white", 2, "left"),
+        ("Encrypted?", "magenta", 1, "center"),
+        ("Crypto Discard Passthrough", "yellow", 2, "center"),
+        ("FS Mount Discard Flag", "cyan", 2, "center"),
+    ]:
         table.add_column(col, style=st, ratio=rt, justify=ju)
 
     for p in layout.partitions:
-        luks_pt = "[bold green]Enabled (allow_discards)[/]" if p.allow_discards else "[bold red]Disabled (Blocks TRIM)[/]" if p.is_luks else "[dim]N/A (No Encryption)[/]"
-        fs_discard = "[dim]N/A (Unmounted/Swap)[/]" if p.mountpoint in ("unmounted", "[SWAP]") else "[bold green]Active (discard)[/]" if p.discard_mounted else "[bold yellow]Inactive (No discard flag)[/]"
-        table.add_row(p.name, p.fs_type, p.mountpoint, "[bold magenta]Yes[/]" if p.is_luks else "No", luks_pt, fs_discard)
+        crypt = p.resolved_crypto_type
+        if crypt == "LUKS":
+            enc_str = "[bold magenta]LUKS[/]"
+        elif crypt == "BitLocker":
+            enc_str = "[bold magenta]BitLocker[/]"
+        elif crypt:
+            enc_str = f"[bold magenta]{crypt}[/]"
+        else:
+            enc_str = "No"
+
+        if hdd:
+            crypto_pt = "[dim]N/A (Rotational Media)[/]"
+            fs_discard = "[dim]N/A (Rotational Media)[/]"
+        else:
+            if p.is_luks:
+                crypto_pt = "[bold green]Enabled (allow_discards)[/]" if p.allow_discards else "[bold red]Disabled (Blocks TRIM)[/]"
+            elif crypt == "BitLocker":
+                crypto_pt = "[dim yellow]BitLocker (Proprietary)[/]"
+            elif p.is_encrypted:
+                crypto_pt = "[bold green]Enabled[/]" if p.allow_discards else "[bold yellow]Unsupported[/]"
+            else:
+                crypto_pt = "[dim]N/A (No Encryption)[/]"
+
+            if p.mountpoint in ("unmounted", "[SWAP]"):
+                fs_discard = "[dim]N/A (Unmounted/Swap)[/]"
+            elif p.discard_mounted:
+                fs_discard = "[bold green]Active (discard)[/]"
+            else:
+                fs_discard = "[bold yellow]Inactive (No discard flag)[/]"
+
+        table.add_row(p.name, p.fs_type, p.mountpoint, enc_str, crypto_pt, fs_discard)
     return table
 
 
 def render_drive_diagnostics(layout: DiskLayout, smart: SmartData, scan_ratio: float | None, dry_run: bool = False, exec_discard: bool = False, is_mock: bool = False) -> None:
+    hdd = is_rotational(layout.device, is_mock=is_mock)
     health = max(0, min(100, 100 - smart.get("percentage_used", 0)))
     health_str = f"[bold green]{health}%[/]" if health >= 90 else f"[bold yellow]{health}%[/]" if health >= 75 else f"[bold red]{health}%[/] [blink][WARNING][/]"
 
@@ -991,39 +1170,50 @@ def render_drive_diagnostics(layout: DiskLayout, smart: SmartData, scan_ratio: f
     sys_panel = Panel(sys_table, title="[bold white]Host OS & Storage Queue Telemetry[/]", border_style="dim", width=PANEL_WIDTH)
     legend = "[bold cyan]█[/] Ext4/Btrfs    [bold bright_magenta]█[/] LUKS Map    [bold bright_red]█[/] Swap    [bold yellow]░[/] Dirty OP Space    [bold green]▒[/] Clean OP Space    [dim grey]─[/] Slack"
 
-    visual_ratio = 0.0 if exec_discard else (scan_ratio or 0.0)
+    visual_ratio = 0.0 if exec_discard or hdd else (scan_ratio or 0.0)
 
     group = Group(
         Text.from_markup(f"\n[bold white]DEVICE TELEMETRY DASHBOARD FOR {layout.device}[/]\n{smart.get('model', 'N/A')}  |  Serial: {smart.get('serial', 'N/A')}  |  Health: {health_str}\n"),
         Columns([
-            Panel(_build_smart_table(smart), title="[bold white]S.M.A.R.T. Hardware Health[/]", border_style="dim", width=int(PANEL_WIDTH * 0.41)),
-            Panel(_build_op_table(layout, smart, scan_ratio, is_cleared=exec_discard), title="[bold white]FTL Over-Provisioning Mapping[/]", border_style="dim", width=int(PANEL_WIDTH * 0.58))
+            Panel(_build_smart_table(smart, is_mock=is_mock), title="[bold white]S.M.A.R.T. Hardware Health[/]", border_style="dim", width=int(PANEL_WIDTH * 0.41)),
+            Panel(_build_op_table(layout, smart, scan_ratio, is_cleared=exec_discard, is_mock=is_mock), title="[bold white]FTL Over-Provisioning Mapping[/]", border_style="dim", width=int(PANEL_WIDTH * 0.58))
         ]),
         sys_panel,
         Text.from_markup(f"\n[bold white]Physical Disk Sector Map Layout:[/]\n{draw_layout_bar(layout, visual_ratio)}\n[dim]{legend}[/]\n")
     )
 
-    border = "green" if exec_discard else ("cyan" if scan_ratio is None else "green" if scan_ratio == 0.0 else "yellow")
+    border = "green" if exec_discard or (hdd and scan_ratio is None) else ("cyan" if scan_ratio is None else "green" if scan_ratio == 0.0 else "yellow")
     console.print(Panel(Align.center(group), border_style=border, width=PANEL_WIDTH))
-    console.print(_build_partition_table(layout))
+    console.print(_build_partition_table(layout, is_mock=is_mock))
 
     # 1. Render Status Condition
-    if scan_ratio is not None:
+    if hdd:
+        rec = Text.assemble(
+            "\n",
+            "[bold green][+] ROTATIONAL MEDIA REPORT:[/]\n",
+            f"{layout.device} is a rotational magnetic hard drive (HDD).\n",
+            "TRIM, FTL over-provisioning, and erase-block discards do not apply to magnetic storage.\n",
+            "No deallocation actions are required or recommended for this device.\n",
+        )
+        console.print(Panel(rec, title="[bold green]Rotational Media Status[/]", border_style="green", width=PANEL_WIDTH))
+    elif scan_ratio is not None:
         if scan_ratio == 0.0 and not exec_discard:
             rec = Text.assemble("\n", "[bold green][+] DIAGNOSTIC HEALTH REPORT:[/]\n", "This drive's unallocated extents are fully trimmed and unmapped in the Flash Translation Layer.\n", "The SSD controller is leveraging the entire unallocated space as functional over-provisioning.\n", "Write amplification is fully optimized. No further action required.\n")
             console.print(Panel(rec, title="[bold green]Optimized Wear-Leveling Status[/]", border_style="green", width=PANEL_WIDTH))
         elif scan_ratio > 0 and not exec_discard:
-            cmds = _build_discard_commands(layout, force=True)
+            cmds = _build_discard_commands(layout, force=True, is_mock=is_mock)
             cmd_lines = "\n".join(f"  {c}" for c in cmds)
             rec = Text.assemble("\n", "[bold yellow][!] DIAGNOSTIC ADVISORY:[/]\n", "This drive contains unallocated sectors holding obsolete host data mappings.\n", "The SSD controller cannot utilize these blocks for over-provisioning until they are discarded.\n\n", "[bold green][*] RECOMMENDED ACTION COMMANDS (4MB Erase Block Aligned & Hardware Chunked):[/]\n", f"{cmd_lines}\n\n", "[dim]Note: blkdiscard is automatically 4MB erase-block aligned and chunked to queue limits for partition safety.[/]")
             console.print(Panel(rec, title="[bold yellow]Wear-Leveling Correction Plan[/]", border_style="yellow", width=PANEL_WIDTH))
 
     # 2. Render Execution or Simulation Panels
     max_chunk_bytes = layout.discard_max_bytes if layout.discard_max_bytes > 0 else DEFAULT_MAX_DISCARD_CHUNK
-    if exec_discard and layout.unallocated_gaps:
+    if hdd and (exec_discard or dry_run):
+        console.print(f"[yellow]Notice: Discard skipped for {layout.device}: device is rotational media (mechanical HDD).[/]")
+    elif exec_discard and layout.unallocated_gaps:
         console.print(Panel("[bold red]Executing Live Discard operations to clear FTL maps...[/]", border_style="red", width=PANEL_WIDTH))
         if is_mock:
-            for c in _build_discard_commands(layout, force=True):
+            for c in _build_discard_commands(layout, force=True, is_mock=is_mock):
                 console.print(f"  [green]✔ MOCK SUCCESS: Executed {c}[/]")
         else:
             for gap in layout.unallocated_gaps:
@@ -1073,18 +1263,34 @@ def render_summary_table(summary_data: list[dict[str, Any]]) -> None:
         table.add_column(col, style=st, ratio=rt, justify=ju)
 
     for d in summary_data:
-        health = max(0, min(100, 100 - d["pct_used"]))
-        health_color = "green" if health >= 90 else "yellow" if health >= 75 else "red"
-        dirty = d.get("dirty_ratio")
-        cleared = d.get("cleared", False)
+        is_hdd = "Rotational" in d.get("interface", "") or "HDD" in d.get("flash_type", "")
+        if is_hdd:
+            media_err = d.get("media_errors", 0)
+            if media_err == 0:
+                health_str = "[green]100% (Healthy)[/]"
+            elif media_err < 10:
+                health_str = f"[yellow]Warning ({media_err} Bad)[/]"
+            else:
+                health_str = f"[red]Critical ({media_err} Bad)[/]"
+            writes_str = f"{d['tbw']:.2f}" if d.get("tbw", 0) > 0 else "[dim]N/A[/]"
+            op_str = "[dim]N/A[/]"
+            state_str = "[dim]N/A (Rotational Platter)[/]"
+        else:
+            health = max(0, min(100, 100 - d["pct_used"]))
+            health_color = "green" if health >= 90 else "yellow" if health >= 75 else "red"
+            health_str = f"[{health_color}]{health}%[/]"
+            dirty = d.get("dirty_ratio")
+            cleared = d.get("cleared", False)
 
-        state_str = "[yellow]Not Scanned[/]"
-        if cleared:
-            state_str = "[bold green]Cleared & Optimized[/]"
-        elif dirty is not None:
-            state_str = "[green]Fully Optimized (Clean)[/]" if dirty == 0.0 else f"[yellow]Degraded ({dirty*100:.1f}% Dirty)[/]"
+            state_str = "[yellow]Not Scanned[/]"
+            if cleared:
+                state_str = "[bold green]Cleared & Optimized[/]"
+            elif dirty is not None:
+                state_str = "[green]Fully Optimized (Clean)[/]" if dirty == 0.0 else f"[yellow]Degraded ({dirty*100:.1f}% Dirty)[/]"
+            op_str = f"{d['op']:.2f}%"
+            writes_str = f"{d['tbw']:.2f}"
 
-        table.add_row(d["device"], d["interface"], d["model"], f"[{health_color}]{health}%[/]", f"{d['tbw']:.2f}", f"{d['op']:.2f}%", state_str)
+        table.add_row(d["device"], d["interface"], d["model"], health_str, writes_str, op_str, state_str)
     console.print(table)
 
 
@@ -1150,7 +1356,7 @@ def _elevate_privileges(choice: int, args: argparse.Namespace) -> None:
 # Main
 # =============================================================================
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Dusky Drive Health Diagnostic Suite", epilog="Arch Linux Kernel 7.1 Multi-Interface SSD Analyzer")
+    parser = argparse.ArgumentParser(description="Dusky Drive Health Diagnostic Suite", epilog="Arch Linux Kernel 7.3 Multi-Interface Storage Analyzer")
     parser.add_argument("-v", "--version", action="version", version=f"Dusky Drive Health v{VERSION}")
     parser.add_argument("--mock", action="store_true", help="Execute in safe isolation demonstration mode with mock profiles.")
     parser.add_argument("--scan", action="store_true", help="Perform real read-only unallocated sector scan (requires root privileges).")
@@ -1176,7 +1382,7 @@ def main() -> None:
 
     console.print(Align.center(Panel(
         "[bold cyan]DUSKY DRIVE HEALTH DIAGNOSTIC SUITE[/]\n"
-        "[dim]Linux Kernel 7.1 & Python 3.14+ Modern Storage Engine Diagnostics[/]",
+        "[dim]Linux Kernel 7.3+ & Python 3.14+ Modern Storage Engine Diagnostics[/]",
         border_style="cyan",
         expand=False
     )))
@@ -1189,9 +1395,9 @@ def main() -> None:
         render_drive_diagnostics(MOCK_SATA_LAYOUT, MOCK_SATA_SMART, scan_ratio=0.35, dry_run=dry_run, exec_discard=exec_discard, is_mock=True)
         render_glossary_panel()
         mock_summary = [
-            {"device": "/dev/nvme0n1", "interface": "NVMe", "model": MOCK_INTEL_SMART["model"], "pct_used": MOCK_INTEL_SMART["percentage_used"], "tbw": MOCK_INTEL_SMART["tbw_written"], "op": 73.9, "dirty_ratio": 0.0, "cleared": False},
-            {"device": "/dev/nvme1n1", "interface": "NVMe", "model": MOCK_SAMSUNG_SMART["model"], "pct_used": MOCK_SAMSUNG_SMART["percentage_used"], "tbw": MOCK_SAMSUNG_SMART["tbw_written"], "op": 46.3, "dirty_ratio": 0.0, "cleared": False},
-            {"device": "/dev/sda", "interface": "SATA", "model": MOCK_SATA_SMART["model"], "pct_used": MOCK_SATA_SMART["percentage_used"], "tbw": MOCK_SATA_SMART["tbw_written"], "op": 1.7, "dirty_ratio": 0.35, "cleared": exec_discard}
+            {"device": "/dev/nvme0n1", "interface": "NVMe", "model": MOCK_INTEL_SMART["model"], "pct_used": MOCK_INTEL_SMART["percentage_used"], "tbw": MOCK_INTEL_SMART["tbw_written"], "op": 73.9, "dirty_ratio": 0.0, "cleared": False, "flash_type": "QLC", "media_errors": 0},
+            {"device": "/dev/nvme1n1", "interface": "NVMe", "model": MOCK_SAMSUNG_SMART["model"], "pct_used": MOCK_SAMSUNG_SMART["percentage_used"], "tbw": MOCK_SAMSUNG_SMART["tbw_written"], "op": 46.3, "dirty_ratio": 0.0, "cleared": False, "flash_type": "TLC", "media_errors": 0},
+            {"device": "/dev/sda", "interface": "SATA", "model": MOCK_SATA_SMART["model"], "pct_used": MOCK_SATA_SMART["percentage_used"], "tbw": MOCK_SATA_SMART["tbw_written"], "op": 1.7, "dirty_ratio": 0.35, "cleared": exec_discard, "flash_type": "QLC", "media_errors": 0}
         ]
         render_summary_table(mock_summary)
         sys.exit(0)
@@ -1219,14 +1425,32 @@ def main() -> None:
         if not (layout := parse_partition_table(dev)):
             continue
 
+        dev_is_rotational = is_rotational(dev)
+
         if not (smart := query_live_smart_data(dev)):
             capacity_tb = get_device_capacity_tb(dev)
-            flash_type = detect_flash_type(layout.model, 0, 0.0, capacity_tb)
-            smart = {"device": dev, "model": layout.model, "serial": "N/A", "firmware": "N/A", "temp": 30.0, "percentage_used": 0, "tbw_written": 0.0, "tbw_rated": estimate_tbw_rated(capacity_tb, flash_type), "power_on_hours": 0, "unsafe_shutdowns": 0, "media_errors": 0, "flash_type": flash_type, "interface": "NVMe" if "nvme" in dev else "SATA"}
+            flash_type = detect_flash_type(layout.model, 0, 0.0, capacity_tb, is_hdd=dev_is_rotational)
+            smart = {
+                "device": dev,
+                "model": layout.model,
+                "serial": "N/A",
+                "firmware": "N/A",
+                "temp": 30.0,
+                "percentage_used": 0,
+                "tbw_written": 0.0,
+                "tbw_rated": 0.0 if dev_is_rotational else estimate_tbw_rated(capacity_tb, flash_type),
+                "power_on_hours": 0,
+                "unsafe_shutdowns": 0,
+                "media_errors": 0,
+                "flash_type": flash_type,
+                "interface": ("SATA (Rotational HDD)" if dev_is_rotational else "SATA") if "sd" in dev else "NVMe"
+            }
 
-        scan_ratio = scan_unallocated_regions(dev, layout.unallocated_gaps, layout.sector_size) if run_scan and layout.unallocated_gaps else None
+        scan_ratio = None
+        if not dev_is_rotational and run_scan and layout.unallocated_gaps:
+            scan_ratio = scan_unallocated_regions(dev, layout.unallocated_gaps, layout.sector_size)
 
-        actually_execute = exec_discard
+        actually_execute = exec_discard and not dev_is_rotational
         if actually_execute and scan_ratio is not None and scan_ratio == 0.0:
             console.print(f"\n[bold green][+] Pre-scan reveals {dev} FTL is already perfectly clean. Bypassing discard operation.[/]")
             actually_execute = False
@@ -1236,12 +1460,14 @@ def main() -> None:
         summary_data.append({
             "device": dev,
             "interface": smart.get("interface", "NVMe"),
-            "model": smart.get("model", "Unknown SSD"),
+            "model": smart.get("model", "Unknown Device"),
             "pct_used": smart.get("percentage_used", 0),
             "tbw": smart.get("tbw_written", 0.0),
             "op": (sum((g[1] - g[0] + 1) for g in layout.unallocated_gaps) / layout.total_sectors) * 100.0 if layout.total_sectors else 0.0,
             "dirty_ratio": scan_ratio,
-            "cleared": actually_execute
+            "cleared": actually_execute,
+            "flash_type": smart.get("flash_type", ""),
+            "media_errors": smart.get("media_errors", 0),
         })
 
     render_glossary_panel()
