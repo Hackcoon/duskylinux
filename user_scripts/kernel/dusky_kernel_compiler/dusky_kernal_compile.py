@@ -4720,7 +4720,7 @@ def ensure_install_dependencies(p: KernelProfile) -> None:
 
 
 def prepare_nvidia_615_for_linux_73(kernelrelease: str) -> None:
-    """Adapt NVIDIA 615's old dmem API before pacman's DKMS hook runs."""
+    """Adapt NVIDIA 615's old dmem API and runtime PM before pacman's DKMS hook runs."""
     if version_tuple(kernelrelease) < (7, 3):
         return
     source = Path("/usr/src/nvidia-615.71.09")
@@ -4731,11 +4731,23 @@ def prepare_nvidia_615_for_linux_73(kernelrelease: str) -> None:
         raise DependencyError("NVIDIA 615 Linux 7.3 compatibility patch or patch tool is missing")
     cmd = ["patch", "--batch", "--silent", "--dry-run", "-d", str(source), "-p1", "-i", str(patch_file)]
     if run([*cmd, "--reverse"], check=False).returncode == 0:
-        return
-    if run([*cmd, "--forward"], check=False).returncode:
+        pass
+    elif run([*cmd, "--forward"], check=False).returncode:
         raise BuildError("NVIDIA 615 source does not match the validated Linux 7.3 compatibility patch; installation stopped before replacing boot images")
-    PRIV.run(["patch", "--batch", "--forward", "-d", str(source), "-p1", "-i", str(patch_file)])
-    ok("Adapted NVIDIA 615 dmem cgroup API for Linux 7.3+ DKMS")
+    else:
+        PRIV.run(["patch", "--batch", "--forward", "-d", str(source), "-p1", "-i", str(patch_file)])
+        ok("Adapted NVIDIA 615 dmem cgroup API and runtime PM for Linux 7.3+ DKMS")
+
+    extra_files: dict[Path, tuple[str, str]] = {}
+    power_conf = SCRIPT_DIR / "extra/nvidia-power.conf"
+    if power_conf.is_file() and not Path("/etc/modprobe.d/nvidia-power.conf").is_file():
+        extra_files[Path("/etc/modprobe.d/nvidia-power.conf")] = (power_conf.read_text(encoding="utf-8"), "0644")
+    pm_rules = SCRIPT_DIR / "extra/80-nvidia-pm.rules"
+    if pm_rules.is_file() and not Path("/etc/udev/rules.d/80-nvidia-pm.rules").is_file():
+        extra_files[Path("/etc/udev/rules.d/80-nvidia-pm.rules")] = (pm_rules.read_text(encoding="utf-8"), "0644")
+    if extra_files:
+        PRIV.write_files(extra_files)
+        ok("Installed NVIDIA dynamic power management configurations from extra/")
 
 
 def install_packages(pkgs: Sequence[Path], profile: KernelProfile, kernelrelease: str) -> None:
