@@ -7,9 +7,12 @@
 #   outer_uuid    = "<blkid UUID>"                  REQUIRED  raw partition, seen while LOCKED  (lsblk -f)
 #   inner_uuid    = "<blkid UUID>"                  REQUIRED for PROTECTED, FORBIDDEN for SIMPLE
 #   hint          = "<string>"                      OPTIONAL  shown before manual prompts (never a secret)
-#   fstype        = "ext4"|"btrfs"|"ntfs"|"exfat".. OPTIONAL  ntfs = in-kernel ntfs driver
+#   fstype        = "ext4"|"btrfs"|"ntfs"|"exfat".. OPTIONAL  always the 7.1+ 'ntfs' driver (legacy ntfs3 rejected)
 #   mount_options = ["opt", ...]                    OPTIONAL  one option per element; "force" is rejected
 #   symlinks      = ["~/.link", ...]                OPTIONAL  healed on every unlock (existing dirs are renamed, never deleted)
+#   post_unlock   = ["cmd", ...]                    OPTIONAL  commands run unprivileged after mount & symlinks ready
+#   pre_lock      = ["cmd", ...]                    OPTIONAL  commands run before lock & unmount (e.g. stop services)
+#   post_lock     = ["cmd", ...]                    OPTIONAL  commands run after lock & container closure
 #
 # UUID CASE IS SIGNIFICANT (/dev/disk/by-uuid is case-sensitive):
 #   ext4/btrfs/xfs/LUKS -> lowercase 8-4-4-4-12      NTFS -> UPPERCASE 16 hex      FAT/exFAT -> UPPERCASE XXXX-XXXX

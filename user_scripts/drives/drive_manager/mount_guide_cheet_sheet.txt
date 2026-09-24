@@ -125,9 +125,15 @@ f2fs    | flash only    | atgc,gc_merge,lazytime,compress_algorithm=zstd:6 | nee
 * Format new containers 4K-aligned:  cryptsetup luksFormat --type luks2 --sector-size 4096 <dev>
 * Make the workqueue/discard flags persistent in the LUKS2 header (then the tool's flags are a no-op):
     sudo cryptsetup --persistent --allow-discards --perf-no_read_workqueue --perf-no_write_workqueue refresh luks-<outer_uuid>
-* NTFS: in-kernel ntfs only (ntfs3 is legacy — do not use); ntfs-3g/FUSE
-  is never consulted because the tool passes -t ntfs explicitly.
-* Teardown ladder: umount (5x, busy resolver) -> blockdev --flushbufs -> cryptsetup close
-  -> 5x retry -> cryptsetup close --deferred -> forensics (lsof, sysfs holders, cryptsetup status).
+* NTFS: always mounted '-i -t ntfs' — the modern 7.1+ in-kernel driver (iomap/folio,
+  full read/write, high performance; docs: https://docs.kernel.org/7.1/filesystems/ntfs.html).
+  Legacy 'ntfs3' and FUSE 'ntfs-3g' are never used. Options: windows_names, iocharset=utf8,
+  preallocated_size= (not 'prealloc').
+* Lifecycle Hooks: drives.toml supports 'post_unlock', 'pre_lock', and 'post_lock' commands
+  (strings or lists of strings, executed unprivileged with $DRIVE_NAME and $DRIVE_MOUNTPOINT).
+* Teardown ladder: cancel queued TRIM unit (best-effort) -> pre_lock hooks -> umount -i (5x,
+  busy resolver, foreign mounts refused) -> blockdev --flushbufs -> cryptsetup close
+  -> 5x retry -> cryptsetup close --deferred (reported as FAILURE until gone) -> post_lock hooks
+  -> forensics (lsof, sysfs holders, cryptsetup status).
 * Verify a mapping any time:  sudo cryptsetup status luks-<outer_uuid> ; lsblk --tree /dev/disk/by-uuid/<outer_uuid>
 ================================================================================
