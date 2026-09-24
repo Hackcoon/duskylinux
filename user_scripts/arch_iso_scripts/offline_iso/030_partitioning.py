@@ -84,7 +84,7 @@ DUSKY_ROOT_PARTNAME = "DUSKY_ROOT"
 STATE_ENV = Path("/tmp/arch_install_state.env")
 STATE_JSON = Path("/tmp/dusky_state.json")
 VALID_PART_RE = re.compile(r"^[a-zA-Z0-9_./-]+$")
-BTRFS_CSUM = "crc32c"
+BTRFS_CSUM = "blake2"
 
 def run(*cmd, check=True, capture=True, input_text=None, timeout=300):
     argv = [os.fspath(c) for c in cmd]
@@ -518,38 +518,6 @@ def detect_windows_esp(disk):
                     pass
     return False, None
 
-def check_filesystem_health(dev_path: str, fstype: str) -> Tuple[bool, str]:
-    if fstype in ("ntfs", "ntfs-3g"):
-        r = run("ntfsfix", "-n", dev_path, check=False, capture=True)
-        if r.returncode != 0 or "Volume is dirty" in (r.stdout or ""):
-            return False, f"NTFS volume {dev_path} is dirty or Windows Fast Startup is active. Boot into Windows and shut down cleanly."
-        return True, "NTFS clean"
-    elif fstype in ("ext4", "ext3", "ext2"):
-        r = run("e2fsck", "-f", "-n", dev_path, check=False, capture=True)
-        if r.returncode >= 4:
-            return False, f"ext4 filesystem errors detected on {dev_path}."
-        return True, "ext4 clean"
-    elif fstype == "btrfs":
-        r = run("btrfs", "check", "--readonly", dev_path, check=False, capture=True)
-        if r.returncode != 0:
-            return False, f"Btrfs integrity check failed on {dev_path}."
-        return True, "Btrfs clean"
-    return True, "OK"
-
-def shrink_partition_ntfs(dev_path: str, target_size_bytes: int) -> bool:
-    ok, msg = check_filesystem_health(dev_path, "ntfs")
-    if not ok:
-        console.print(f"[red]{msg}[/red]")
-        return False
-    r = run("ntfsresize", "--info", "--force", dev_path, check=False, capture=True)
-    if r.returncode != 0:
-        return False
-    r = run("ntfsresize", "--no-action", "--size", str(target_size_bytes), dev_path, check=False, capture=True)
-    if r.returncode != 0:
-        return False
-    console.print(f"[cyan]Shrinking NTFS {dev_path} to {target_size_bytes // (1024**2)} MiB...[/cyan]")
-    run("ntfsresize", "--force", "--size", str(target_size_bytes), dev_path, capture=True)
-    return True
 
 def safe_deactivate_swaps_for_device(target_dev):
     wanted = {"/mnt/swap/swapfile","/swap/swapfile"}
@@ -622,8 +590,16 @@ def teardown_target_storage(target_dev: str, max_retries: int = 4) -> None:
                             run("umount", "-R", "-f", "-l", tgt, check=False, capture=True)
 
             # Precision systemd 261 mount namespace purging
+            seen_ns_inodes = set()
             for proc_dir in Path("/proc").glob("[0-9]*"):
                 try:
+                    ns_mnt = proc_dir / "ns" / "mnt"
+                    if not ns_mnt.exists():
+                        continue
+                    ino = ns_mnt.stat().st_ino
+                    if ino in seen_ns_inodes:
+                        continue
+                    seen_ns_inodes.add(ino)
                     mi = proc_dir / "mountinfo"
                     if mi.is_file():
                         text = mi.read_text(errors="ignore")
@@ -774,6 +750,7 @@ def write_gpt_sfdisk(disk, boot_mode, encrypt, efi_size="1.3G"):
     
     # 1. Annihilate existing GPT structures (primary and backup header/table) and MBR
     console.print(f"[cyan]Destroying all GPT/MBR structures and backup tables on {disk}...[/cyan]")
+    run("blkdiscard", "-f", disk, check=False, capture=True)
     run("sgdisk", "--zap-all", disk, check=False, capture=True)
     run("wipefs", "--all", "--force", disk, check=False, capture=True)
     try:
@@ -812,11 +789,11 @@ def write_gpt_sfdisk(disk, boot_mode, encrypt, efi_size="1.3G"):
     finally:
         run("udevadm", "control", "--start-exec-queue", check=False, capture=True)
     try:
-        run("udevadm","trigger","--settle","-w","--timeout=10",disk, check=False, capture=True)
+        run("udevadm", "trigger", "--settle", "-w", "--timeout=10", disk, check=False, capture=True)
     except:
-        run("udevadm","settle","--timeout=10", check=False, capture=True)
+        run("udevadm", "settle", "--timeout=10", check=False, capture=True)
     try:
-        run("udevadm","wait","--timeout=10","--settle",f"{get_partition_path(disk,1)}",f"{get_partition_path(disk,2)}", check=False, capture=True)
+        run("udevadm", "wait", "--timeout=10", "--initialized=yes", "--settle", f"{get_partition_path(disk,1)}", f"{get_partition_path(disk,2)}", check=False, capture=True)
     except:
         pass
     efi_part = get_partition_path(disk,1) if boot_mode=="UEFI" else None
@@ -1045,14 +1022,30 @@ def format_root_and_efi(root_part, efi_part, format_efi, do_encrypt, boot_mode, 
         mem_kb = get_ram_kb()
         pbkdf = []
         if mem_kb < 3_000_000:
-            pbkdf = ["--pbkdf-memory","256","--pbkdf-parallel","1"]
+            pbkdf = ["--pbkdf-memory", "262144", "--pbkdf-parallel", "1"]
         elif mem_kb < 4_200_000:
-            pbkdf = ["--pbkdf-memory","512"]
+            pbkdf = ["--pbkdf-memory", "524288"]
+        sector_args = []
         try:
-            fmt = ["cryptsetup","--batch-mode","--type","luks2","--pbkdf","argon2id","--label",DUSKY_ROOT_LABEL] + pbkdf + ["luksFormat","--key-file","-",root_part]
+            r_pbsz = run("blockdev", "--getpbsz", root_part, check=False, capture=True)
+            pbsz = r_pbsz.stdout.strip()
+            if pbsz == "4096":
+                sector_args = ["--sector-size", "4096"]
+            else:
+                pname = Path(root_part).resolve().name
+                rot = Path(f"/sys/class/block/{pname}/queue/rotational")
+                if not rot.exists():
+                    parent_name = re.sub(r"p?\d+$", "", pname)
+                    rot = Path(f"/sys/class/block/{parent_name}/queue/rotational")
+                if rot.exists() and rot.read_text().strip() == "0":
+                    sector_args = ["--sector-size", "4096"]
+        except Exception:
+            pass
+        try:
+            fmt = ["cryptsetup", "--batch-mode", "--type", "luks2", "--pbkdf", "argon2id", "--label", DUSKY_ROOT_LABEL] + pbkdf + sector_args + ["luksFormat", "--key-file", "-", root_part]
             r = run(*fmt, input_text=luks_ba, check=False, capture=True)
             if r.returncode == 3:
-                fmt = ["cryptsetup","--batch-mode","--type","luks2","--pbkdf","argon2id","--label",DUSKY_ROOT_LABEL,"--pbkdf-memory","256","--pbkdf-parallel","1","luksFormat","--key-file","-",root_part]
+                fmt = ["cryptsetup", "--batch-mode", "--type", "luks2", "--pbkdf", "argon2id", "--label", DUSKY_ROOT_LABEL, "--pbkdf-memory", "262144", "--pbkdf-parallel", "1"] + sector_args + ["luksFormat", "--key-file", "-", root_part]
                 r = run(*fmt, input_text=luks_ba, check=False, capture=True)
             if r.returncode != 0:
                 console.print(f"[red]luksFormat fail {r.returncode}[/red]")
@@ -1080,8 +1073,8 @@ def format_root_and_efi(root_part, efi_part, format_efi, do_encrypt, boot_mode, 
         btrfs_target = f"/dev/mapper/{TARGET_CRYPT_NAME}"
         
     mkfs_cmd = ["mkfs.btrfs", "-f"]
-    if BTRFS_CSUM == "blake2":
-        mkfs_cmd += ["--csum", "blake2", "-O", "no-holes"]
+    if BTRFS_CSUM != "crc32c":
+        mkfs_cmd += ["--checksum", BTRFS_CSUM]
     mkfs_cmd += ["-L", DUSKY_ROOT_LABEL, btrfs_target]
 
     for mkfs_attempt in range(1, 6):
@@ -1366,10 +1359,10 @@ def strategy_manual(target_dev, boot_mode, do_encrypt, creds, has_win, win_esp):
     except:
         pass
     try:
-        run("udevadm","trigger","--settle","-w","--timeout=10",target_dev, check=False, capture=True)
-        run("udevadm","wait","--timeout=10","--settle",f"{get_partition_path(target_dev,1)}",f"{get_partition_path(target_dev,2)}", check=False, capture=True)
+        run("udevadm", "trigger", "--settle", "-w", "--timeout=10", target_dev, check=False, capture=True)
+        run("udevadm", "wait", "--timeout=10", "--initialized=yes", "--settle", f"{get_partition_path(target_dev,1)}", f"{get_partition_path(target_dev,2)}", check=False, capture=True)
     except:
-        run("udevadm","settle","--timeout=10", check=False, capture=True)
+        run("udevadm", "settle", "--timeout=10", check=False, capture=True)
     time.sleep(1)
     
     parts = get_partitions_list(target_dev)
@@ -1517,8 +1510,9 @@ def strategy_rescue(target_dev, boot_mode, creds, has_win, win_esp):
     return True
 
 def valid_efi_size(s: str) -> str:
-    if re.match(r'^\d+(\.\d+)?\s*(M|MiB|G|GiB)\s*$', s, re.I):
-        return s.strip().replace(" ","")
+    s_clean = s.strip()
+    if re.match(r'^\d+(\.\d+)?\s*(M|MiB|G|GiB)\s*$', s_clean, re.I):
+        return s_clean.replace(" ", "")
     raise argparse.ArgumentTypeError(f"Invalid EFI size {s}, use like 1.3G, 1331M, 2G")
 
 def main():
@@ -1531,7 +1525,12 @@ def main():
     parser.add_argument("--allow-bios", action="store_true", help="Allow BIOS mode")
     parser.add_argument("--strategy", type=str, default=None, help="Partitioning strategy: wipe|existing|manual|rescue (1-4)")
     parser.add_argument("--rescue", action="store_true", help="Shortcut for --strategy rescue")
+    parser.add_argument("--csum", choices=["blake2", "crc32c", "xxhash", "sha256"], default="blake2", help="BTRFS checksum algorithm (default: blake2)")
     args = parser.parse_args()
+
+    global BTRFS_CSUM
+    if args.csum:
+        BTRFS_CSUM = args.csum
 
     if hasattr(os, "geteuid") and os.geteuid() != 0:
         console.print("[red]Need root[/red]")

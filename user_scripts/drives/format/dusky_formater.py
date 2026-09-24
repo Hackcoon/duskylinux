@@ -801,7 +801,7 @@ def interactive_setup() -> FormatPlan:
 # ==============================================================================
 
 def build_execution_plan(plan: FormatPlan) -> tuple[list[ExecutionStep], str, Optional[str]]:
-    device = plan["device"]
+    device = plan["device"].rstrip("/")
     fs_type = plan["fs_type"]
     label = plan["label"]
     encrypt = plan["encrypt"]
@@ -848,7 +848,7 @@ def build_execution_plan(plan: FormatPlan) -> tuple[list[ExecutionStep], str, Op
             sfdisk_table = "label: gpt\n,\n" if partition_table == "gpt" else "label: dos\n,\n"
             desc_str = f"Creating single primary {partition_table.upper()} partition layout on {device}"
 
-        part_cmd = ["sfdisk", device]
+        part_cmd = ["sfdisk", "--wipe", "always", "--wipe-partitions", "always", device]
         commands.append({
             "action": "partition",
             "desc": desc_str,
@@ -856,7 +856,7 @@ def build_execution_plan(plan: FormatPlan) -> tuple[list[ExecutionStep], str, Op
             "interactive": False,
             "input_data": sfdisk_table
         })
-        bash_script += f"# Partition drive via sfdisk\nprintf '{sfdisk_table}' | sfdisk {device}\n"
+        bash_script += f"# Partition drive via sfdisk\nprintf '{sfdisk_table}' | {shlex.join(part_cmd)}\n"
         
         # UNIVERSAL PARTITION SUFFIX RULE: Devices ending in digits (loop0, nvme0n1, zram1, mmcblk0) use 'p1', others (sda) use '1'
         part_suffix = "p1" if device[-1].isdigit() else "1"
@@ -888,7 +888,7 @@ def build_execution_plan(plan: FormatPlan) -> tuple[list[ExecutionStep], str, Op
         mapper_name = generate_secure_mapper_name()
         
         # Sector size 4096 aligns with modern 4Kn/512e SSDs and HDDs, avoiding crypto fragmentation
-        luks_fmt = ["cryptsetup", "-q", "luksFormat", "--type", "luks2", "--sector-size", "4096", target_block, "-"]
+        luks_fmt = ["cryptsetup", "-q", "luksFormat", "--type", "luks2", "--pbkdf", "argon2id", "--sector-size", "4096", target_block, "-"]
         commands.append({
             "action": "luks_format",
             "desc": f"Initializing LUKS2 Encryption Container (4096 sector size) on {target_block}",
@@ -898,7 +898,7 @@ def build_execution_plan(plan: FormatPlan) -> tuple[list[ExecutionStep], str, Op
         })
         bash_script += f"# Initialize LUKS2 Container (4096 sector size)\necho -n 'YOUR_PASSPHRASE' | {shlex.join(luks_fmt[:-1])} -\n"
         
-        luks_open = ["cryptsetup", "open", "--type", "luks", "--key-file", "-"]
+        luks_open = ["cryptsetup", "open", "--type", "luks2", "--key-file", "-"]
         if not rotational:
             luks_open.extend(["--allow-discards", "--perf-no_read_workqueue", "--perf-no_write_workqueue", "--persistent"])
         luks_open.extend([target_block, mapper_name])

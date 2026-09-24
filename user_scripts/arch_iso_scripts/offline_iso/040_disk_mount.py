@@ -190,8 +190,16 @@ def unmount_mount_tree():
 
     # Purge systemd 261 slave mount namespaces holding /mnt
     try:
+        seen_ns_inodes = set()
         for proc_dir in Path("/proc").glob("[0-9]*"):
             try:
+                ns_mnt = proc_dir / "ns" / "mnt"
+                if not ns_mnt.exists():
+                    continue
+                ino = ns_mnt.stat().st_ino
+                if ino in seen_ns_inodes:
+                    continue
+                seen_ns_inodes.add(ino)
                 mi = proc_dir / "mountinfo"
                 if mi.is_file():
                     text = mi.read_text(errors="ignore")
@@ -228,13 +236,11 @@ def ensure_subvolume(path: Path, nocow=False):
         existed=False
     if nocow:
         try:
-            run("chattr","-m",str(path), check=False, capture=True)
-            run("btrfs","property","set",str(path),"compression","", check=False, capture=True)
+            run("chattr","-c",str(path), check=False, capture=True)
+            run("btrfs","property","set",str(path),"compression","none", check=False, capture=True)
         except:
             pass
-        if not existed:
-            run("chattr","+C",str(path), check=False, capture=True)
-        elif is_empty_dir(path):
+        if not existed or is_empty_dir(path):
             run("chattr","+C",str(path), check=False, capture=True)
 
 def load_state():
@@ -638,7 +644,7 @@ def assemble_fhs(mapped_root,efi_part):
     
     if BOOT_MODE=="UEFI" and efi_part:
         console.print(f"[yellow]>> Mounting EFI {efi_part} to /mnt/boot (hardened)...[/yellow]")
-        run("mount","-t","vfat","-o","fmask=0177,dmask=0077,noexec,nosuid,nodev",str(efi_part),"/mnt/boot",capture=True)
+        run("mount","-t","vfat","-o","fmask=0077,dmask=0077,noexec,nosuid,nodev",str(efi_part),"/mnt/boot",capture=True)
         sync_secondary_efi_bootloaders("/mnt/boot", str(efi_part))
 
     if STATE_JSON.exists():
@@ -733,7 +739,7 @@ def sync_secondary_efi_bootloaders(primary_esp_mnt: str = "/mnt/boot", primary_e
                         if not vendor_dir.is_dir():
                             continue
                         v_name = vendor_dir.name
-                        if not v_name or v_name.startswith("."):
+                        if not v_name or v_name.startswith(".") or v_name.lower() in ("boot", "systemd"):
                             continue
                         dst_vendor = target_efi_dir / v_name
                         console.print(f"[cyan]Syncing secondary EFI vendor directory '{v_name}' from {p_res} -> {dst_vendor}[/cyan]")
@@ -821,7 +827,7 @@ def initialize_swapfile():
 
     try:
         SWAPFILE_PATH.unlink(missing_ok=True)
-        run("truncate", "-s", size_str, str(SWAPFILE_PATH), check=False)
+        run("fallocate", "-l", size_str, str(SWAPFILE_PATH), check=False)
         run("chattr", "+C", str(SWAPFILE_PATH), check=False)
         run("chmod", "600", str(SWAPFILE_PATH), check=False)
         run("mkswap", str(SWAPFILE_PATH), check=False)
