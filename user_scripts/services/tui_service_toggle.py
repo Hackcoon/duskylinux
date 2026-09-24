@@ -358,7 +358,6 @@ _append_core_sections(1, CORE_SYSTEM_DEFS, _core_installed_sys, "system", CORE_S
 
 # =============================================================================
 # DEFERRED FULL FETCH (Tabs 2-6)
-# Background threads start immediately (running in parallel with TUI startup).
 # The TUI calls DEFERRED_LOAD() after initial render to complete these tabs.
 # =============================================================================
 def _fetch_all_unit_files(scope: str) -> tuple[set, set, set]:
@@ -433,28 +432,22 @@ def _fetch_active_services(scope: str) -> set:
         return set()
 
 
-# Start full fetch in background IMMEDIATELY — these threads run in parallel
-# with TUI startup so they're often already finished by the time DEFERRED_LOAD is called.
-_bg_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-_f_user_all = _bg_executor.submit(_fetch_all_unit_files, "user")
-_f_sys_all = _bg_executor.submit(_fetch_all_unit_files, "system")
-_f_user_act = _bg_executor.submit(_fetch_active_services, "user")
-_f_sys_act = _bg_executor.submit(_fetch_active_services, "system")
-
-
 def DEFERRED_LOAD() -> list[int]:
     """
     Completes the deferred tab population for tabs 2-6.
-    Waits on background futures (which have been running since module import),
-    then populates the SCHEMA lists.
+    Runs the full scans after the initial UI render, then populates the SCHEMA lists.
     Returns list of tab indices that were populated.
     Called by the TUI after its initial render of tabs 0-1.
     """
-    installed_user_srv, enabled_user, timers_user = _f_user_all.result()
-    installed_sys_srv, enabled_sys, timers_sys = _f_sys_all.result()
-    active_user_raw = _f_user_act.result()
-    active_sys_raw = _f_sys_act.result()
-    _bg_executor.shutdown(wait=False)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        user_all = executor.submit(_fetch_all_unit_files, "user")
+        sys_all = executor.submit(_fetch_all_unit_files, "system")
+        user_active = executor.submit(_fetch_active_services, "user")
+        sys_active = executor.submit(_fetch_active_services, "system")
+        installed_user_srv, enabled_user, timers_user = user_all.result()
+        installed_sys_srv, enabled_sys, timers_sys = sys_all.result()
+        active_user_raw = user_active.result()
+        active_sys_raw = sys_active.result()
 
     installed_user = installed_user_srv | timers_user
     installed_sys = installed_sys_srv | timers_sys
