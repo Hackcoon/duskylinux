@@ -2359,12 +2359,11 @@ Tooltip {
                 self.screen.dismiss(None)
             return
 
-        if self._sudo_keepalive:
-            self._sudo_keepalive.stop()
-            self._sudo_keepalive = None
+        if self._quit_after_save:
+            return
 
         # BATCH mode: don't silently throw away queued writes.
-        if self.pending_commits and not self._save_tasks and (not self.auto_save or not self._save_timers):
+        if self.pending_commits and not self._save_tasks and not self._save_auth_pending and (not self.auto_save or not self._save_timers):
             def on_reply(reply: str) -> None:
                 if reply == "save":
                     self._quit_after_save = True
@@ -5210,6 +5209,11 @@ Tooltip {
                 self._save_failure_pending = True
                 self._maybe_finish_quit()
                 return
+            except Exception as exc:
+                self.notify_status(f"Sudo authentication failed: {exc}", level="error")
+                self._save_failure_pending = True
+                self._maybe_finish_quit()
+                return
             finally:
                 pwd = None
 
@@ -5260,6 +5264,9 @@ Tooltip {
         if self._modal_active():
             if on_complete:
                 on_complete(False)
+            if self._quit_after_save:
+                self._save_failure_pending = True
+                self._maybe_finish_quit()
             return False
 
         self.trigger_shortcut_blink("ctrl-s")
@@ -5285,11 +5292,6 @@ Tooltip {
             self._save_lock = asyncio.Lock()
 
         async with self._save_lock:
-            if self._modal_active():
-                if on_complete:
-                    on_complete(False)
-                return
-
             if not self.pending_commits:
                 self.notify_status("No pending changes.", level="info")
                 if on_complete:
@@ -5489,6 +5491,13 @@ Tooltip {
                 )
             except subprocess.TimeoutExpired:
                 self.notify_status("Sudo authentication timed out.", level="error")
+                self._save_failure_pending = True
+                if on_complete:
+                    on_complete(False)
+                self._maybe_finish_quit()
+                return
+            except Exception as exc:
+                self.notify_status(f"Sudo authentication failed: {exc}", level="error")
                 self._save_failure_pending = True
                 if on_complete:
                     on_complete(False)
@@ -6780,6 +6789,9 @@ Tooltip {
                 self._action_shutdown_done = True
 
     async def on_unmount(self) -> None:
+        if self._sudo_keepalive:
+            self._sudo_keepalive.stop()
+            self._sudo_keepalive = None
         await self._shutdown_background_actions()
 
     def execute_action(self, item: ConfigItem) -> None:

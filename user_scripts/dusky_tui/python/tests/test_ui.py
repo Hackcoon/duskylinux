@@ -282,6 +282,80 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(engine.state['x'], '2')
             self.assertFalse(app.pending_commits)
 
+    async def test_accepted_save_continues_if_dialog_opens(self):
+        app = app_for()
+        engine = app.engine_pool[app.default_engine_key]
+        async with app.run_test() as pilot:
+            await self.boot(app, pilot)
+            app._apply_value(0, 0, app.schema[0][0], 2, batch_mode=True)
+            self.assertTrue(app.action_save_batch())
+            app.push_screen(ui.AlertDialog('Notice'))
+            for _ in range(50):
+                await pilot.pause(0.01)
+                if not app._save_tasks:
+                    break
+            self.assertEqual(engine.state['x'], '2')
+            self.assertFalse(app.pending_commits)
+
+    async def test_quit_save_failure_keeps_change_pending(self):
+        engine = Engine()
+        engine.fail = True
+        app = app_for(engine=engine)
+        async with app.run_test() as pilot:
+            await self.boot(app, pilot)
+            app._apply_value(0, 0, app.schema[0][0], 2, batch_mode=True)
+            with patch.object(app, 'exit') as exit_app:
+                app.action_quit()
+                await pilot.pause()
+                await pilot.click('#btn-save')
+                for _ in range(50):
+                    await pilot.pause(0.01)
+                    if not app._save_tasks and not isinstance(app.screen, ui.UnsavedChangesDialog):
+                        break
+                self.assertFalse(exit_app.called)
+            self.assertIn((0, 0), app.pending_commits)
+
+    async def test_quit_waits_during_authorization_handoff(self):
+        app = app_for()
+        async with app.run_test() as pilot:
+            await self.boot(app, pilot)
+            app._apply_value(0, 0, app.schema[0][0], 2, batch_mode=True)
+            app._save_auth_pending = 1
+            app.action_quit()
+            self.assertTrue(app._quit_after_save)
+            self.assertNotIsInstance(app.screen, ui.UnsavedChangesDialog)
+            app.action_quit()
+            self.assertNotIsInstance(app.screen, ui.UnsavedChangesDialog)
+            app._save_auth_pending = 0
+
+    async def test_password_execution_error_keeps_batch_pending(self):
+        app = app_for()
+        async with app.run_test() as pilot:
+            await self.boot(app, pilot)
+            app._apply_value(0, 0, app.schema[0][0], 2, batch_mode=True)
+            results = []
+            with patch.object(ui.subprocess, 'run', side_effect=OSError('sudo unavailable')):
+                await app._on_batch_password('password', results.append)
+            self.assertEqual(results, [False])
+            self.assertIn((0, 0), app.pending_commits)
+            self.assertTrue(app._save_failure_pending)
+
+    async def test_quit_flushes_pending_autosave_timer(self):
+        app = app_for(mode='auto')
+        engine = app.engine_pool[app.default_engine_key]
+        async with app.run_test() as pilot:
+            await self.boot(app, pilot)
+            app._apply_value(0, 0, app.schema[0][0], 2)
+            with patch.object(app, 'exit') as exit_app:
+                app.action_quit()
+                for _ in range(50):
+                    await pilot.pause(0.01)
+                    if exit_app.called:
+                        break
+                self.assertTrue(exit_app.called)
+            self.assertEqual(engine.state['x'], '2')
+            self.assertFalse(app.pending_commits)
+
     async def test_failed_coalesced_autosave_keeps_unsaved_value_pending(self):
         engine = Engine()
         engine.fail = True
