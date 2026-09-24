@@ -9,8 +9,42 @@ NM_DIR="$HOME/.mozilla/native-messaging-hosts"
 EXT_ID="dusky_sites@dusky.com"
 
 echo "== toolchain"
-python3 -c 'import sys; assert sys.version_info >= (3, 14, 7), sys.version; print("python", sys.version.split()[0])'
-firefox --version | tee /dev/stderr | grep -Eq 'Firefox (15[6-9]|1[6-9][0-9])' || { echo "Firefox >= 156 required" >&2; exit 1; }
+
+command -v python3 >/dev/null || {
+  echo "python3 is required" >&2
+  exit 1
+}
+
+command -v firefox >/dev/null || {
+  echo "firefox is required" >&2
+  exit 1
+}
+
+command -v zip >/dev/null || {
+  echo "zip is required (pacman -S zip)" >&2
+  exit 1
+}
+
+python3 -c '
+import sys
+assert sys.version_info >= (3, 14, 7), sys.version
+print("python", sys.version.split()[0])
+'
+
+ff_ver="$(firefox --version)"
+printf '%s\n' "$ff_ver" >&2
+
+ff_major="$(
+  sed -En \
+    's/.*Firefox ([0-9]+).*/\1/p' \
+    <<<"$ff_ver"
+)"
+
+[[ "$ff_major" =~ ^[0-9]+$ ]] &&
+  (( ff_major >= 156 )) || {
+    echo "Firefox >= 156 required" >&2
+    exit 1
+  }
 if command -v node >/dev/null; then
   node --check "$SRC/extension/background.js"
   node --check "$SRC/extension/content.js"
@@ -53,11 +87,60 @@ def recv(want):
 send({'type': 'HELLO', 'wire': 3, 'extension': ext, 'known': {}})
 ack = recv('HELLO_ACK'); assert ack['wire'] >= 3, ack
 t0 = time.perf_counter(); send({'type': 'FETCH_NOW', 'known': {}}); m = recv('MATUGEN_UPDATE'); dt = (time.perf_counter() - t0) * 1000
-d = m['data']; print(f"MATUGEN_UPDATE in {dt:.1f} ms: {len(d['colors'])} colours, {len(d.get('websites', {}))} site keys, status={d['status']}")
-assert 'websites' in d, 'first frame must carry the rule map'
-send({'type': 'FETCH_NOW', 'known': {'websitesRev': d['websitesRev']}}); m2 = recv('MATUGEN_UPDATE')
-assert 'websites' not in m2['data'], 'delta path failed: websites re-sent although known'
-print("delta ok: second FETCH_NOW omitted websites")
+d = m["data"]
+
+print(
+    f"MATUGEN_UPDATE in {dt:.1f} ms: "
+    f"{len(d['colors'])} colours, "
+    f"{len(d.get('websites', {}))} site keys, "
+    f"status={d['status']}"
+)
+
+assert (
+    isinstance(
+        d.get("colorsRev"),
+        str
+    ) and
+    d["colorsRev"]
+), "missing canonical colorsRev"
+
+assert (
+    isinstance(
+        d.get("websitesRev"),
+        str
+    ) and
+    d["websitesRev"]
+), "missing canonical websitesRev"
+
+assert (
+    "websites" in d
+), "first frame must carry the rule map"
+
+send({
+    "type": "FETCH_NOW",
+    "known": {
+        "websitesRev":
+            d["websitesRev"]
+    }
+})
+
+m2 = recv(
+    "MATUGEN_UPDATE"
+)
+
+assert (
+    m2["data"].get("websitesRev") ==
+    d["websitesRev"]
+), "websitesRev changed unexpectedly"
+
+assert (
+    "websites" not in
+    m2["data"]
+), "delta path failed: websites re-sent although known"
+
+print(
+    "delta ok: second FETCH_NOW omitted websites"
+)
 send({'type': 'PING', 'at': 1}); assert recv('PONG')['at'] == 1
 p.stdin.close(); print("exit", p.wait(timeout=5))
 PY

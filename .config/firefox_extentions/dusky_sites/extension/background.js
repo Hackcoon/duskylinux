@@ -1,5 +1,5 @@
 /* =============================================================================
- * Dusky Sites — Background Engine v6.1
+ * Dusky Sites — Background Engine v6.2
  * Firefox 156+ · MV3 event page · wire v3 (delta) native host · no UI
  *
  * HOT PATH — one matugen tick = one ~4 KB MATUGEN_UPDATE frame
@@ -25,21 +25,26 @@
     const APP = 'Dusky Sites';
     const NATIVE_APP = 'dusky_sites';
     const WIRE = 3;
-    const SCHEMA = 6;
+    const SCHEMA = 7;
 
     const T = Object.freeze({
         RECONNECT_BASE_MS: 1500,
         RECONNECT_MAX_MS: 120000,
         HANDSHAKE_MS: 5000,
         RPC_MS: 6000,
-        IDLE_PING_MS: 120000,        // half-open detector (the host pings every 20 s, so this rarely fires)
+        IDLE_PING_MS: 120000,
         PING_GRACE_MS: 10000,
-        THEME_MIN_GAP_MS: 100,       // floor between two theme.update() calls (≤ 10 Hz chrome)
-        THEME_MAX_GAP_MS: 1500,      // ceiling: even a 400 ms chrome restyle gets ≥ 1 update / 1.5 s
-        THEME_COST_X: 4,             // gap = 4 × cost → chrome restyle ≤ 25 % of the parent main thread
-        THEME_PROBE_DELAY_MS: 24,    // one parent refresh tick before probing residual busy time
-        TAB_SLOT_MS: 16,             // per-tab coalescing window (one frame)
-        SETTLE_MS: 1200,             // quiet period that ends a burst
+
+        // browser.theme.update() is global when no windowId is supplied.
+        // Promise RTT is only a congestion signal, never treated as a direct
+        // measurement of Gecko's subsequent chrome restyle/reflow work.
+        THEME_MIN_GAP_MS: 250,
+        THEME_MAX_GAP_MS: 1500,
+        THEME_COST_X: 4,
+        THEME_EWMA_ALPHA: 0.25,
+
+        TAB_SLOT_MS: 16,
+        SETTLE_MS: 1200,
         TRICKLE_BATCH: 24,
         TRICKLE_MS: 50,
         CHUNK_TTL_MS: 15000,
@@ -107,7 +112,6 @@
 
     const clamp = (n, lo, hi) => (n < lo ? lo : n > hi ? hi : n);
     const now = () => Date.now();
-    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
     /* ── 3. Colour engine (pure arithmetic; chrome theme only) ───────────── */
     const NAMED = { transparent: [0, 0, 0, 0], black: [0, 0, 0, 1], white: [255, 255, 255, 1] };
@@ -193,7 +197,7 @@
     const BUILTIN = Object.freeze({
         ecoMode: true,
         browserThemeEnabled: true,
-        webThemeEnabled: false,          // host config.json is authoritative once connected
+        webThemeEnabled: true,           // mirror host default; config.json becomes authoritative once connected
         forceUnthemedWebsites: false,    // idem
         fastPaint: true,
         contentColorScheme: 'dark',      // auto | light | dark | system
@@ -299,7 +303,7 @@
     const S = {
         cfg: mergeConfig(BUILTIN, userConfig()),
         enabled: true,
-        theme: null,      // frozen {colors, colorsRev, websites, websitesRev, hostSitesRev, disabled, disabledRev, status, at}
+        theme: null,      // frozen {colors, colorsRev, websites, websitesRev, disabled, disabledRev, status, at}
         palette: null,    // frozen {vars, hash} — derived once per colour revision, shared by every tab
         port: null, ready: false, gen: 0, attempt: 0, nextAt: 0, rxAt: 0, connectedAt: 0, lastError: null,
         themeHash: null, themeCost: 0, themeAt: 0, themeBusy: false, themeDirty: false, themeEpoch: 0, scheme: 'dark',
@@ -312,8 +316,10 @@
     const rulesCache = new Lru(LIM.RULES_CACHE);    // host -> rules entry | null
     const domainCache = new Lru(LIM.DOMAIN_CACHE);  // host -> {css,isDarkSite,hints,neg,at}
     const domainInflight = new Map();               // host -> Promise
-    const slots = new Map();                        // tabId -> {timer,msg}
-    const lastSig = new Map();                      // tabId -> 'p/r[/s]' | 'x' (nothing applied) | '?' (unknown after respawn)
+    const slots = new Map();                        // tabId -> queued delivery
+    const lastSig = new Map();                      // tabId -> acknowledged 'p/r[/s]' | 'x' | '?'
+    const tabEpoch = new Map();                     // tabId -> newest delivery/pull epoch
+    let tabEpochSeq = 0;
     const paintDirty = new Map();                   // host -> paint entry | null (tombstone)
     let paintIndex = [];                            // [[host, rulesHash], …] MRU order, mirrors paint:<host> keys on disk
     let paletteWritten = null;                      // palette hash last written to paint:palette
@@ -323,49 +329,189 @@
     const ready = () => (bootP ??= boot().catch((e) => fail('boot failed', e)));
 
     async function boot() {
-        const [local, sess] = await Promise.all([
-            browser.storage.local.get(['schema', 'enabled', 'seed', 'seedSites', 'paintIndex']).catch(() => ({})),
-            browser.storage.session.get(['colors', 'sites', 'meta']).catch(() => ({}))
+        let [local, sess] = await Promise.all([
+            browser.storage.local.get([
+                'schema',
+                'enabled',
+                'seed',
+                'seedSites',
+                'paintIndex'
+            ]).catch(() => ({})),
+
+            browser.storage.session.get([
+                'colors',
+                'sites',
+                'meta'
+            ]).catch(() => ({}))
         ]);
-        if (local.schema !== SCHEMA) await migrate();
-        if (typeof local.enabled === 'boolean') S.enabled = local.enabled;
+
+        if (local.schema !== SCHEMA) {
+            await migrate();
+
+            // The snapshots above predate migrate(), so invalidate their
+            // revision-bearing records in memory too.
+            local = {
+                ...local,
+                schema: SCHEMA,
+                seed: undefined,
+                seedSites: undefined
+            };
+
+            sess = {
+                ...sess,
+                colors: undefined,
+                sites: undefined
+            };
+        }
+
+        if (typeof local.enabled === 'boolean') {
+            S.enabled = local.enabled;
+        }
+
         paintIndex = Array.isArray(local.paintIndex)
-            ? local.paintIndex.filter((e) => Array.isArray(e) && typeof e[0] === 'string' && typeof e[1] === 'string')
+            ? local.paintIndex.filter(
+                (e) =>
+                    Array.isArray(e) &&
+                    typeof e[0] === 'string' &&
+                    typeof e[1] === 'string'
+            )
             : [];
 
         const meta = sess.meta;
+
         if (meta && typeof meta === 'object') {
-            if (typeof meta.enabled === 'boolean') S.enabled = meta.enabled;
-            S.themeHash = typeof meta.themeHash === 'string' ? meta.themeHash : null;
-            S.scheme = meta.scheme === 'light' ? 'light' : 'dark';
-            if (typeof meta.paletteWritten === 'string') paletteWritten = meta.paletteWritten;
-            if (Array.isArray(meta.tabs)) for (const id of meta.tabs) if (Number.isInteger(id)) lastSig.set(id, '?');
+            if (typeof meta.enabled === 'boolean') {
+                S.enabled = meta.enabled;
+            }
+
+            S.themeHash =
+                typeof meta.themeHash === 'string'
+                    ? meta.themeHash
+                    : null;
+
+            S.scheme =
+                meta.scheme === 'light'
+                    ? 'light'
+                    : 'dark';
+
+            if (typeof meta.paletteWritten === 'string') {
+                paletteWritten = meta.paletteWritten;
+            }
+
+            if (Array.isArray(meta.tabs)) {
+                for (const id of meta.tabs) {
+                    if (Number.isInteger(id)) {
+                        lastSig.set(id, '?');
+                    }
+                }
+            }
         }
 
-        // Warm (session) beats cold (local seed); the seed underlies it so a colours-only session
-        // record still boots with the last settled rule map. Both carry the host-owned flags.
-        const seedSites = local.seedSites && typeof local.seedSites === 'object' && local.seedSites.websites ? local.seedSites : null;
-        const seed = local.seed && typeof local.seed === 'object' && local.seed.colors ? { ...local.seed, ...(seedSites || {}) } : null;
-        const src = sess.colors && typeof sess.colors === 'object' && sess.colors.colors
-            ? { ...(seed || {}), ...sess.colors, ...(sess.sites || {}) }
-            : seed;
-        if (seedSites) seedSitesRev = hash32(JSON.stringify(seedSites.websites));   // so a respawn never rewrites 174 KB
-        if (src?.colors) adopt(src, false);
+        // Schema-7 seeds always carry the host's canonical revisions.
+        const seedSites =
+            local.seedSites &&
+            typeof local.seedSites === 'object' &&
+            local.seedSites.websites &&
+            typeof local.seedSites.websitesRev === 'string'
+                ? local.seedSites
+                : null;
 
-        if (S.cfg.browserThemeEnabled) { if (S.theme) queueTheme(); }
-        else if (S.themeHash) resetTheme();
+        const seed =
+            local.seed &&
+            typeof local.seed === 'object' &&
+            local.seed.colors &&
+            typeof local.seed.colorsRev === 'string'
+                ? {
+                    ...local.seed,
+                    ...(seedSites || {})
+                }
+                : null;
+
+        const src =
+            sess.colors &&
+            typeof sess.colors === 'object' &&
+            sess.colors.colors
+                ? {
+                    ...(seed || {}),
+                    ...sess.colors,
+                    ...(sess.sites || {})
+                }
+                : seed;
+
+        if (seedSites) {
+            seedSitesRev = seedSites.websitesRev;
+        }
+
+        // Prevent an unchanged cold seed from being needlessly rewritten
+        // after every event-page reconstruction.
+        if (seed) {
+            const disabled =
+                Array.isArray(seed.disabledSites)
+                    ? cleanSites(seed.disabledSites)
+                    : [];
+
+            const disabledRev = hash32(disabled.join('\n'));
+
+            seedHash = hash32([
+                seed.colorsRev,
+                disabledRev,
+                !!seed.webThemeEnabled,
+                !!seed.forceUnthemedWebsites
+            ].join('|'));
+        }
+
+        if (src?.colors) {
+            adopt(src, false);
+        }
+
+        if (S.cfg.browserThemeEnabled) {
+            if (S.theme) {
+                queueTheme();
+            }
+        } else if (S.themeHash) {
+            resetTheme();
+        }
 
         await ensureWatchdog(false);
-        if (S.enabled) connect();
-        browser.action.setTitle({ title: S.enabled ? APP : `${APP} (paused)` }).catch(swallow);
+
+        if (S.enabled) {
+            connect();
+        }
+
+        browser.action.setTitle({
+            title: S.enabled ? APP : `${APP} (paused)`
+        }).catch(swallow);
     }
 
-    /** v5 → v6 storage migration: drop the single-blob shapes, stamp the schema. */
+    /**
+     * Schema 7 makes host-generated revisions canonical.
+     * Cold/warm records from older schemas cannot be reused safely.
+     *
+     * Paint cache format is unchanged and intentionally preserved.
+     */
     async function migrate() {
         try {
-            await browser.storage.local.remove(['config', 'themeData', 'paintCache']);
-            await browser.storage.local.set({ schema: SCHEMA });
-        } catch (e) { swallow(e); }
+            await Promise.all([
+                browser.storage.local.remove([
+                    'config',
+                    'themeData',
+                    'paintCache',
+                    'seed',
+                    'seedSites'
+                ]),
+
+                browser.storage.session.remove([
+                    'colors',
+                    'sites'
+                ])
+            ]);
+
+            await browser.storage.local.set({
+                schema: SCHEMA
+            });
+        } catch (e) {
+            swallow(e);
+        }
     }
 
     /* ── 6. URL helpers + matcher ────────────────────────────────────────── */
@@ -413,7 +559,9 @@
     const chunks = new Map();    // id -> {parts,total,bytes,at}
     let ridSeq = 0;
 
-    const known = () => ({ websitesRev: S.theme?.hostSitesRev ?? null });
+    const known = () => ({
+        websitesRev: S.theme?.websitesRev ?? null
+    });
 
     function connect() {
         if (!S.enabled || S.port) return;
@@ -552,7 +700,17 @@
         switch (msg.type) {
             case 'MATUGEN_UPDATE': onPaletteUpdate(msg.data); return;
             case 'DOMAIN_FIX_RESPONSE': cacheDomainFix(msg); return;
-            case 'HELLO_ACK': if ((msg.wire | 0) < WIRE) fail(`native host speaks wire ${msg.wire}; v6 needs ${WIRE} — reinstall dusky_sites_host.py`); return;
+            case 'HELLO_ACK':
+                if (
+                    (msg.wire | 0) <
+                    WIRE
+                ) {
+                    fail(
+                        `native host speaks wire ${msg.wire}; wire ${WIRE} required — reinstall dusky_sites_host.py`
+                    );
+                }
+
+                return;
             case 'QUERY_LIVE_THEME': replyLiveTheme(); return;
             case 'PING': send({ type: 'PONG', at: now() }); return;   // host keep-alive: the reply is also our liveness proof
             case 'PONG': return;
@@ -565,37 +723,150 @@
      * @returns {null|{colors:boolean,rules:boolean,webOn:boolean,webOff:boolean}}
      */
     function adopt(d, fromHost) {
-        if (!d || typeof d !== 'object' || !d.colors || typeof d.colors !== 'object') return null;
+        if (
+            !d ||
+            typeof d !== 'object' ||
+            !d.colors ||
+            typeof d.colors !== 'object' ||
+            typeof d.colorsRev !== 'string' ||
+            typeof d.websitesRev !== 'string'
+        ) {
+            return null;
+        }
+
         const prev = S.theme;
-        const hasSites = !!d.websites && typeof d.websites === 'object';
-        const websites = hasSites ? d.websites : (prev?.websites ?? {});
-        const websitesRev = hasSites ? hash32(JSON.stringify(websites)) : (prev?.websitesRev ?? hash32('{}'));
-        const hostSitesRev = hasSites ? (typeof d.websitesRev === 'string' ? d.websitesRev : null) : (prev?.hostSitesRev ?? null);
-        const colorsRev = hash32(JSON.stringify(d.colors));
-        const disabled = Array.isArray(d.disabledSites) ? cleanSites(d.disabledSites) : (prev?.disabled ?? []);
-        const disabledRev = hash32(disabled.join('\n'));
 
-        // Host-owned switches ride along with every frame; the host's config.json is authoritative.
-        const webBefore = S.cfg.webThemeEnabled, forcedBefore = S.cfg.forceUnthemedWebsites;
+        const hasSites =
+            !!d.websites &&
+            typeof d.websites === 'object';
+
+        // A delta is only valid if we already possess exactly the rule
+        // revision it references. Never silently pair new metadata with
+        // an older rule map.
+        if (
+            !hasSites &&
+            (!prev || d.websitesRev !== prev.websitesRev)
+        ) {
+            warn(
+                'host omitted websites for an unknown revision; requesting full snapshot'
+            );
+
+            send({
+                type: 'FETCH_NOW',
+                known: {
+                    websitesRev: null
+                }
+            });
+
+            return null;
+        }
+
+        const websites =
+            hasSites
+                ? d.websites
+                : prev.websites;
+
+        // These identities are computed over canonical JSON by the native host.
+        // Do not re-hash the objects independently in JavaScript.
+        const websitesRev = d.websitesRev;
+        const colorsRev = d.colorsRev;
+
+        const disabled =
+            Array.isArray(d.disabledSites)
+                ? cleanSites(d.disabledSites)
+                : (prev?.disabled ?? []);
+
+        const disabledRev =
+            hash32(disabled.join('\n'));
+
+        const webBefore =
+            S.cfg.webThemeEnabled;
+
+        const forcedBefore =
+            S.cfg.forceUnthemedWebsites;
+
         const patch = {};
-        if (typeof d.webThemeEnabled === 'boolean') patch.webThemeEnabled = d.webThemeEnabled;
-        if (typeof d.forceUnthemedWebsites === 'boolean') patch.forceUnthemedWebsites = d.forceUnthemedWebsites;
-        S.cfg = mergeConfig(S.cfg, patch);
-        const webOn = !webBefore && S.cfg.webThemeEnabled, webOff = webBefore && !S.cfg.webThemeEnabled;
-        const forcedChanged = forcedBefore !== S.cfg.forceUnthemedWebsites;
 
-        const colors = colorsRev !== prev?.colorsRev;
-        const rules = websitesRev !== prev?.websitesRev || disabledRev !== prev?.disabledRev || forcedChanged;
-        if (!colors && !rules && !webOn && !webOff) return null;
+        if (typeof d.webThemeEnabled === 'boolean') {
+            patch.webThemeEnabled = d.webThemeEnabled;
+        }
+
+        if (typeof d.forceUnthemedWebsites === 'boolean') {
+            patch.forceUnthemedWebsites =
+                d.forceUnthemedWebsites;
+        }
+
+        S.cfg = mergeConfig(S.cfg, patch);
+
+        const webOn =
+            !webBefore &&
+            S.cfg.webThemeEnabled;
+
+        const webOff =
+            webBefore &&
+            !S.cfg.webThemeEnabled;
+
+        const forcedChanged =
+            forcedBefore !==
+            S.cfg.forceUnthemedWebsites;
+
+        const colors =
+            colorsRev !== prev?.colorsRev;
+
+        const rules =
+            websitesRev !== prev?.websitesRev ||
+            disabledRev !== prev?.disabledRev ||
+            forcedChanged;
+
+        if (
+            !colors &&
+            !rules &&
+            !webOn &&
+            !webOff
+        ) {
+            return null;
+        }
 
         S.theme = Object.freeze({
-            colors: d.colors, colorsRev, websites, websitesRev, hostSitesRev, disabled, disabledRev,
-            status: Array.isArray(d.status) ? d.status.slice(0, 8) : null, at: Number(d.timestamp) || now()
+            colors: d.colors,
+            colorsRev,
+
+            websites,
+            websitesRev,
+
+            disabled,
+            disabledRev,
+
+            status:
+                Array.isArray(d.status)
+                    ? d.status.slice(0, 8)
+                    : null,
+
+            at:
+                Number(d.timestamp) ||
+                now()
         });
-        if (colors || !S.palette) { S.palette = buildPalette(d.colors); stats.revs++; }
-        if (rules) { rulesCache.clear(); stats.ruleRevs++; }
-        if (fromHost) persistWarm(hasSites && rules);
-        return { colors, rules, webOn, webOff };
+
+        if (colors || !S.palette) {
+            S.palette = buildPalette(d.colors);
+            stats.revs++;
+        }
+
+        if (rules) {
+            rulesCache.clear();
+            stats.ruleRevs++;
+        }
+
+        if (fromHost) {
+            persistWarm(hasSites && rules);
+        }
+
+        return {
+            colors,
+            rules,
+            webOn,
+            webOff
+        };
     }
 
     function onPaletteUpdate(d) {
@@ -643,46 +914,126 @@
     function queueTheme() { S.themeDirty = true; scheduleTheme(); }
 
     function scheduleTheme() {
-        if (S.tm.theme || S.themeBusy || !S.themeDirty) return;
-        const gap = clamp(S.themeCost * T.THEME_COST_X, T.THEME_MIN_GAP_MS, T.THEME_MAX_GAP_MS);
-        S.tm.theme = setTimeout(runTheme, Math.max(0, S.themeAt + gap - now()));
+        if (
+            S.tm.theme ||
+            S.themeBusy ||
+            !S.themeDirty
+        ) {
+            return;
+        }
+
+        const gap = clamp(
+            S.themeCost * T.THEME_COST_X,
+            T.THEME_MIN_GAP_MS,
+            T.THEME_MAX_GAP_MS
+        );
+
+        S.tm.theme = setTimeout(
+            runTheme,
+            Math.max(
+                0,
+                S.themeAt + gap - now()
+            )
+        );
     }
 
     async function runTheme() {
         S.tm.theme = 0;
-        if (!S.themeDirty) return;
+
+        if (!S.themeDirty) {
+            return;
+        }
+
         S.themeDirty = false;
-        if (!S.enabled || !S.cfg.browserThemeEnabled || !S.theme) return;
-        const payload = buildThemePayload(S.theme.colors);
-        const h = hash32(JSON.stringify(payload));
-        if (h === S.themeHash) { stats.themeSkipped++; return; }
+
+        if (
+            !S.enabled ||
+            !S.cfg.browserThemeEnabled ||
+            !S.theme
+        ) {
+            return;
+        }
+
+        const payload =
+            buildThemePayload(S.theme.colors);
+
+        const h =
+            hash32(JSON.stringify(payload));
+
+        if (h === S.themeHash) {
+            stats.themeSkipped++;
+            return;
+        }
+
         const epoch = S.themeEpoch;
+
         S.themeBusy = true;
+
         const t0 = performance.now();
+
         let ok = false;
-        try { await browser.theme.update(payload); ok = true; }
-        catch (e) { fail('theme.update rejected:', e); }
-        const rtt = performance.now() - t0;
-        // The update RTT covers the parent's synchronous share (LightweightThemeConsumer sets the chrome's
-        // CSS variables in every window). The restyle/reflow it triggers runs on the parent's next refresh
-        // tick, so give it one tick and then time a trivial parent-side call: its RTT is how long the
-        // parent main thread was still busy — the quantity that freezes the UI.
-        await sleep(T.THEME_PROBE_DELAY_MS);
-        const t1 = performance.now();
-        try { await browser.runtime.getPlatformInfo(); } catch { /* probe only */ }
-        const cost = rtt + (performance.now() - t1);
-        if (epoch === S.themeEpoch) { S.themeHash = ok ? h : null; if (ok) stats.themeUpdates++; }
-        S.themeCost = S.themeCost ? S.themeCost * 0.5 + cost * 0.5 : cost;
-        stats.themeLastCostMs = Math.round(cost);
-        S.themeAt = now(); S.themeBusy = false;
-        persistMeta();
-        scheduleTheme();                               // a burst may have re-dirtied us meanwhile
+
+        try {
+            await browser.theme.update(payload);
+            ok = true;
+        } catch (e) {
+            fail('theme.update rejected:', e);
+        }
+
+        const rtt =
+            performance.now() - t0;
+
+        if (epoch === S.themeEpoch) {
+            S.themeHash =
+                ok
+                    ? h
+                    : null;
+
+            if (ok) {
+                stats.themeUpdates++;
+            }
+        }
+
+        /*
+         * browser.theme.update() promise latency is a congestion signal.
+         * It is NOT a direct measurement of Gecko's subsequent chrome
+         * restyle/reflow/paint cost, so retain the hard 250 ms floor.
+         */
+        if (ok) {
+            S.themeCost =
+                S.themeCost
+                    ? S.themeCost +
+                        T.THEME_EWMA_ALPHA *
+                        (rtt - S.themeCost)
+                    : rtt;
+
+            stats.themeLastCostMs =
+                Math.round(rtt);
+        }
+
+        S.themeAt = now();
+        S.themeBusy = false;
+
+        await persistMeta();
+
+        // A newer palette may have dirtied us while theme.update() was pending.
+        scheduleTheme();
     }
 
     async function resetTheme() {
-        S.themeEpoch++; S.themeHash = null; S.themeDirty = false; clearT('theme');
-        try { await browser.theme.reset(); } catch (e) { warn(e); }
-        persistMeta();
+        S.themeEpoch++;
+        S.themeHash = null;
+        S.themeDirty = false;
+
+        clearT('theme');
+
+        try {
+            await browser.theme.reset();
+        } catch (e) {
+            warn(e);
+        }
+
+        await persistMeta();
     }
 
     function rolePalette(colors) {
@@ -816,26 +1167,156 @@
     });
 
     /* ── 11. Delivery (I5, I6) ───────────────────────────────────────────── */
-    function queueTab(tabId, msg, sig) {
-        lastSig.set(tabId, sig);
-        if (lastSig.size > LIM.TRACKED_TABS) lastSig.delete(lastSig.keys().next().value);
-        const s = slots.get(tabId);
+    function claimTabEpoch(tabId) {
+        const epoch = ++tabEpochSeq;
+
+        tabEpoch.set(
+            tabId,
+            epoch
+        );
+
+        return epoch;
+    }
+
+    function commitTabSig(
+        tabId,
+        epoch,
+        sig
+    ) {
+        // A later delivery/pull superseded this async operation.
+        if (
+            tabEpoch.get(tabId) !== epoch
+        ) {
+            return false;
+        }
+
+        if (sig === undefined) {
+            lastSig.delete(tabId);
+            tabEpoch.delete(tabId);
+            return true;
+        }
+
+        lastSig.set(
+            tabId,
+            sig
+        );
+
+        if (
+            lastSig.size >
+            LIM.TRACKED_TABS
+        ) {
+            const oldest =
+                lastSig.keys().next().value;
+
+            lastSig.delete(oldest);
+            tabEpoch.delete(oldest);
+        }
+
+        return true;
+    }
+
+    function noteTabSig(
+        tabId,
+        sig
+    ) {
+        commitTabSig(
+            tabId,
+            claimTabEpoch(tabId),
+            sig
+        );
+    }
+
+    function queueTab(
+        tabId,
+        msg,
+        sig
+    ) {
+        const epoch =
+            claimTabEpoch(tabId);
+
+        const s =
+            slots.get(tabId);
+
         if (s) {
-            // Latest wins inside the slot. A palette-only frame must never displace a queued full frame
-            // for the same rules revision, or the tab would never receive the stylesheet.
-            const a = s.msg.data, b = msg.data;
-            if (a && b && !b.rules.css && a.rules.css && a.rules.hash === b.rules.hash) b.rules = a.rules;
+            /*
+             * Latest wins inside the slot.
+             *
+             * But a palette-only payload must not displace the queued full
+             * stylesheet when both refer to the same rule revision.
+             */
+            const a = s.msg.data;
+            const b = msg.data;
+
+            if (
+                a &&
+                b &&
+                !b.rules.css &&
+                a.rules.css &&
+                a.rules.hash === b.rules.hash
+            ) {
+                b.rules = a.rules;
+            }
+
             s.msg = msg;
+            s.sig = sig;
+            s.epoch = epoch;
+
             return;
         }
-        const e = { msg, timer: 0 };
-        e.timer = setTimeout(() => {
-            slots.delete(tabId);
-            stats.tabSends++;
-            if (e.msg.data && !e.msg.data.rules.css) stats.paletteOnly++;
-            browser.tabs.sendMessage(tabId, e.msg).catch(swallow);
-        }, T.TAB_SLOT_MS);
-        slots.set(tabId, e);
+
+        const e = {
+            msg,
+            sig,
+            epoch,
+            timer: 0
+        };
+
+        e.timer = setTimeout(
+            async () => {
+                slots.delete(tabId);
+
+                stats.tabSends++;
+
+                if (
+                    e.msg.data &&
+                    !e.msg.data.rules.css
+                ) {
+                    stats.paletteOnly++;
+                }
+
+                try {
+                    await browser.tabs.sendMessage(
+                        tabId,
+                        e.msg
+                    );
+
+                    commitTabSig(
+                        tabId,
+                        e.epoch,
+                        e.sig
+                    );
+                } catch (error) {
+                    /*
+                     * Only invalidate if this is still the newest delivery
+                     * attempt for the tab. An older Promise must never erase
+                     * state established by a later navigation/pull/send.
+                     */
+                    commitTabSig(
+                        tabId,
+                        e.epoch,
+                        undefined
+                    );
+
+                    swallow(error);
+                }
+            },
+            T.TAB_SLOT_MS
+        );
+
+        slots.set(
+            tabId,
+            e
+        );
     }
 
     function pushTab(tabId, url, force) {
@@ -888,52 +1369,221 @@
     }
 
     function dropTab(tabId) {
-        const s = slots.get(tabId);
-        if (s) { clearTimeout(s.timer); slots.delete(tabId); }
+        const s =
+            slots.get(tabId);
+
+        if (s) {
+            clearTimeout(s.timer);
+            slots.delete(tabId);
+        }
+
         lastSig.delete(tabId);
+        tabEpoch.delete(tabId);
     }
 
     /* ── 12. Persistence: session per revision, disk after settle ────────── */
     function armSettle() { clearT('settle'); S.tm.settle = setTimeout(onSettle, T.SETTLE_MS); }
 
     async function onSettle() {
-        S.tm.settle = 0; stats.settles++;
-        if (S.wantTrickle && S.enabled && S.cfg.webThemeEnabled) trickle();
+        S.tm.settle = 0;
+        stats.settles++;
+
+        if (
+            S.wantTrickle &&
+            S.enabled &&
+            S.cfg.webThemeEnabled
+        ) {
+            trickle();
+        }
+
         await flushPaint();
-        persistSeed();
-        persistMeta();
-        if (DEBUG) log('settled', JSON.stringify({ ...stats, themeCostEwmaMs: Math.round(S.themeCost), rulesCache: rulesCache.size, trackedTabs: lastSig.size }));
+        await persistSeed();
+        await persistMeta();
+
+        if (DEBUG) {
+            log(
+                'settled',
+                JSON.stringify({
+                    ...stats,
+                    themeCostEwmaMs:
+                        Math.round(S.themeCost),
+
+                    rulesCache:
+                        rulesCache.size,
+
+                    trackedTabs:
+                        lastSig.size
+                })
+            );
+        }
     }
 
     /** storage.session: the 4 KB colours record on every change, the rule map only when the host sent one. */
-    function persistWarm(sitesChanged) {
+    function persistWarm(
+        sitesChanged
+    ) {
         const th = S.theme;
-        const w = { colors: { colors: th.colors, disabledSites: th.disabled, webThemeEnabled: S.cfg.webThemeEnabled, forceUnthemedWebsites: S.cfg.forceUnthemedWebsites, status: th.status, timestamp: th.at } };
-        if (sitesChanged) w.sites = { websites: th.websites, websitesRev: th.hostSitesRev };
-        browser.storage.session.set(w).catch(swallow);
+
+        const w = {
+            colors: {
+                colors: th.colors,
+                colorsRev: th.colorsRev,
+
+                disabledSites:
+                    th.disabled,
+
+                webThemeEnabled:
+                    S.cfg.webThemeEnabled,
+
+                forceUnthemedWebsites:
+                    S.cfg.forceUnthemedWebsites,
+
+                status:
+                    th.status,
+
+                timestamp:
+                    th.at
+            }
+        };
+
+        if (sitesChanged) {
+            w.sites = {
+                websites:
+                    th.websites,
+
+                websitesRev:
+                    th.websitesRev
+            };
+        }
+
+        browser.storage.session
+            .set(w)
+            .catch(swallow);
     }
 
     /** storage.local cold-start seed: seed (4 KB) per settle when changed, seedSites only when the rule map changed. */
-    function persistSeed() {
+    async function persistSeed() {
         const th = S.theme;
-        if (!th) return;
+
+        if (!th) {
+            return;
+        }
+
         const put = {};
-        const h = hash32([th.colorsRev, th.disabledRev, S.cfg.webThemeEnabled, S.cfg.forceUnthemedWebsites].join('|'));
+
+        let nextSeedHash =
+            seedHash;
+
+        let nextSitesRev =
+            seedSitesRev;
+
+        const h = hash32([
+            th.colorsRev,
+            th.disabledRev,
+            S.cfg.webThemeEnabled,
+            S.cfg.forceUnthemedWebsites
+        ].join('|'));
+
         if (h !== seedHash) {
-            seedHash = h;
-            put.seed = { colors: th.colors, disabledSites: th.disabled, webThemeEnabled: S.cfg.webThemeEnabled, forceUnthemedWebsites: S.cfg.forceUnthemedWebsites, status: th.status, timestamp: th.at };
+            nextSeedHash = h;
+
+            put.seed = {
+                colors:
+                    th.colors,
+
+                colorsRev:
+                    th.colorsRev,
+
+                disabledSites:
+                    th.disabled,
+
+                webThemeEnabled:
+                    S.cfg.webThemeEnabled,
+
+                forceUnthemedWebsites:
+                    S.cfg.forceUnthemedWebsites,
+
+                status:
+                    th.status,
+
+                timestamp:
+                    th.at
+            };
         }
-        if (th.websitesRev !== seedSitesRev) {
-            seedSitesRev = th.websitesRev;
-            put.seedSites = { websites: th.websites, websitesRev: th.hostSitesRev };
+
+        if (
+            th.websitesRev !==
+            seedSitesRev
+        ) {
+            nextSitesRev =
+                th.websitesRev;
+
+            put.seedSites = {
+                websites:
+                    th.websites,
+
+                websitesRev:
+                    th.websitesRev
+            };
         }
-        if (Object.keys(put).length) browser.storage.local.set(put).catch(swallow);
+
+        if (
+            !Object.keys(put).length
+        ) {
+            return;
+        }
+
+        try {
+            await browser.storage.local.set(
+                put
+            );
+
+            /*
+             * Advance the in-memory "persisted" identities only AFTER
+             * storage confirms success. A failed write must be retried
+             * at the next settle.
+             */
+            seedHash =
+                nextSeedHash;
+
+            seedSitesRev =
+                nextSitesRev;
+        } catch (e) {
+            swallow(e);
+        }
     }
 
     function persistMeta() {
         const tabs = [];
-        for (const [id, sig] of lastSig) if (sig !== 'x') tabs.push(id);
-        browser.storage.session.set({ meta: { enabled: S.enabled, themeHash: S.themeHash, scheme: S.scheme, paletteWritten, tabs: tabs.slice(-2048) } }).catch(swallow);
+
+        for (
+            const [id, sig]
+            of lastSig
+        ) {
+            if (sig !== 'x') {
+                tabs.push(id);
+            }
+        }
+
+        return browser.storage.session
+            .set({
+                meta: {
+                    enabled:
+                        S.enabled,
+
+                    themeHash:
+                        S.themeHash,
+
+                    scheme:
+                        S.scheme,
+
+                    paletteWritten,
+
+                    tabs:
+                        tabs.slice(-2048)
+                }
+            })
+            .catch(swallow);
     }
 
     /** First-paint cache: paint:palette (shared) + paint:<host> (rules, hash-deduped). Written at settle only. */
@@ -950,24 +1600,126 @@
     }
 
     async function flushPaint() {
-        if (!S.cfg.fastPaint) return;
-        const paletteStale = !!S.palette && S.palette.hash !== paletteWritten;
-        if (!paintDirty.size && !paletteStale) return;
-        const put = {}, del = [];
-        for (const [host, entry] of paintDirty) {
-            paintIndex = paintIndex.filter((e) => e[0] !== host);
-            if (entry === null) del.push('paint:' + host);
-            else { put['paint:' + host] = entry; paintIndex.push([host, entry.rules.hash]); }
+        if (!S.cfg.fastPaint) {
+            return;
         }
-        paintDirty.clear();
-        for (const e of paintIndex.splice(0, Math.max(0, paintIndex.length - LIM.PAINT_ENTRIES))) del.push('paint:' + e[0]);
-        if (paletteStale) { put['paint:palette'] = S.palette; paletteWritten = S.palette.hash; }
-        put.paintIndex = paintIndex;
+
+        const palette =
+            S.palette;
+
+        const paletteStale =
+            !!palette &&
+            palette.hash !== paletteWritten;
+
+        if (
+            !paintDirty.size &&
+            !paletteStale
+        ) {
+            return;
+        }
+
+        /*
+         * Snapshot the work. Do not mutate the authoritative in-memory
+         * bookkeeping until storage.local confirms success.
+         */
+        const pending =
+            new Map(paintDirty);
+
+        const nextIndex =
+            paintIndex.slice();
+
+        const put = {};
+        const del = [];
+
+        for (
+            const [host, entry]
+            of pending
+        ) {
+            for (
+                let i = nextIndex.length - 1;
+                i >= 0;
+                i--
+            ) {
+                if (
+                    nextIndex[i][0] === host
+                ) {
+                    nextIndex.splice(i, 1);
+                }
+            }
+
+            if (entry === null) {
+                del.push(
+                    'paint:' + host
+                );
+            } else {
+                put[
+                    'paint:' + host
+                ] = entry;
+
+                nextIndex.push([
+                    host,
+                    entry.rules.hash
+                ]);
+            }
+        }
+
+        while (
+            nextIndex.length >
+            LIM.PAINT_ENTRIES
+        ) {
+            del.push(
+                'paint:' +
+                nextIndex.shift()[0]
+            );
+        }
+
+        if (paletteStale) {
+            put['paint:palette'] =
+                palette;
+        }
+
+        put.paintIndex =
+            nextIndex;
+
         try {
-            if (del.length) await browser.storage.local.remove(del);
-            await browser.storage.local.set(put);
+            if (del.length) {
+                await browser.storage.local.remove(
+                    del
+                );
+            }
+
+            await browser.storage.local.set(
+                put
+            );
+
+            /*
+             * Delete only snapshot entries that weren't replaced while
+             * the asynchronous storage operation was underway.
+             */
+            for (
+                const [host, entry]
+                of pending
+            ) {
+                if (
+                    paintDirty.get(host) ===
+                    entry
+                ) {
+                    paintDirty.delete(host);
+                }
+            }
+
+            paintIndex =
+                nextIndex;
+
+            if (paletteStale) {
+                paletteWritten =
+                    palette.hash;
+            }
+
             stats.paintWrites++;
-        } catch (e) { swallow(e); }
+        } catch (e) {
+            swallow(e);
+        }
     }
 
     async function clearPaint() {
@@ -985,7 +1737,7 @@
             case 'GET_STATUS': return ready().then(status);
             case 'FORCE_REFRESH':
                 return ready().then(() => {
-                    rulesCache.clear(); domainCache.clear(); lastSig.clear();
+                    rulesCache.clear(); domainCache.clear(); lastSig.clear(); tabEpoch.clear();
                     S.themeHash = null; queueTheme(); broadcastActive(true); armSettle();
                     return { ok: true };
                 });
@@ -1002,8 +1754,25 @@
         const host = hostOf(url);
         const res = resolve(host);
         const top = !!sender.tab && sender.frameId === 0;
-        if (!res) { if (top) lastSig.set(sender.tab.id, 'x'); return { data: null }; }
-        if (top) lastSig.set(sender.tab.id, res.sig);
+        if (!res) {
+            if (top) {
+                noteTabSig(
+                    sender.tab.id,
+                    'x'
+                );
+            }
+
+            return {
+                data: null
+            };
+        }
+
+        if (top) {
+            noteTabSig(
+                sender.tab.id,
+                res.sig
+            );
+        }
         if (!res.rules.provisional) { markPaint(host, res.rules); if (!S.tm.settle) armSettle(); }
         if (req.have && req.have.p === res.palette.hash && req.have.r === res.rules.hash) return { same: true };
         return { data: payloadOf(res, true) };
@@ -1013,7 +1782,11 @@
         return {
             connected: !!S.port && S.ready, enabled: S.enabled, lastError: S.lastError,
             nextAttemptIn: S.port ? 0 : Math.max(0, S.nextAt - now()),
-            colorsRev: S.theme?.colorsRev ?? null, websitesRev: S.theme?.websitesRev ?? null, hostSitesRev: S.theme?.hostSitesRev ?? null,
+            colorsRev:
+                S.theme?.colorsRev ?? null,
+
+            websitesRev:
+                S.theme?.websitesRev ?? null,
             lastSync: S.theme?.at ?? null, hostStatus: S.theme?.status ?? null,
             themeHash: S.themeHash, themeCostEwmaMs: Math.round(S.themeCost), scheme: S.scheme,
             config: S.cfg, wire: WIRE, stats: { ...stats }
@@ -1023,7 +1796,11 @@
     async function setEnabled(on) {
         if (S.enabled === on) return;
         S.enabled = on;
-        browser.storage.local.set({ enabled: on }).catch(swallow);
+        await browser.storage.local
+            .set({
+                enabled: on
+            })
+            .catch(swallow);
         if (on) {
             S.attempt = 0; connect();
             if (S.cfg.browserThemeEnabled) queueTheme();
@@ -1035,7 +1812,7 @@
             await clearPaint();
             await resetTheme();
         }
-        persistMeta();
+        await persistMeta();
         browser.action.setTitle({ title: on ? APP : `${APP} (paused)` }).catch(swallow);
     }
 
@@ -1114,7 +1891,13 @@
 
     on(browser.runtime, 'onStartup', () => { ready(); });
     on(browser.runtime, 'onInstalled', () => { ready(); });
-    on(browser.runtime, 'onSuspend', () => { persistMeta(); flushPaint(); teardown(S.port); });
+    on(
+        browser.runtime,
+        'onSuspend',
+        () => {
+            teardown(S.port);
+        }
+    );
 
     ready();
 })();

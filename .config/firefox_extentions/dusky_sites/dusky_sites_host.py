@@ -1,6 +1,6 @@
 #!/usr/bin/env -S python3 -u
 """
-Dusky Sites — native-messaging host v6.1
+Dusky Sites — native-messaging host v6.2
 Python 3.14+ · Linux only (inotify via libc) · single thread · wire v3 (delta)
 
 Hot path per matugen tick: one stat, one 3.6 KB regex parse, one BLAKE2b, one ~4 KB frame.
@@ -46,8 +46,8 @@ WIRE = 3
 MAX_MSG = 1 << 20                 # Gecko app→extension cap
 MAX_INBOUND = 64 << 20            # sanity cap (the spec allows 4 GiB)
 CHUNK_CHARS = 200_000             # ≤ ~800 KiB UTF-8 per CHUNK frame in the worst case
-QUIET_S = 0.025                   # fire 25 ms after the last relevant inotify event …
-MAX_WAIT_S = 0.120                # … but never later than 120 ms after the first one
+QUIET_S = 0.120                   # collapse write bursts: fire 120 ms after the latest relevant event …
+MAX_WAIT_S = 0.300                # … with an immovable 300 ms deadline from the first event
 SETTLE_S = 1.5                    # QUERY_LIVE_THEME after a settled change
 KEEPALIVE_S = 20.0                # PING cadence (event-page idle timeout is 30 s)
 POLL_S = 60.0                     # stat-poll safety net (inotify cannot see every filesystem)
@@ -71,7 +71,7 @@ def err(*parts: object) -> None:
 
 
 def digest(text: str) -> str:
-    return hashlib.blake2b(text.encode("utf-8"), digest_size=6).hexdigest()
+    return hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest()
 
 
 def canon(obj: object) -> str:

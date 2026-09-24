@@ -1,12 +1,12 @@
 /* =============================================================================
- * Dusky Sites — Content Runtime v6.1
+ * Dusky Sites — Content Runtime v6.2
  * Firefox 156+ · document_start · every frame (all_frames + about:blank)
  *
  * PER-REVISION COST MODEL — the only thing that matters under a matugen burst
  *   palette  ~100 × root.style.setProperty('--x', v, 'important'), diffed against the previous
- *            map. Gecko restyles the root through the style-attribute path and re-cascades the
- *            subtree because inherited custom properties changed — no author cascade-data
- *            rebuild, no selector re-matching: the cheapest whole-document colour change.
+ *            map. Descendants consuming inherited custom properties can still require cascade/style
+ *            recomputation, but palette changes do NOT rebuild or reparse the much larger Dusky
+ *            site-rule stylesheet.
  *   rules    untouched. The constructed sheet (style-element fallback) is replaced only when
  *            ITS hash changes: site file edited, host switched, domain fix arrived.
  *   pacing   one flush per animation frame, further spaced by 3 × the measured frame cost;
@@ -53,18 +53,62 @@
         palVars = vars; palKeys = keys;
         rootObs?.takeRecords();                    // our own writes are not a fight
     }
-    function varsIntact() {
-        const st = document.documentElement?.style;
-        if (!st || !palKeys.length) return true;
-        const k = palKeys[0];
-        return st.getPropertyValue(k) !== '' && st.getPropertyPriority(k) === 'important';
+    function varIntact(
+        st,
+        k
+    ) {
+        return (
+            st.getPropertyPriority(k) ===
+                'important' &&
+
+            st.getPropertyValue(k).trim() ===
+                String(palVars[k]).trim()
+        );
     }
-    function reassertVars() {
-        const st = document.documentElement?.style;
-        if (!st || !palVars) return;
-        for (const k of palKeys) {
-            if (st.getPropertyValue(k) === '' || st.getPropertyPriority(k) !== 'important') st.setProperty(k, palVars[k], 'important');
+
+    function varsIntact() {
+        const st =
+            document.documentElement?.style;
+
+        if (
+            !st ||
+            !palVars
+        ) {
+            return true;
         }
+
+        return palKeys.every(
+            (k) =>
+                varIntact(st, k)
+        );
+    }
+
+    function reassertVars() {
+        const st =
+            document.documentElement?.style;
+
+        if (
+            !st ||
+            !palVars
+        ) {
+            return;
+        }
+
+        for (
+            const k
+            of palKeys
+        ) {
+            if (
+                !varIntact(st, k)
+            ) {
+                st.setProperty(
+                    k,
+                    palVars[k],
+                    'important'
+                );
+            }
+        }
+
         rootObs?.takeRecords();
     }
     function unsetVars() {
