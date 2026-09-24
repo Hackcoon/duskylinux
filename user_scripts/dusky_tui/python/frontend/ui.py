@@ -2368,7 +2368,10 @@ Tooltip {
             def on_reply(reply: str) -> None:
                 if reply == "save":
                     self._quit_after_save = True
-                    self.action_save_batch()
+                    # Textual invokes the result callback before popping the
+                    # modal. Save on the next message-pump turn, once the
+                    # dialog is gone and modal guards allow the write.
+                    self.call_later(self.action_save_batch)
 
                 elif reply == "discard":
                     try:
@@ -5497,7 +5500,13 @@ Tooltip {
             if auth_res.returncode == 0:
                 self.notify_status("Sudo authenticated. Retrying batch...", level="info")
                 self._start_sudo_keepalive()
-                self.action_save_batch(on_complete=on_complete)
+                # PasswordScreen also calls back before it is popped.
+                # Keep quit waiting until the deferred retry owns a save task.
+                self._save_auth_pending += 1
+                def retry_after_dialog() -> None:
+                    self._save_auth_pending -= 1
+                    self.action_save_batch(on_complete=on_complete)
+                self.call_later(retry_after_dialog)
             else:
                 self.notify_status("Incorrect sudo password. Batch aborted.", level="error")
                 self._save_failure_pending = True

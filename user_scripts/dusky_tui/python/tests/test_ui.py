@@ -8,6 +8,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from python.frontend import ui
@@ -227,6 +228,59 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('[+]', app._build_option(setting).plain)
             await app._save_batch_async()
             self.assertNotIn('[+]', app._build_option(setting).plain)
+
+    async def test_quit_dialog_save_applies_change_and_exits(self):
+        for mode in ('batch', 'auto'):
+            with self.subTest(mode=mode):
+                app = app_for(mode=mode)
+                engine = app.engine_pool[app.default_engine_key]
+                async with app.run_test() as pilot:
+                    await self.boot(app, pilot)
+                    # An AUTO session can also have a queued batch change.
+                    app._apply_value(0, 0, app.schema[0][0], 2, batch_mode=True)
+                    with patch.object(app, 'exit') as exit_app:
+                        app.action_quit()
+                        await pilot.pause()
+                        self.assertIsInstance(app.screen, ui.UnsavedChangesDialog)
+                        await pilot.click('#btn-save')
+                        for _ in range(50):
+                            await pilot.pause(0.01)
+                            if exit_app.called:
+                                break
+                        self.assertTrue(exit_app.called)
+                    self.assertEqual(engine.state['x'], '2')
+                    self.assertFalse(app.pending_commits)
+
+    async def test_quit_save_retries_after_password_dialog(self):
+        class AuthEngine(Engine):
+            def write_batch(self, changes):
+                if not self.batches:
+                    self.batches.append(changes)
+                    return False, 'AUTH_REQUIRED', ''
+                return super().write_batch(changes)
+
+        engine = AuthEngine()
+        app = app_for(engine=engine)
+        async with app.run_test() as pilot:
+            await self.boot(app, pilot)
+            app._apply_value(0, 0, app.schema[0][0], 2, batch_mode=True)
+            with patch.object(app, 'exit') as exit_app, patch.object(ui.subprocess, 'run', return_value=SimpleNamespace(returncode=0)):
+                app.action_quit()
+                await pilot.pause()
+                await pilot.click('#btn-save')
+                for _ in range(50):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, ui.PasswordScreen):
+                        break
+                self.assertIsInstance(app.screen, ui.PasswordScreen)
+                app.screen.dismiss('password')
+                for _ in range(50):
+                    await pilot.pause(0.01)
+                    if exit_app.called:
+                        break
+                self.assertTrue(exit_app.called)
+            self.assertEqual(engine.state['x'], '2')
+            self.assertFalse(app.pending_commits)
 
     async def test_failed_coalesced_autosave_keeps_unsaved_value_pending(self):
         engine = Engine()
