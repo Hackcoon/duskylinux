@@ -34,19 +34,19 @@ SCHEMA = {i: [] for i in range(len(TABS))}
 # --- DETAILED EXTENDED HELP DICTIONARIES ---
 CORE_USER_DEFS = {
     "app-dev.lizardbyte.app.Sunshine.service": (
-        "Sunshine (Moonlight Streaming)",
+        "Sunshine Streaming",
         "Self-hosted game stream host for Moonlight. Streams your desktop and games to Moonlight clients. Runs as a user service and is enabled to start automatically with your graphical session (graphical-session.target). Use systemctl --user disable to stop it launching at login, or disable/enable right here.",
     ),
     "hyprsunset.service": (
-        "Night Light (Blue Light Filter)",
+        "Night Light",
         "Manages hyprsunset, a Wayland-native blue light filter. Turning this on will adjust the color temperature of your display to reduce eye strain at night.",
     ),
     "dusky_battery.service": (
-        "Battery Level Notifications",
+        "Battery Alerts",
         "Background daemon that monitors your battery level and sends desktop notifications using libnotify when power is running low.",
     ),
     "network_meter.service": (
-        "Waybar Network Traffic Monitor",
+        "Network Traffic Meter",
         "Service to track network traffic. Often used in conjunction with Waybar to display real-time upload and download speeds.",
     ),
     "dusky.service": (
@@ -66,7 +66,7 @@ CORE_USER_DEFS = {
         "Hyprland's idle management daemon. Handles screen dimming, locking, and DPMS sleep states when you are away from the computer.",
     ),
     "osd_lock.service": (
-        "OSD for CapsLock,NumLock,ScrollLock",
+        "Lock Key OSD",
         "On-Screen Display service for hardware lock keys. Shows a visual pop-up when Caps Lock, Num Lock, or Scroll Lock is toggled.",
     ),
     "dusky_polkit.service": (
@@ -78,7 +78,7 @@ CORE_USER_DEFS = {
         "Unified Wayland clipboard history and persistence daemon (cliphist + wl-clip-persist). Seamlessly records copied text and images to SQLite history, preserves clipboard selections even after source apps close, and supports live RAM/disk persistence switching without reboot.",
     ),
     "dusky_ram_monitor.service": (
-        "Dusky RAM Monitor Daemon",
+        "Dusky RAM Monitor",
         "Background monitor that alerts you if physical RAM usage exceeds 95% or ZRAM swap occupancy exceeds 90%. Clicking the alert opens an interactive Rofi menu to select and terminate memory-heavy processes before a system crash.",
     ),
     "dusky_visualizer.service": (
@@ -86,12 +86,12 @@ CORE_USER_DEFS = {
         "Background daemon for the audio visualizer. Renders visualizer shapes dynamically in the background.",
     ),
     "dusky_screentime.service": (
-        "Dusky Screentime Tracking Daemon",
+        "Screentime Tracker",
         "Wayland screentime tracking daemon. Connects to Hyprland UNIX socket to monitor active window durations and persist daily usage metrics.",
     ),
 
     "dusky_notif_time.service": (
-        "Notification Timestamp Daemon",
+        "Notification Timestamps",
         "Background daemon that tracks exact arrival timestamps for Mako desktop notifications and caches them for QuickPanel and Rofi displays.",
     ),
     "modprobed-db.service": (
@@ -107,7 +107,7 @@ CORE_USER_DEFS = {
         "Local LLM inference daemon (Ollama / llama.cpp wrapper). Handles prompt completion and embeddings for Dusky AI features.",
     ),
     "dusky_stt.service": (
-        "STT Service (Parakeet GPU)",
+        "STT (Parakeet GPU)",
         "Speech-to-text daemon (NVIDIA Parakeet 0.6B, on-demand CUDA worker). ON = warm-resident: model preloaded, instant dictation, VRAM held (plugged-in mode). OFF = on-demand: hotkey still works, VRAM held only mid-job, then worker exits and the service stops itself so the dGPU can sleep (battery mode).",
     ),
     "dusky_firefox_cache.service": (
@@ -138,7 +138,7 @@ CORE_SYSTEM_DEFS = {
         "Applies an 80% hardware battery charge limit at boot.",
     ),
     "dusky_cpu.service": (
-        "Dusky CPU Cores & Power Restorer",
+        "CPU Power Restorer",
         "Restores your custom CPU core states and package power limit adjustments dynamically on system boot.",
     ),
     "dusky-kbd-backlight.service": (
@@ -146,15 +146,15 @@ CORE_SYSTEM_DEFS = {
         "Restores the configured keyboard backlight hardware state at boot.",
     ),
     "ghelper-gpu-boot.service": (
-        "G-Helper GPU Mode at Boot",
+        "G-Helper GPU at Boot",
         "Applies the configured G-Helper GPU mode during system startup.",
     ),
     "glance_cpu_pkg_watt.service": (
-        "CPU Package Power Read Access",
+        "CPU Package Power Access",
         "Allows Dusky Glance to read CPU package energy counters.",
     ),
     "numlock_disable.service": (
-        "Disable NumLock on TTY Boot",
+        "NumLock on TTY Boot",
         "Disables NumLock on virtual consoles (TTYs 1 to 6) during boot. Useful for keyboards that default to NumLock ON, preventing lock-out at the login screen.",
     ),
     "swayosd-libinput-backend.service": (
@@ -175,19 +175,19 @@ CORE_SYSTEM_DEFS = {
     ),
     "tailscaled.service": ("Tailscaled", "Allows remote access"),
     "dusky_snapshot.timer": (
-        "8 PM Root + Home Snapshots",
+        "Root + Home Snapshots",
         "Creates paired root and home snapshots daily at 8 PM and keeps up to six scheduled pairs.",
     ),
     "dusky-zram-recompress.timer": (
-        "Hourly ZRAM Recompression",
+        "ZRAM Recompression",
         "Recompresses idle ZRAM pages every hour while the timer is enabled.",
     ),
     "dusky_boot_zram_flush.timer": (
-        "Dusky Boot ZRAM Flush Timer",
+        "ZRAM Boot Flush Timer",
         "One-shot boot memory flush timer. Triggers 60s after boot to flush cold startup memory into ZRAM swap, minimizing idle memory footprint.",
     ),
     "dusky_pro_active_zram_swap.timer": (
-        "Proactive ZRAM Swap Timer",
+        "Proactive ZRAM Swap",
         "Proactive MGLRU slice skimmer timer. Checks memory every 6 minutes and reclaims cold anonymous pages into ZRAM when RAM usage reaches 70%.",
     ),
     "ufw.service": (
@@ -195,7 +195,7 @@ CORE_SYSTEM_DEFS = {
         "Uncomplicated Firewall. A user-friendly front-end for iptables to manage network access rules.",
     ),
     "linux-modules-cleanup.service": (
-        "Old Kernel Modules Cleanup",
+        "Old Kernel Cleanup",
         "Oneshot boot service provided by kernel-modules-hook. Automatically cleans up orphaned kernel module directories in /usr/lib/modules after a kernel update.",
     ),
     "snapper-cleanup.timer": (
@@ -207,11 +207,11 @@ CORE_SYSTEM_DEFS = {
         "Discards unused filesystem blocks once a week on supported storage.",
     ),
     "dusky_keylogger.service": (
-        "Dusky Keystroke Statistics Daemon",
+        "Dusky Keystroke Stats",
         "Always-on keystroke statistics daemon. Captures raw key presses via evdev (no Wayland/X11), classifies them (Shift/Caps/NumLock, shortcut chords), and stores them with kernel timestamps in SQLite at ~/.local/share/dusky-keylogger/keys.db (mode 0600). Powers the `dusky stats` / `dusky dashboard` analytics. Stop/disable it here to pause logging.",
     ),
     "dusky_powertop_autotune.timer": (
-        "Powertop Auto-Tune (Battery Saver)",
+        "Powertop Auto-Tune",
         "One-shot boot timer that runs `powertop --auto-tune` 2 minutes after boot to flip all power tunables to their Good setting. Enable this timer to auto-tune on every boot; the companion dusky_powertop_autotune.service runs only when triggered. Disabled by default because it can conflict with TLP.",
     ),
 }
@@ -252,7 +252,7 @@ def _fetch_core_installed(scope: str, units: list[str]) -> set:
         return set()
 
 
-# Fast path: only query the specific hardcoded units (2 subprocess calls, ~22 units)
+# Fast path: query only the curated units in two subprocess calls.
 _core_user_units = list(CORE_USER_DEFS.keys())
 _core_sys_units = list(CORE_SYSTEM_DEFS.keys())
 
@@ -263,33 +263,92 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _fast_exec:
     _core_installed_user = _f_core_user.result()
     _core_installed_sys = _f_core_sys.result()
 
-# --- TAB 0: CORE USER (instant) ---
-for unit, (label, help_text) in CORE_USER_DEFS.items():
-    if unit in _core_installed_user:
-        SCHEMA[0].append(
-            ConfigItem(
-                label=label,
-                key=unit,
-                scope="user",
-                type_="bool",
-                default=False,
-                extended_help=f"**Unit:** `{unit}`\n**Scope:** User\n\n{help_text}",
-            )
-        )
+# The frontend's native menu rows are value-less folders. They never reach the
+# systemd engine, and their children keep their real unit keys and scopes.
+CORE_USER_SECTIONS = (
+    ("Desktop & Session", (
+        "hyprsunset.service", "hypridle.service", "osd_lock.service",
+        "dusky_polkit.service", "dusky_clipboard.service", "dusky-oom-shield.service",
+    )),
+    ("Panels & Integration", (
+        "dusky.service", "dusky_quickpanal.service", "network_meter.service",
+        "dusky_notif_time.service", "dusky_visualizer.service", "dusky_screentime.service",
+    )),
+    ("Media & AI", (
+        "app-dev.lizardbyte.app.Sunshine.service", "dusky_llm.service", "dusky_stt.service",
+    )),
+    ("Power & Monitoring", (
+        "dusky_battery.service", "dusky_ram_monitor.service",
+    )),
+    ("Storage & Maintenance", (
+        "dusky_firefox_cache.service", "dusky_firefox_cache_resync.timer",
+        "update_checker.timer",
+    )),
+    ("Kernel Compilation", (
+        "modprobed-db.service", "modprobed-db.timer",
+    )),
+)
 
-# --- TAB 1: CORE SYSTEM (instant) ---
-for unit, (label, help_text) in CORE_SYSTEM_DEFS.items():
-    if unit in _core_installed_sys:
-        SCHEMA[1].append(
+CORE_SYSTEM_SECTIONS = (
+    ("Power & Hardware", (
+        "tlp.service", "battery-charge-limit.service", "dusky_cpu.service",
+        "dusky-kbd-backlight.service", "ghelper-gpu-boot.service",
+        "glance_cpu_pkg_watt.service", "dusky-zram-recompress.timer",
+        "dusky_boot_zram_flush.timer", "dusky_pro_active_zram_swap.timer",
+        "dusky_powertop_autotune.timer",
+    )),
+    ("Input & Session", (
+        "numlock_disable.service", "swayosd-libinput-backend.service",
+        "dusky_keylogger.service",
+    )),
+    ("Network & Security", (
+        "vsftpd.service", "sshd.service", "warp-svc.service",
+        "firewalld.service", "tailscaled.service", "ufw.service",
+    )),
+    ("Storage & Maintenance", (
+        "dusky_snapshot.timer", "linux-modules-cleanup.service",
+        "snapper-cleanup.timer", "fstrim.timer",
+    )),
+)
+
+
+def _append_core_sections(tab_idx, definitions, installed, scope, sections):
+    assigned = set()
+    for section_idx, (title, units) in enumerate((*sections, ("Other", tuple(definitions)))):
+        members = [unit for unit in units if unit in definitions and unit in installed and unit not in assigned]
+        if not members:
+            continue
+        folder_key = f"__core_{scope}_{section_idx}"
+        SCHEMA[tab_idx].append(
             ConfigItem(
-                label=label,
-                key=unit,
-                scope="system",
-                type_="bool",
-                default=False,
-                extended_help=f"**Unit:** `{unit}`\n**Scope:** System\n\n{help_text}",
+                label=f"{title} ({len(members)})",
+                key=folder_key,
+                type_="menu",
+                default=None,
+                is_parent=True,
+                expanded=True,
+                extended_help=f"{title}: {len(members)} installed units. Press Enter to expand or collapse.",
             )
         )
+        for unit in members:
+            label, help_text = definitions[unit]
+            SCHEMA[tab_idx].append(
+                ConfigItem(
+                    label=label,
+                    key=unit,
+                    scope=scope,
+                    type_="bool",
+                    default=False,
+                    parent_ref=folder_key,
+                    extended_help=f"**Unit:** `{unit}`\n**Scope:** {scope.title()}\n\n{help_text}",
+                )
+            )
+        assigned.update(members)
+
+
+# --- TABS 0-1: CURATED CORE UNITS (instant) ---
+_append_core_sections(0, CORE_USER_DEFS, _core_installed_user, "user", CORE_USER_SECTIONS)
+_append_core_sections(1, CORE_SYSTEM_DEFS, _core_installed_sys, "system", CORE_SYSTEM_SECTIONS)
 
 # --- TAB 7: PRESETS ---
 # Empty – populated at runtime by User Presets via ENABLE_USER_PRESETS /

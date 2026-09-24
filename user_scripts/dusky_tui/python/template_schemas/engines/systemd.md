@@ -30,9 +30,17 @@ File-less engine. It executes `systemctl` directly: `systemctl enable --now <uni
 
 ## Example items
 
+For a long curated tab, use a `type_="menu"` item as a folder and set
+each unit's `parent_ref` to its key. Menu rows are UI-only: they are omitted
+from systemd state reads and writes. Keep each folder followed by its children;
+the unit items retain their real `scope` and `key`. Set `expanded=True` to
+show the folder's units when the TUI opens.
+
 ```python
+ConfigItem(label="Desktop & Session", key="__desktop_session", type_="menu",
+           default=None, is_parent=True, expanded=True),
 ConfigItem(label="Night Light", key="hyprsunset.service", scope="user",
-           type_="bool", default=False,
+           type_="bool", default=False, parent_ref="__desktop_session",
            extended_help="**Unit:** `hyprsunset.service`\n**Scope:** User\n\nBlue light filter."),
 ConfigItem(label="SSH Server", key="sshd.service", scope="system",
            type_="bool", default=False,
