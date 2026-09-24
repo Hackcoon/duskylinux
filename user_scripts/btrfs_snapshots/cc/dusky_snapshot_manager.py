@@ -3437,10 +3437,37 @@ def decode_meta(blob: str) -> JSONDict:
     return {}
 
 
-def panel(title: str, rows: Sequence[str], width: int = 52) -> None:
+def _fit_panel_text(value: str, limit: int) -> str:
+    """Clip coloured preview text by terminal cells without splitting an SGR code."""
+    if display_width(value) <= limit:
+        return value
+    if limit <= 0:
+        return ""
+    used = 0
+    parts: list[str] = []
+    for token in re.findall(r"\x1b\[[0-9;]*[A-Za-z]|[^\x1b]", value):
+        if token.startswith("\x1b["):
+            parts.append(token)
+            continue
+        cells = display_width(token)
+        if used + cells > limit - 1:
+            break
+        parts.append(token)
+        used += cells
+    return "".join(parts) + C_RESET + "…"
+
+
+def panel(title: str, rows: Sequence[str]) -> None:
+    width = max(6, display_width(title) + 5,
+                *(display_width(row) + 4 for row in rows))
+    preview_columns = os.environ.get("FZF_PREVIEW_COLUMNS", "")
+    if preview_columns.isdecimal() and int(preview_columns) >= 6:
+        width = min(width, int(preview_columns))
+    title = _fit_panel_text(title, width - 5)
     dash = "\u2500"
     say(f"{C_WARN}\u256d{dash} {title} {C_WARN}{dash * max(0, width - display_width(title) - 5)}\u256e{C_RESET}")
     for row in rows:
+        row = _fit_panel_text(row, width - 4)
         pad = max(0, width - display_width(row) - 4)
         say(f"{C_WARN}\u2502{C_RESET} {row}{' ' * pad} {C_WARN}\u2502{C_RESET}")
     say(f"{C_WARN}\u2570{dash * (width - 2)}\u256f{C_RESET}\n")
