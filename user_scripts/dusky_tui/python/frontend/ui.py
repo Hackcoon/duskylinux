@@ -634,6 +634,7 @@ class ConfirmDialog(ModalScreen[bool]):
         Binding("tab", "nav_next", "Next Option", priority=True),
         Binding("shift+tab", "nav_prev", "Previous Option", priority=True),
         Binding("enter,space", "select_current", "Confirm", priority=True),
+        Binding("y", "dismiss_true", "Confirm", priority=True, show=False),
     ]
 
     selected_index: reactive[int] = reactive(1)
