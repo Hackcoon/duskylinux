@@ -708,8 +708,8 @@ EXAMPLES:
     if is_headless:
         if DEFERRED_LOAD:
             deferred_result = DEFERRED_LOAD()
-            if isinstance(deferred_result, tuple) and len(deferred_result) == 2:
-                _, discovered_items = deferred_result
+            if isinstance(deferred_result, tuple) and len(deferred_result) >= 2:
+                _, discovered_items = deferred_result[:2]
                 if discovered_items:
                     SCHEMA.update(discovered_items)
             for items in SCHEMA.values():

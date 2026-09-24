@@ -4723,7 +4723,7 @@ def prepare_nvidia_615_for_linux_73(kernelrelease: str) -> None:
     """Adapt NVIDIA 615's old dmem API and runtime PM before pacman's DKMS hook runs."""
     if version_tuple(kernelrelease) < (7, 3):
         return
-    source = Path("/usr/src/nvidia-615.71.09")
+    source = next(Path("/usr/src").glob("nvidia-615*"), Path("/usr/src/nvidia-615.71.09"))
     if not (source / "kernel-open/nvidia/os-interface.c").is_file():
         return
     patch_file = SCRIPT_DIR / "compat/nvidia-615.71.09-linux-7.3.patch"

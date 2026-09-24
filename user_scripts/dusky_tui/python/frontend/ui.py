@@ -2310,6 +2310,9 @@ Tooltip {
         # Lazy tab population state.
         self._tab_populated: set[int] = set()
         self._tab_dirty: set[int] = set()
+        self._tab_warmup_queue: deque[int] = deque()
+        self._tab_warmup_queued: set[int] = set()
+        self._tab_warmup_scheduled = False
 
         # Schema indexes.
         self._items_by_uid: dict[str, list[tuple[int, int, ConfigItem]]] = {}
@@ -3444,15 +3447,30 @@ Tooltip {
     @work(exclusive=True, group="deferred-tabs", exit_on_error=False)
     async def _run_deferred_load(self) -> None:
         try:
+            writes_before = dict(self._write_generation)
             result = await asyncio.to_thread(self.deferred_load)
-            if isinstance(result, tuple) and len(result) == 2:
+            if isinstance(result, tuple) and len(result) == 3:
+                updated_tabs, new_items, default_state = result
+            elif isinstance(result, tuple) and len(result) == 2:
                 updated_tabs, new_items = result
+                default_state = None
             else:
                 updated_tabs, new_items = result, None
-            def load_states():
-                return {key: engine.load_state() for key, engine in self.engine_pool.items()}
+                default_state = None
             async with self._save_lock:
+                # A schema can return the state collected during discovery.
+                # Re-read it if an edit happened while discovery was running.
+                use_prefetched = default_state is not None and self._write_generation == writes_before
+                def load_states():
+                    return {
+                        key: default_state if use_prefetched and key == self.default_engine_key else engine.load_state()
+                        for key, engine in self.engine_pool.items()
+                    }
                 states = await self._run_save_io(load_states)
+                if use_prefetched and self._write_generation != writes_before:
+                    states[self.default_engine_key] = await self._run_save_io(
+                        self.engine_pool[self.default_engine_key].load_state
+                    )
             self._apply_deferred_tabs(updated_tabs, states, new_items)
         except Exception:
             LOGGER.exception("Deferred tab loading failed")
@@ -3478,14 +3496,14 @@ Tooltip {
                 self._failed_engines[ekey] = f"{type(exc).__name__}: {exc}"
                 self.notify_status(f"Failed to load {ekey}: {exc}", level="error")
 
-        for t_idx in self.tabs:
-            if self._engines_for_tab(t_idx).issubset(self._loaded_engines):
-                self._apply_states_to_tab(t_idx, self._states)
+        if initial_tab in self.tabs and self._engines_for_tab(initial_tab).issubset(self._loaded_engines):
+            self._apply_states_to_tab(initial_tab, self._states)
 
         if self.tabs:
             await asyncio.sleep(0)
             self._populate_option_list(initial_tab)
             self._populated_tabs.add(initial_tab)
+            self.call_after_refresh(self._queue_ready_tabs_for_warmup)
 
         if deferred:
             self._pending_engine_loads |= set(deferred)
@@ -3527,6 +3545,53 @@ Tooltip {
                 self._tab_dirty.discard(cur)
 
         self._mark_boot_complete_if_done()
+        self._queue_ready_tabs_for_warmup()
+
+    def _queue_ready_tabs_for_warmup(self) -> None:
+        """Prepare hidden lists after first paint so a later tab switch is cheap."""
+        current = self._current_tab_index()
+        for tab_idx in self.tabs:
+            if tab_idx == current:
+                continue
+            if not self.schema.get(tab_idx):
+                continue
+            if not self._engines_for_tab(tab_idx).issubset(self._loaded_engines):
+                continue
+            if tab_idx in self._populated_tabs and tab_idx not in self._tab_dirty:
+                continue
+            if tab_idx in self._tab_warmup_queued:
+                continue
+            try:
+                self.query_one(f"#list-{tab_idx}", ConfigOptionList)
+            except Exception:
+                continue
+            self._tab_warmup_queue.append(tab_idx)
+            self._tab_warmup_queued.add(tab_idx)
+
+        if self._tab_warmup_queue and not self._tab_warmup_scheduled:
+            self._tab_warmup_scheduled = True
+            self.call_after_refresh(self._warm_next_tab)
+
+    def _warm_next_tab(self) -> None:
+        self._tab_warmup_scheduled = False
+        while self._tab_warmup_queue:
+            tab_idx = self._tab_warmup_queue.popleft()
+            self._tab_warmup_queued.discard(tab_idx)
+            if tab_idx == self._current_tab_index():
+                continue
+            if not self._engines_for_tab(tab_idx).issubset(self._loaded_engines):
+                continue
+            if tab_idx in self._populated_tabs and tab_idx not in self._tab_dirty:
+                continue
+            if tab_idx not in self._tab_data_ready:
+                self._apply_states_to_tab(tab_idx, self._states)
+            self._populate_option_list(tab_idx)
+            self._populated_tabs.add(tab_idx)
+            self._tab_dirty.discard(tab_idx)
+            break
+        if self._tab_warmup_queue:
+            self._tab_warmup_scheduled = True
+            self.call_after_refresh(self._warm_next_tab)
 
     def require_boot_complete(self) -> bool:
         if getattr(self, "_boot_complete", True):
@@ -3791,6 +3856,7 @@ Tooltip {
         if current_idx in tab_indices:
             if ol := self.current_option_list:
                 self._update_pagination(ol)
+        self._queue_ready_tabs_for_warmup()
 
     def _refresh_single_ui(self, tab_idx: int, item_idx: int, item: ConfigItem) -> None:
         if tab_idx not in self._tab_populated:
@@ -3868,6 +3934,7 @@ Tooltip {
                 self._tab_dirty.add(tab_idx)
             else:
                 self._tab_dirty.add(tab_idx)
+        self._queue_ready_tabs_for_warmup()
 
     # =========================================================================
     # SAVE MODE / FOOTER

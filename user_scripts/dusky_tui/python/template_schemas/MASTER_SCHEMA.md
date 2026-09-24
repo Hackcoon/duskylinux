@@ -45,9 +45,14 @@ Optional module attributes:
 | `USER_PRESETS_TAB` | auto-detected | Must exactly match a tab name. Auto-falls back to a tab named `presets`/`theme`/`themes`/`appearance`/`profiles` (case-insensitive). |
 | `GLOBAL_POPUP` | `None` | `{"title": str, "message": str, "level": "info"\|"warning"\|"danger"\|"success", "require_confirm": bool (default False), "cancel_quits": bool (default False), "btn_text": str}` — shown once after first render; if `require_confirm` the Yes/No dialog quits when cancelled and `cancel_quits` is set. |
 | `TAB_NOTICES` | `None` | `{tab_index: {"level": "info"\|"warning"\|"danger"\|"success", "message": str, "position": "top"\|"bottom" (default top)}}` or `{tab_index: [{...}, ...]}` — persistent `NoticeBox` banner(s) rendered above/below the option list for that tab. |
-| `DEFERRED_LOAD` | `None` | Callable `() -> list[int] \| tuple[list[int], dict[int, list[ConfigItem]]]` run in a background thread after first paint. Return the tab indices to populate; optionally return `(indices, new_items)` to replace `SCHEMA[tab]` before state is re-loaded. Used for slow/dynamic tabs (systemd services, network scans). In headless mode the router just calls it for side-effects. |
+| `DEFERRED_LOAD` | `None` | Callable run in a background thread after first paint. Return the tab indices to populate; optionally return `(indices, new_items)` to replace `SCHEMA[tab]`, or `(indices, new_items, default_engine_state)` if discovery already read the default engine state. `new_items` may be `None`. The UI re-reads state if a setting changed during discovery. Used for slow/dynamic tabs (systemd services, network scans). In headless mode the router calls it for side-effects. |
 | `REQUIRE_ROOT` | `False` | Re-executes the whole router via `sudo`/`su` with real-user `HOME`/`XDG_*` reconstruction and `XDG_CONFIG_HOME` chown fix. |
 | `CUSTOM_VIEWS` | `None` | `{tab_index_or_name: view_spec}` — replaces that tab's `ConfigOptionList` with a custom renderable. `view_spec` may be a `Widget` subclass, a `Widget` instance, a callable `(app) -> renderable`, or `{"view": <above>, "interval": float_seconds}` for auto-refresh. `CustomRichTabWidget` handles `refresh_interval` and scroll bindings. See `tui_dusky_network.py` `render_network_dashboard_view`. |
+
+After the first tab paints, the frontend prepares other ready option lists one
+per refresh. Tabs populated by `DEFERRED_LOAD` are prepared after that function
+returns. Their availability still depends on how long the schema's discovery
+work takes.
 
 ---
 

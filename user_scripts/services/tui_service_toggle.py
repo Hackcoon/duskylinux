@@ -360,8 +360,8 @@ _append_core_sections(1, CORE_SYSTEM_DEFS, _core_installed_sys, "system", CORE_S
 # DEFERRED FULL FETCH (Tabs 2-6)
 # The TUI calls DEFERRED_LOAD() after initial render to complete these tabs.
 # =============================================================================
-def _fetch_all_unit_files(scope: str) -> tuple[set, set, set]:
-    """Returns (installed_services, enabled_services, installed_timers) in a single pass."""
+def _fetch_all_unit_files(scope: str) -> tuple[set, set, set, dict[str, str] | None]:
+    """Returns installed services, enabled services, timers, and enablement in one pass."""
     call = [
         "systemctl",
         "list-unit-files",
@@ -375,11 +375,14 @@ def _fetch_all_unit_files(scope: str) -> tuple[set, set, set]:
     installed_srv = set()
     enabled_srv = set()
     installed_tmr = set()
+    unit_states = {}
 
     try:
         res = subprocess.run(
             call, capture_output=True, text=True, stdin=subprocess.DEVNULL
         )
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.strip() or f"systemctl exited with status {res.returncode}")
         for line in res.stdout.splitlines():
             if not line:
                 continue
@@ -390,12 +393,14 @@ def _fetch_all_unit_files(scope: str) -> tuple[set, set, set]:
 
             if unit.endswith(".service"):
                 installed_srv.add(unit)
+                unit_states[unit] = "true" if state in ("enabled", "enabled-runtime") else "false"
                 if state == "enabled":
                     enabled_srv.add(unit)
             elif unit.endswith(".timer"):
                 installed_tmr.add(unit)
+                unit_states[unit] = "true" if state in ("enabled", "enabled-runtime") else "false"
 
-        return installed_srv, enabled_srv, installed_tmr
+        return installed_srv, enabled_srv, installed_tmr, unit_states
     except Exception as e:
         import sys
 
@@ -403,7 +408,7 @@ def _fetch_all_unit_files(scope: str) -> tuple[set, set, set]:
             f"[tui_service_toggle] ERROR: _fetch_all_unit_files({scope}): {e}",
             file=sys.stderr,
         )
-        return set(), set(), set()
+        return set(), set(), set(), None
 
 
 def _fetch_active_services(scope: str) -> set:
@@ -432,11 +437,11 @@ def _fetch_active_services(scope: str) -> set:
         return set()
 
 
-def DEFERRED_LOAD() -> list[int]:
+def DEFERRED_LOAD() -> tuple[list[int], None, dict[str, str] | None]:
     """
     Completes the deferred tab population for tabs 2-6.
     Runs the full scans after the initial UI render, then populates the SCHEMA lists.
-    Returns list of tab indices that were populated.
+    Returns populated tab indices and the unit states collected by those scans.
     Called by the TUI after its initial render of tabs 0-1.
     """
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
@@ -444,8 +449,8 @@ def DEFERRED_LOAD() -> list[int]:
         sys_all = executor.submit(_fetch_all_unit_files, "system")
         user_active = executor.submit(_fetch_active_services, "user")
         sys_active = executor.submit(_fetch_active_services, "system")
-        installed_user_srv, enabled_user, timers_user = user_all.result()
-        installed_sys_srv, enabled_sys, timers_sys = sys_all.result()
+        installed_user_srv, enabled_user, timers_user, user_states = user_all.result()
+        installed_sys_srv, enabled_sys, timers_sys, sys_states = sys_all.result()
         active_user_raw = user_active.result()
         active_sys_raw = sys_active.result()
 
@@ -582,7 +587,11 @@ def DEFERRED_LOAD() -> list[int]:
             )
         )
 
-    return [2, 3, 4, 5, 6]
+    state = None
+    if user_states is not None and sys_states is not None:
+        state = {f"user/{unit}": value for unit, value in user_states.items()}
+        state.update({f"system/{unit}": value for unit, value in sys_states.items()})
+    return [2, 3, 4, 5, 6], None, state
 
 # =============================================================================
 # DIRECT EXECUTION HANDLER
