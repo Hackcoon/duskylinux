@@ -118,6 +118,10 @@ CORE_USER_DEFS = {
         "STT Service (Parakeet GPU)",
         "Speech-to-text daemon (NVIDIA Parakeet 0.6B, on-demand CUDA worker). ON = warm-resident: model preloaded, instant dictation, VRAM held (plugged-in mode). OFF = on-demand: hotkey still works, VRAM held only mid-job, then worker exits and the service stops itself so the dGPU can sleep (battery mode).",
     ),
+    "dusky_firefox_cache.service": (
+        "Firefox Profile RAM Sync",
+        "Synchronizes Firefox profiles into RAM (tmpfs) to eliminate SSD write amplification from cookie and SQLite churn. Automatically restores to disk on shutdown, with periodic background resyncs.",
+    ),
 }
 
 CORE_SYSTEM_DEFS = {

@@ -39,6 +39,8 @@ hint          = "LAP_P"
 fstype        = "ext4"
 mount_options = ["noatime", "lazytime", "delalloc", "commit=20"]
 symlinks      = ["~/.mozilla"]
+post_unlock   = ["systemctl --user restart dusky_firefox_cache.service"]
+pre_lock      = ["systemctl --user stop dusky_firefox_cache.service"]
 
 [drives.media]
 type          = "PROTECTED"

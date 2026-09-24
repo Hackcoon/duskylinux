@@ -135,9 +135,9 @@ PSD_FLAG_FILE: Final = ".flagged"
 PSD_STATE_FILE: Final = ".firefox-sync-state.json"
 CRASH_RECOVERY_PREFIX: Final = "-psd-crashrecovery-"
 
-SYSTEMD_SERVICE_NAME: Final = "firefox-profile-sync.service"
-SYSTEMD_RESYNC_SERVICE_NAME: Final = "firefox-profile-sync-resync.service"
-SYSTEMD_RESYNC_TIMER_NAME: Final = "firefox-profile-sync-resync.timer"
+SYSTEMD_SERVICE_NAME: Final = "dusky_firefox_cache.service"
+SYSTEMD_RESYNC_SERVICE_NAME: Final = "dusky_firefox_cache_resync.service"
+SYSTEMD_RESYNC_TIMER_NAME: Final = "dusky_firefox_cache_resync.timer"
 
 MANAGED_KEYS: Final = frozenset({
     "browser.cache.disk.enable",
