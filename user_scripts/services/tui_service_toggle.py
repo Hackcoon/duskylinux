@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
 import subprocess
-
-import sys
-from pathlib import Path
-
-_dusky_root = Path.home() / "user_scripts" / "dusky_tui"
-if str(_dusky_root) not in sys.path:
-    sys.path.insert(0, str(_dusky_root))
-
 import sys
 from pathlib import Path
 
@@ -122,6 +114,14 @@ CORE_USER_DEFS = {
         "Firefox Profile RAM Sync",
         "Synchronizes Firefox profiles into RAM (tmpfs) to eliminate SSD write amplification from cookie and SQLite churn. Automatically restores to disk on shutdown, with periodic background resyncs.",
     ),
+    "dusky_firefox_cache_resync.timer": (
+        "Firefox RAM Cache Resync",
+        "Runs the Firefox profile RAM sync every hour while the companion service is active.",
+    ),
+    "dusky-oom-shield.service": (
+        "Dusky OOM Shield",
+        "Protects the active Hyprland session and pinned windows from systemd-oomd pressure kills.",
+    ),
 }
 
 CORE_SYSTEM_DEFS = {
@@ -133,9 +133,25 @@ CORE_SYSTEM_DEFS = {
         "TLP Power Management",
         "Advanced power management for Linux. Applies various battery-saving tweaks to the kernel, PCI, and USB devices.",
     ),
+    "battery-charge-limit.service": (
+        "Battery Charge Limit",
+        "Applies an 80% hardware battery charge limit at boot.",
+    ),
     "dusky_cpu.service": (
         "Dusky CPU Cores & Power Restorer",
         "Restores your custom CPU core states and package power limit adjustments dynamically on system boot.",
+    ),
+    "dusky-kbd-backlight.service": (
+        "Keyboard Backlight State",
+        "Restores the configured keyboard backlight hardware state at boot.",
+    ),
+    "ghelper-gpu-boot.service": (
+        "G-Helper GPU Mode at Boot",
+        "Applies the configured G-Helper GPU mode during system startup.",
+    ),
+    "glance_cpu_pkg_watt.service": (
+        "CPU Package Power Read Access",
+        "Allows Dusky Glance to read CPU package energy counters.",
     ),
     "numlock_disable.service": (
         "Disable NumLock on TTY Boot",
@@ -159,12 +175,12 @@ CORE_SYSTEM_DEFS = {
     ),
     "tailscaled.service": ("Tailscaled", "Allows remote access"),
     "dusky_snapshot.timer": (
-        "8 PM Daily Snapshots (Backup)",
-        "Triggers a snapshot automaticaly everyday at 8PM, while automatically cleaning up the oldest snapshot (max 6).",
+        "8 PM Root + Home Snapshots",
+        "Creates paired root and home snapshots daily at 8 PM and keeps up to six scheduled pairs.",
     ),
-    "zram-recompress.timer": (
-        "ZRAM 15M Cold Pages Compressor",
-        "Auto compresses cold pages in both zram0 and zram1 with zstd level 3 every 15 minutes to reclaim memory",
+    "dusky-zram-recompress.timer": (
+        "Hourly ZRAM Recompression",
+        "Recompresses idle ZRAM pages every hour while the timer is enabled.",
     ),
     "dusky_boot_zram_flush.timer": (
         "Dusky Boot ZRAM Flush Timer",
@@ -182,6 +198,14 @@ CORE_SYSTEM_DEFS = {
         "Old Kernel Modules Cleanup",
         "Oneshot boot service provided by kernel-modules-hook. Automatically cleans up orphaned kernel module directories in /usr/lib/modules after a kernel update.",
     ),
+    "snapper-cleanup.timer": (
+        "Snapper Cleanup Timer",
+        "Runs Snapper's snapshot cleanup service every hour.",
+    ),
+    "fstrim.timer": (
+        "Weekly SSD Trim",
+        "Discards unused filesystem blocks once a week on supported storage.",
+    ),
     "dusky_keylogger.service": (
         "Dusky Keystroke Statistics Daemon",
         "Always-on keystroke statistics daemon. Captures raw key presses via evdev (no Wayland/X11), classifies them (Shift/Caps/NumLock, shortcut chords), and stores them with kernel timestamps in SQLite at ~/.local/share/dusky-keylogger/keys.db (mode 0600). Powers the `dusky stats` / `dusky dashboard` analytics. Stop/disable it here to pause logging.",
@@ -197,7 +221,7 @@ import concurrent.futures
 
 # =============================================================================
 # FAST TARGETED CORE FETCH (Tabs 0-1)
-# Only queries the ~22 hardcoded units instead of enumerating ALL installed units.
+# Only queries the curated units instead of enumerating all installed units.
 # =============================================================================
 def _fetch_core_installed(scope: str, units: list[str]) -> set:
     """Checks only specific units for existence via targeted list-unit-files query."""
