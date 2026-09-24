@@ -23,20 +23,14 @@ declare -A CACHE_MNT_OPTS=()
 
 declare -a ACTIVE_TEMP_MOUNTS=()
 declare -a ACTIVE_TEMP_FILES=()
-declare -a ROLLBACK_CMDS=()
-
 SUDO_PID=""
-ROLLBACK_ON_EXIT=false
+SNAPPER_CLEANUP_WAS_ACTIVE=false
+SNAPPER_TIMELINE_WAS_ACTIVE=false
+SNAPPER_TIMELINE_WAS_ENABLED=false
+SETUP_COMPLETE=false
 
 cleanup() {
-    local cmd mnt f i
-
-    if [[ "$ROLLBACK_ON_EXIT" == true ]] && (( ${#ROLLBACK_CMDS[@]} > 0 )); then
-        warn "Executing transactional rollbacks..."
-        for (( i=${#ROLLBACK_CMDS[@]}-1; i>=0; i-- )); do
-            eval "${ROLLBACK_CMDS[i]}" 2>/dev/null || true
-        done
-    fi
+    local mnt f
 
     if (( ${#ACTIVE_TEMP_MOUNTS[@]} > 0 )); then
         for mnt in "${ACTIVE_TEMP_MOUNTS[@]}"; do
@@ -54,24 +48,34 @@ cleanup() {
         done
     fi
 
+    if [[ "$SNAPPER_CLEANUP_WAS_ACTIVE" == true ]] && ! systemctl is-active --quiet snapper-cleanup.timer; then
+        sudo systemctl start snapper-cleanup.timer || warn "Could not restart the Snapper cleanup timer."
+    fi
+
+    if [[ "$SETUP_COMPLETE" != true ]]; then
+        if [[ "$SNAPPER_TIMELINE_WAS_ENABLED" == true ]] && ! systemctl is-enabled --quiet snapper-timeline.timer; then
+            sudo systemctl enable snapper-timeline.timer || warn "Could not restore the Snapper timeline timer enablement."
+        fi
+        if [[ "$SNAPPER_TIMELINE_WAS_ACTIVE" == true ]] && ! systemctl is-active --quiet snapper-timeline.timer; then
+            sudo systemctl start snapper-timeline.timer || warn "Could not restart the Snapper timeline timer."
+        fi
+    fi
+
     kill "${SUDO_PID:-}" 2>/dev/null || true
 }
 
 trap_exit() { cleanup; }
 
 trap_interrupt() {
-    ROLLBACK_ON_EXIT=true
-    cleanup
     printf '\n\033[1;31m[FATAL]\033[0m Script interrupted.\n' >&2
     exit 130
 }
 
-trap 'ROLLBACK_ON_EXIT=true; printf "\n\033[1;31m[FATAL]\033[0m Script failed at line %d. Command: %s\n" "$LINENO" "$BASH_COMMAND" >&2; cleanup' ERR
+trap 'printf "\n\033[1;31m[FATAL]\033[0m Script failed at line %d. Command: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 trap trap_exit EXIT
 trap trap_interrupt INT TERM HUP
 
 fatal() {
-    ROLLBACK_ON_EXIT=true
     printf '\033[1;31m[FATAL]\033[0m %s\n' "$1" >&2
     exit 1
 }
@@ -96,8 +100,7 @@ execute() {
     read -r -p "Execute this step? [Y/n] " response || fatal "Input closed; aborting."
 
     if [[ "${response,,}" =~ ^(n|no)$ ]]; then
-        info "Skipped."
-        return 0
+        fatal "Setup stopped before '${desc}'; later steps depend on this one."
     fi
 
     "$@"
@@ -140,7 +143,6 @@ remove_array_value() {
 }
 
 sudo_path_exists() { sudo test -e "$1"; }
-sudo_path_is_dir() { sudo test -d "$1"; }
 
 atomic_write() {
     local target="$1" src="$2" target_dir tmp_target
@@ -154,7 +156,7 @@ atomic_write() {
     sudo mv "$tmp_target" "$target"
 
     remove_array_value ACTIVE_TEMP_FILES "$tmp_target"
-    sudo sync -f "$target_dir" 2>/dev/null || true
+    sudo sync -f "$target_dir" || fatal "Could not sync filesystem containing $target_dir"
 }
 
 load_mount_info() {
@@ -162,23 +164,13 @@ load_mount_info() {
 
     [[ -v CACHE_MNT_SOURCE["$target"] ]] && return 0
 
-    local findmnt_out source uuid opts fstab_opts
+    local findmnt_out source uuid opts
 
     findmnt_out="$(findmnt -n -e -o SOURCE,UUID,OPTIONS -M "$target" 2>/dev/null || true)"
     [[ -n "$findmnt_out" ]] || fatal "Could not determine mount info for $target"
 
     read -r source uuid opts <<< "$findmnt_out"
     source="${source%%\[*}"
-
-    fstab_opts="$(findmnt -s -n -e -o OPTIONS -M "$target" 2>/dev/null || true)"
-    if [[ -n "$fstab_opts" ]]; then
-        while IFS= read -r line; do
-            if [[ "$line" == *subvol=* ]]; then
-                opts="$line"
-                break
-            fi
-        done <<< "$fstab_opts"
-    fi
 
     if [[ -z "$uuid" || "$uuid" == "-" ]]; then
         uuid="$(sudo blkid -s UUID -o value "$source" 2>/dev/null || true)"
@@ -191,33 +183,10 @@ load_mount_info() {
     CACHE_MNT_OPTS["$target"]="$opts"
 }
 
-extract_subvol() {
-    if [[ "$1" =~ subvol=([^,[:space:]]+) ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]#/}"
-        return 0
-    fi
-    return 1
-}
-
 get_mount_subvolume_path() {
     local target="$1" path
-
-    load_mount_info "$target"
-
-    path="$(extract_subvol "${CACHE_MNT_OPTS["$target"]}" || true)"
-    if [[ -n "$path" ]]; then
-        printf '%s\n' "${path#/}"
-        return 0
-    fi
-
-    require_cmd btrfs
-    path="$(sudo btrfs subvolume show "$target" 2>/dev/null | sed -n 's/^[[:space:]]*Path:[[:space:]]*//p' || true)"
+    path="$(findmnt -n -e -o FSROOT -M "$target")" || fatal "Could not identify mounted Btrfs root for $target"
     path="${path#/}"
-
-    case "$path" in
-        ""|"<FS_TREE>"|"/") return 1 ;;
-    esac
-
     printf '%s\n' "$path"
 }
 
@@ -244,12 +213,35 @@ dir_is_empty() {
     sudo test -d "$1" || return 0
 
     local entries
-    entries="$(sudo find "$1" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)"
+    entries="$(sudo find "$1" -mindepth 1 -maxdepth 1 -print -quit)" || fatal "Could not inspect $1"
     [[ -z "$entries" ]]
 }
 
 path_is_btrfs_subvolume() {
     sudo btrfs subvolume show "$1" >/dev/null 2>&1
+}
+
+delete_unmounted_subvolume() {
+    local target="$1" subvol_id fs_uuid default_id mounts_json mount_list mounted mounted_id
+    subvol_id="$(sudo btrfs inspect-internal rootid "$target")" || fatal "Cannot identify subvolume $target"
+    fs_uuid="$(findmnt -n -e -o UUID -T "$target")" || fatal "Cannot identify filesystem for $target"
+    default_id="$(sudo btrfs subvolume get-default "$target" | awk '{print $2}')" || fatal "Cannot inspect Btrfs default for $target"
+    [[ "$subvol_id" != "$default_id" ]] || fatal "Refusing to delete default subvolume $target"
+    mounts_json="$(findmnt --json --list -t btrfs -o TARGET,UUID)" || fatal "Cannot inspect Btrfs mounts"
+    mount_list="$(mktemp)"
+    ACTIVE_TEMP_FILES+=("$mount_list")
+    python3 -c 'import json, sys
+uuid = sys.argv[1]
+for item in json.load(sys.stdin)["filesystems"]:
+    if item.get("uuid") == uuid:
+        sys.stdout.buffer.write(item["target"].encode() + b"\0")' "$fs_uuid" <<< "$mounts_json" > "$mount_list" || fatal "Cannot parse Btrfs mounts"
+    while IFS= read -r -d '' mounted; do
+        mounted_id="$(sudo btrfs inspect-internal rootid "$mounted")" || fatal "Cannot inspect mounted subvolume $mounted"
+        [[ "$mounted_id" != "$subvol_id" ]] || fatal "Refusing to delete mounted subvolume $target (mounted at $mounted)"
+    done < "$mount_list"
+    rm -f "$mount_list"
+    remove_array_value ACTIVE_TEMP_FILES "$mount_list"
+    sudo btrfs subvolume delete --commit-after "$target" >/dev/null
 }
 
 btrfs_subvolume_is_ro() {
@@ -264,7 +256,7 @@ btrfs_subvolume_is_ro() {
 }
 
 mount_top_level_for_base() {
-    local base_path="$1" root_source root_opts tmp_mnt extra_opts="subvolid=5"
+    local base_path="$1" result_var="$2" root_source root_opts new_mount extra_opts="subvolid=5"
 
     load_mount_info "$base_path"
 
@@ -273,12 +265,10 @@ mount_top_level_for_base() {
 
     [[ ",$root_opts," == *",degraded,"* ]] && extra_opts+=",degraded"
 
-    tmp_mnt="$(mktemp -d)"
-    ACTIVE_TEMP_MOUNTS+=("$tmp_mnt")
-
-    sudo mount -o "$extra_opts" "$root_source" "$tmp_mnt" || fatal "Mount failed."
-
-    printf '%s\n' "$tmp_mnt"
+    new_mount="$(mktemp -d)"
+    ACTIVE_TEMP_MOUNTS+=("$new_mount")
+    sudo mount -o "$extra_opts" "$root_source" "$new_mount" || fatal "Mount failed."
+    printf -v "$result_var" '%s' "$new_mount"
 }
 
 release_temp_mount() {
@@ -287,60 +277,54 @@ release_temp_mount() {
     [[ -n "$tmp_mnt" ]] || return 0
 
     if mountpoint -q "$tmp_mnt"; then
-        sudo umount "$tmp_mnt" 2>/dev/null || true
+        sudo umount "$tmp_mnt" || fatal "Could not unmount temporary Btrfs mount $tmp_mnt"
     fi
 
-    rmdir "$tmp_mnt" 2>/dev/null || true
+    rmdir "$tmp_mnt" || fatal "Could not remove temporary mount directory $tmp_mnt"
     remove_array_value ACTIVE_TEMP_MOUNTS "$tmp_mnt"
 }
 
 current_snapshots_mount_matches_expected() {
     local mount_target="$1" expected_subvol="$2" base_target="$3" target_uuid
-    local snap_info snap_uuid mounted_opts mounted_subvol
+    local snap_info snap_uuid mounted_root
 
     load_mount_info "$base_target"
     target_uuid="${CACHE_MNT_UUID["$base_target"]}"
 
     findmnt -M "$mount_target" >/dev/null 2>&1 || return 1
 
-    snap_info="$(findmnt -n -e -o UUID,OPTIONS -M "$mount_target" 2>/dev/null || true)"
-    read -r snap_uuid mounted_opts <<< "$snap_info"
+    snap_info="$(findmnt -n -e -o UUID,FSROOT -M "$mount_target" 2>/dev/null || true)"
+    read -r snap_uuid mounted_root <<< "$snap_info"
 
     [[ "$snap_uuid" == "$target_uuid" ]] || return 1
 
-    mounted_subvol="$(extract_subvol "$mounted_opts" || true)"
-    [[ "${mounted_subvol#/}" == "${expected_subvol#/}" ]]
+    [[ "$mounted_root" == "/${expected_subvol#/}" ]]
 }
 
 verify_snapshots_mount() {
     local mount_target="$1" expected_subvol="$2" base_target="$3" target_uuid
-    local snap_info snap_uuid mounted_opts mounted_subvol
+    local snap_info snap_uuid mounted_root
 
     load_mount_info "$base_target"
     target_uuid="${CACHE_MNT_UUID["$base_target"]}"
 
     findmnt -M "$mount_target" >/dev/null 2>&1 || fatal "${mount_target} is not mounted."
 
-    snap_info="$(findmnt -n -e -o UUID,OPTIONS -M "$mount_target" 2>/dev/null || true)"
-    read -r snap_uuid mounted_opts <<< "$snap_info"
+    snap_info="$(findmnt -n -e -o UUID,FSROOT -M "$mount_target" 2>/dev/null || true)"
+    read -r snap_uuid mounted_root <<< "$snap_info"
 
     [[ "$snap_uuid" == "$target_uuid" ]] || fatal "${mount_target} filesystem UUID mismatch."
 
-    mounted_subvol="$(extract_subvol "$mounted_opts" || true)"
-    [[ "${mounted_subvol#/}" == "${expected_subvol#/}" ]] || fatal "${mount_target} subvol mismatch."
+    [[ "$mounted_root" == "/${expected_subvol#/}" ]] || fatal "${mount_target} subvol mismatch."
 
     sudo chmod 750 "$mount_target"
     info "${mount_target} is mounted correctly."
 }
 
 install_packages() {
-    info "Verifying Snapper runtime packages for maximum reliability..."
-    if pacman -Q snapper boost-libs btrfs-progs >/dev/null 2>&1; then
-        info "All required packages (snapper, boost-libs, btrfs-progs) are already installed."
-    else
-        sudo pacman -Sy --needed --noconfirm snapper boost-libs btrfs-progs
-    fi
-    command -v ldconfig >/dev/null 2>&1 && sudo ldconfig
+    pacman -Q snapper boost-libs btrfs-progs >/dev/null ||
+        fatal "Install snapper, boost-libs and btrfs-progs in the package stage before running this setup."
+    info "Snapper runtime packages are installed."
 }
 
 verify_snapper_runtime() {
@@ -349,12 +333,15 @@ verify_snapper_runtime() {
 
 post_install_checks() {
     require_cmd btrfs
+    require_cmd python3
     require_cmd snapper
     require_cmd systemctl
 
     verify_snapper_runtime
 
+    [[ -n "$(get_mount_subvolume_path /)" ]] || fatal "/ must be mounted from a Btrfs subvolume."
     path_is_btrfs_subvolume "/home" || fatal "/home is not a Btrfs subvolume."
+    [[ -n "$(get_mount_subvolume_path /home)" ]] || fatal "/home must be mounted from a Btrfs subvolume."
 }
 
 ensure_snapper_config() {
@@ -363,17 +350,14 @@ ensure_snapper_config() {
     snap_dir="${snap_dir//\/\//\/}"
 
     if sudo snapper -c "$config_name" get-config >/dev/null 2>&1; then
+        sudo grep -qxF "SUBVOLUME=\"${config_path}\"" "/etc/snapper/configs/${config_name}" ||
+            fatal "Snapper ${config_name} points somewhere other than ${config_path}."
         info "Snapper ${config_name} exists."
         return 0
     fi
 
     if sudo test -f "/etc/snapper/configs/${config_name}"; then
-        warn "Snapper config '${config_name}' is corrupted or invalid. Purging..."
-        sudo rm -f "/etc/snapper/configs/${config_name}"
-
-        if sudo test -f "/etc/conf.d/snapper"; then
-            sudo sed -i -E "s/[[:space:]]*\b${config_name}\b//g" /etc/conf.d/snapper || true
-        fi
+        fatal "Snapper config '${config_name}' exists but cannot be loaded; inspect it before retrying."
     fi
 
     if sudo test -d /etc/snapper/configs; then
@@ -384,13 +368,7 @@ ensure_snapper_config() {
 
             if sudo grep -qxF "SUBVOLUME=\"${config_path}\"" "$conf" 2>/dev/null; then
                 conflicting_name="$(basename "$conf")"
-                warn "Subvolume ${config_path} is already covered by '${conflicting_name}'. Purging conflict..."
-
-                sudo rm -f "$conf"
-
-                if sudo test -f "/etc/conf.d/snapper"; then
-                    sudo sed -i -E "s/[[:space:]]*\b${conflicting_name}\b//g" /etc/conf.d/snapper || true
-                fi
+                fatal "Subvolume ${config_path} is already covered by Snapper config '${conflicting_name}'."
             fi
         done < <(sudo find /etc/snapper/configs/ -mindepth 1 -maxdepth 1 -type f -print0 2>/dev/null || true)
     fi
@@ -403,15 +381,14 @@ ensure_snapper_config() {
     if sudo_path_exists "$snap_dir"; then
         if path_is_btrfs_subvolume "$snap_dir"; then
             dir_is_empty "$snap_dir" || fatal "${snap_dir} is a populated subvolume. Cannot proceed safely."
-            sudo btrfs subvolume delete "$snap_dir" >/dev/null || true
+            delete_unmounted_subvolume "$snap_dir" || fatal "Could not remove empty ${snap_dir}."
         else
             dir_is_empty "$snap_dir" || fatal "${snap_dir} directory is not empty after unmounting."
-            sudo rmdir "$snap_dir" 2>/dev/null || true
+            sudo rmdir "$snap_dir" || fatal "Could not remove empty ${snap_dir}."
         fi
     fi
 
     sudo snapper -c "$config_name" create-config "$config_path"
-    ROLLBACK_CMDS+=("sudo snapper -c ${config_name} delete-config")
 
     info "Created Snapper ${config_name} config."
 }
@@ -419,7 +396,7 @@ ensure_snapper_config() {
 ensure_top_level_snapshots_subvolume() {
     local base_path="$1" subvol_target="$2" tmp_mnt
 
-    tmp_mnt="$(mount_top_level_for_base "$base_path")"
+    mount_top_level_for_base "$base_path" tmp_mnt
 
     if sudo_path_exists "${tmp_mnt}/${subvol_target}"; then
         path_is_btrfs_subvolume "${tmp_mnt}/${subvol_target}" || fatal "${subvol_target} exists but is not a subvolume."
@@ -435,10 +412,12 @@ ensure_top_level_snapshots_subvolume() {
 migrate_regular_item_into_dir() {
     local src_item="$1" dst_dir="$2" base dst_item
 
+    sudo test ! -d "$src_item" || fatal "Unexpected directory under Snapper metadata: $src_item"
+
     base="$(basename "$src_item")"
     dst_item="${dst_dir}/${base}"
 
-    if sudo_path_exists "$dst_item"; then
+    if sudo_path_exists "$dst_item" || sudo test -L "$dst_item"; then
         if sudo test -f "$src_item" && sudo test -f "$dst_item" && sudo cmp -s "$src_item" "$dst_item"; then
             sudo rm -f -- "$src_item"
             return 0
@@ -448,7 +427,7 @@ migrate_regular_item_into_dir() {
     fi
 
     sudo cp -a -- "$src_item" "$dst_dir/" || fatal "Failed to copy ${src_item} into ${dst_dir}."
-    sudo rm -rf --one-file-system -- "$src_item" || fatal "Failed to remove migrated source item ${src_item}."
+    sudo rm -f -- "$src_item" || fatal "Failed to remove migrated source item ${src_item}."
 }
 
 migrate_single_legacy_snapshot_entry() {
@@ -476,7 +455,7 @@ migrate_single_legacy_snapshot_entry() {
                 sudo btrfs subvolume snapshot "$item" "${dst_entry}/snapshot" >/dev/null || fatal "Failed to clone writable snapshot ${item} to ${dst_entry}/snapshot."
             fi
 
-            sudo btrfs subvolume delete "$item" >/dev/null || fatal "Failed to delete old snapshot subvolume ${item} after cloning."
+            delete_unmounted_subvolume "$item" || fatal "Failed to delete old snapshot subvolume ${item} after cloning."
         else
             migrate_regular_item_into_dir "$item" "$dst_entry"
         fi
@@ -490,8 +469,8 @@ migrate_existing_nested_snapshots() {
     local base_path="$1" mount_target="$2" subvol_target="$3"
     local tmp_mnt="" base_subvol="" src_path dst_path src_entry entry
 
-    base_subvol="$(get_mount_subvolume_path "$base_path" || true)"
-    tmp_mnt="$(mount_top_level_for_base "$base_path")"
+    base_subvol="$(get_mount_subvolume_path "$base_path")"
+    mount_top_level_for_base "$base_path" tmp_mnt
 
     src_path="$tmp_mnt"
     [[ -n "$base_subvol" ]] && src_path+="/${base_subvol#/}"
@@ -508,7 +487,7 @@ migrate_existing_nested_snapshots() {
 
     if path_is_btrfs_subvolume "$src_path"; then
         if dir_is_empty "$src_path"; then
-            sudo btrfs subvolume delete "$src_path" >/dev/null || fatal "Failed to delete empty legacy snapshots subvolume ${src_path}."
+            delete_unmounted_subvolume "$src_path" || fatal "Failed to delete empty legacy snapshots subvolume ${src_path}."
             info "Removed empty legacy snapshots subvolume behind ${mount_target}."
             release_temp_mount "$tmp_mnt"
             return 0
@@ -525,7 +504,7 @@ migrate_existing_nested_snapshots() {
         done < <(sudo find "$src_path" -mindepth 1 -maxdepth 1 -printf '%f\0' 2>/dev/null)
 
         dir_is_empty "$src_path" || fatal "Legacy snapshots root ${src_path} is not empty after migration."
-        sudo btrfs subvolume delete "$src_path" >/dev/null || fatal "Failed to delete drained legacy snapshots root ${src_path}."
+        delete_unmounted_subvolume "$src_path" || fatal "Failed to delete drained legacy snapshots root ${src_path}."
 
         info "Migrated existing snapshots into ${subvol_target}."
     else
@@ -553,6 +532,20 @@ migrate_existing_nested_snapshots() {
     release_temp_mount "$tmp_mnt"
 }
 
+legacy_snapshots_need_migration() {
+    local base_path="$1" tmp_mnt="" base_subvol hidden needed=1
+    base_subvol="$(get_mount_subvolume_path "$base_path")"
+    mount_top_level_for_base "$base_path" tmp_mnt
+    hidden="$tmp_mnt"
+    [[ -n "$base_subvol" ]] && hidden+="/${base_subvol#/}"
+    hidden+="/.snapshots"
+    if sudo_path_exists "$hidden" && { path_is_btrfs_subvolume "$hidden" || ! dir_is_empty "$hidden"; }; then
+        needed=0
+    fi
+    release_temp_mount "$tmp_mnt"
+    return "$needed"
+}
+
 prepare_snapshots_mountpoint() {
     local base_path="$1" mount_target="$2" subvol_target="$3"
 
@@ -562,12 +555,15 @@ prepare_snapshots_mountpoint() {
 
     if mountpoint -q "$mount_target"; then
         if current_snapshots_mount_matches_expected "$mount_target" "$subvol_target" "$base_path"; then
-            sudo chmod 750 "$mount_target"
-            info "${mount_target} is already mounted from ${subvol_target}."
-            return 0
+            if ! legacy_snapshots_need_migration "$base_path"; then
+                sudo chmod 750 "$mount_target"
+                info "${mount_target} is already mounted from ${subvol_target}."
+                return 0
+            fi
+            info "Temporarily unmounting ${mount_target} to migrate hidden legacy snapshots."
+        else
+            warn "${mount_target} is mounted from an unexpected source. Temporarily unmounting it to repair layout..."
         fi
-
-        warn "${mount_target} is mounted from an unexpected source. Temporarily unmounting it to repair layout..."
         sudo umount "$mount_target" || fatal "Failed to unmount ${mount_target}"
     fi
 
@@ -577,7 +573,7 @@ prepare_snapshots_mountpoint() {
 
     if path_is_btrfs_subvolume "$mount_target"; then
         dir_is_empty "$mount_target" || fatal "Populated nested subvolume still present at ${mount_target} after migration."
-        sudo btrfs subvolume delete "$mount_target" >/dev/null || fatal "Failed to delete empty nested subvolume ${mount_target}."
+        delete_unmounted_subvolume "$mount_target" || fatal "Failed to delete empty nested subvolume ${mount_target}."
         sudo mkdir -p "$mount_target"
         info "Removed empty nested subvolume at ${mount_target}."
         return 0
@@ -605,7 +601,7 @@ ensure_fstab_entry_for_snapshots() {
     tmp="$(mktemp)"
     ACTIVE_TEMP_FILES+=("$tmp")
 
-    sudo awk -v mp="$canonical_target" -v newline="$newline" '
+    awk -v mp="$canonical_target" -v newline="$newline" '
         BEGIN { done = 0 }
 
         /^[[:space:]]*#/ || NF < 2 {
@@ -662,7 +658,6 @@ mount_snapshots() {
 
     verify_snapshots_mount "$mount_target" "$expected_subvol" "$base_target"
 
-    ROLLBACK_CMDS=()
 }
 
 verify_snapper_works() {
@@ -673,7 +668,7 @@ tune_snapper() {
     local cfg="$1"
     local strict_limit="${SNAPSHOT_RETENTION_LIMIT}"
 
-    info "Enforcing strict cleanup limits and zero background bloat for ${cfg}..."
+    info "Configuring snapshot limits and disabling background comparisons for ${cfg}..."
 
     sudo snapper -c "$cfg" set-config \
         TIMELINE_CREATE="no" \
@@ -687,86 +682,191 @@ tune_snapper() {
 }
 
 quiesce_snapper() {
+    if systemctl is-active --quiet snapper-cleanup.timer; then
+        SNAPPER_CLEANUP_WAS_ACTIVE=true
+    fi
+    if systemctl is-active --quiet snapper-timeline.timer; then
+        SNAPPER_TIMELINE_WAS_ACTIVE=true
+    fi
+    if systemctl is-enabled --quiet snapper-timeline.timer; then
+        SNAPPER_TIMELINE_WAS_ENABLED=true
+    fi
     if systemctl is-active --quiet snapper-timeline.timer || systemctl is-active --quiet snapper-cleanup.timer; then
-        sudo systemctl stop snapper-timeline.timer snapper-cleanup.timer 2>/dev/null || true
+        sudo systemctl stop snapper-timeline.timer snapper-cleanup.timer || fatal "Could not pause Snapper timers."
     fi
 }
 
 apply_global_btrfs_tuning() {
-    sudo btrfs quota disable / 2>/dev/null || true
-    info "Applied global Btrfs tuning parameters (Quotas disabled)."
+    local path uuid status seen=' '
+    for path in / /home; do
+        uuid="$(findmnt -n -e -o UUID -M "$path")" || fatal "Cannot inspect filesystem at $path"
+        [[ "$seen" == *" $uuid "* ]] && continue
+        seen+="$uuid "
+        status="$(sudo btrfs quota status "$path" | awk '/Enabled:/ {print $2}')" || fatal "Cannot inspect Btrfs quota status at $path"
+        case "$status" in
+            yes) sudo btrfs quota disable "$path" || fatal "Could not disable Btrfs quotas at $path" ;;
+            no) ;;
+            *) fatal "Unrecognized Btrfs quota status at $path: $status" ;;
+        esac
+    done
+    info "Btrfs quotas are disabled on root and home filesystems."
 }
 
-write_tmpfiles_override() {
-    local target="$1" content="$2" tmp
-
-    tmp="$(mktemp)"
-    ACTIVE_TEMP_FILES+=("$tmp")
-
-    printf '%s\n' "$content" > "$tmp"
-
-    if sudo test -f "$target" && sudo cmp -s "$tmp" "$target"; then
-        rm -f "$tmp"
-        remove_array_value ACTIVE_TEMP_FILES "$tmp"
-        return 1
-    fi
-
-    backup_file "$target"
-    atomic_write "$target" "$tmp"
-
-    rm -f "$tmp"
-    remove_array_value ACTIVE_TEMP_FILES "$tmp"
-
-    return 0
-}
-
-enforce_flat_topology() {
-    local sv changed=false
-
-    for sv in /var/lib/machines /var/lib/portables; do
-        if findmnt -M "$sv" >/dev/null 2>&1; then
-            info "$sv is an actively mounted filesystem. Preserving explicit layout."
-            continue
-        fi
-
-        if path_is_btrfs_subvolume "$sv"; then
-            sudo btrfs subvolume delete "$sv" >/dev/null 2>&1 || warn "Failed to delete subvolume $sv"
-            info "Deleted nested systemd subvolume: $sv"
-        fi
-
-        if [[ ! -e "$sv" ]]; then
-            sudo mkdir -p "$sv"
-            sudo chmod 0700 "$sv"
+remove_legacy_tmpfiles_overrides() {
+    # Older versions forced ordinary directories, pulling machine data into root snapshots.
+    local target expected
+    for target in /etc/tmpfiles.d/systemd-nspawn.conf /etc/tmpfiles.d/portables.conf; do
+        case "$target" in
+            */systemd-nspawn.conf) expected='d /var/lib/machines 0700 - - -' ;;
+            */portables.conf) expected='d /var/lib/portables 0700 - - -' ;;
+        esac
+        if sudo test -f "$target" && [[ "$(sudo cat "$target")" == "$expected" ]]; then
+            backup_file "$target"
+            sudo rm -- "$target"
+            info "Removed obsolete tmpfiles override: $target"
         fi
     done
-
-    sudo mkdir -p /etc/tmpfiles.d
-
-    if write_tmpfiles_override /etc/tmpfiles.d/systemd-nspawn.conf "d /var/lib/machines 0700 - - -"; then
-        changed=true
-    fi
-
-    if write_tmpfiles_override /etc/tmpfiles.d/portables.conf "d /var/lib/portables 0700 - - -"; then
-        changed=true
-    fi
-
-    if [[ "$changed" == true ]]; then
-        info "Applied systemd tmpfiles overrides to permanently enforce flat Btrfs topology."
-    else
-        info "Flat-topology tmpfiles overrides are already correct."
-    fi
 }
 
 enable_snapper_timers() {
     info "Enabling systemd snapper-cleanup.timer to enforce pruning..."
-    sudo systemctl enable --now snapper-cleanup.timer 2>/dev/null || true
+    sudo systemctl enable --now snapper-cleanup.timer || fatal "Could not enable Snapper cleanup timer."
 
     info "Disabling systemd snapper-timeline.timer to eliminate background wakeups..."
-    sudo systemctl disable --now snapper-timeline.timer 2>/dev/null || true
+    sudo systemctl disable --now snapper-timeline.timer || fatal "Could not disable Snapper timeline timer."
+}
+
+deploy_pair_helper() {
+    local target=/usr/local/libexec/dusky-snapshot-pair tmp
+    tmp="$(mktemp)"
+    ACTIVE_TEMP_FILES+=("$tmp")
+    cat <<'PAIR_HELPER' > "$tmp"
+#!/usr/bin/env bash
+set -euo pipefail
+export LC_ALL=C
+
+mkdir -p /run/dusky
+exec 9>/run/dusky/dusky.lock
+flock -x 9
+
+pair="$(cat /proc/sys/kernel/random/uuid)"
+
+pair_ids() {
+    local config="$1"
+    snapper --iso --jsonout -c "$config" list |
+        python3 -c 'import json, sys
+config, pair = sys.argv[1:]
+for row in json.load(sys.stdin)[config]:
+    if (row.get("userdata") or {}).get("dusky_pair") == pair:
+        print(row["number"])' "$config" "$pair"
+}
+
+remove_partial_pair() {
+    local config ids id incomplete=0
+    for config in root home; do
+        if ! ids="$(pair_ids "$config")"; then
+            printf 'Could not inspect %s snapshots for pair %s\n' "$config" "$pair" >&2
+            incomplete=1
+            continue
+        fi
+        while IFS= read -r id; do
+            [[ -n "$id" ]] || continue
+            snapper -c "$config" delete "$id" || incomplete=1
+        done <<< "$ids"
+    done
+    (( incomplete == 0 ))
+}
+
+on_exit() {
+    local status=$?
+    trap - EXIT
+    if (( status != 0 )); then
+        remove_partial_pair || printf 'Pair %s needs manual cleanup.\n' "$pair" >&2
+    fi
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+snapper -c root create --description 'scheduled daily' \
+    --userdata "dusky_pair=${pair},dusky_role=root,dusky_schedule=daily"
+snapper -c home create --description 'scheduled daily' \
+    --userdata "dusky_pair=${pair},dusky_role=home,dusky_schedule=daily"
+root_ids="$(pair_ids root)"
+home_ids="$(pair_ids home)"
+[[ "$root_ids" =~ ^[0-9]+$ && "$home_ids" =~ ^[0-9]+$ ]]
+
+# The new pair is complete. Retention failures must never remove it.
+trap - EXIT
+python3 - __SNAPSHOT_LIMIT__ <<'PYTHON_PRUNE'
+import json
+import subprocess
+import sys
+
+limit = int(sys.argv[1])
+rows = {}
+for config in ("root", "home"):
+    result = subprocess.run(
+        ["snapper", "--iso", "--jsonout", "-c", config, "list"],
+        check=True, capture_output=True, text=True,
+    )
+    rows[config] = json.loads(result.stdout)[config]
+
+scheduled = {}
+for config in ("root", "home"):
+    by_pair = {}
+    for snapshot in rows[config]:
+        metadata = snapshot.get("userdata") or {}
+        pair_id = metadata.get("dusky_pair")
+        if not pair_id or metadata.get("dusky_role") != config:
+            continue
+        if metadata.get("dusky_schedule") != "daily" and snapshot.get("description") != "auto 8pm":
+            continue
+        by_pair.setdefault(pair_id, []).append(snapshot)
+    scheduled[config] = by_pair
+
+complete = []
+for pair_id in scheduled["root"].keys() | scheduled["home"].keys():
+    root = scheduled["root"].get(pair_id, [])
+    home = scheduled["home"].get(pair_id, [])
+    if len(root) != 1 or len(home) != 1:
+        if len(root) > 1 or len(home) > 1:
+            print(f"Duplicate scheduled pair tag {pair_id}; inspect it manually.", file=sys.stderr)
+            continue
+        for config, snapshots in (("root", root), ("home", home)):
+            for snapshot in snapshots:
+                subprocess.run(["snapper", "-c", config, "delete", str(snapshot["number"])], check=True)
+        print(f"Removed incomplete scheduled pair {pair_id}.", file=sys.stderr)
+        continue
+    complete.append((max(root[0]["date"], home[0]["date"]),
+                     root[0]["number"], pair_id,
+                     root[0]["number"], home[0]["number"]))
+
+complete.sort()
+for _, _, pair_id, root_id, home_id in complete[:-limit]:
+    for config, number in (("root", root_id), ("home", home_id)):
+        subprocess.run(["snapper", "-c", config, "delete", str(number)], check=True)
+PYTHON_PRUNE
+PAIR_HELPER
+    sed -i "s/__SNAPSHOT_LIMIT__/${SNAPSHOT_RETENTION_LIMIT}/" "$tmp"
+
+    sudo mkdir -p /usr/local/libexec
+    if sudo test -f "$target" && sudo cmp -s "$tmp" "$target"; then
+        rm -f "$tmp"
+        remove_array_value ACTIVE_TEMP_FILES "$tmp"
+        return 0
+    fi
+    backup_file "$target"
+    sudo install -m 0755 "$tmp" "${target}.new"
+    sudo mv -f -- "${target}.new" "$target"
+    sudo sync -f /usr/local/libexec || fatal "Could not sync installed pair helper."
+    rm -f "$tmp"
+    remove_array_value ACTIVE_TEMP_FILES "$tmp"
 }
 
 deploy_custom_timer() {
     info "Deploying custom scheduled snapshot creation timer with gatekeeper..."
+    deploy_pair_helper
 
     local service_file="/etc/systemd/system/dusky_snapshot.service"
     local timer_file="/etc/systemd/system/dusky_snapshot.timer"
@@ -776,14 +876,13 @@ deploy_custom_timer() {
     tmp_timer="$(mktemp)"
     ACTIVE_TEMP_FILES+=("$tmp_service" "$tmp_timer")
 
-    # Service unit is generated with a quoted heredoc so escaping is explicit.
-    # Systemd converts $$ -> $ and %% -> %.
+    # Systemd converts $$ -> $ and %% -> % in ExecCondition.
     cat <<'EOF' > "$tmp_service"
 [Unit]
 Description=Create Automated Snapper Snapshots
 Documentation=man:snapper(8)
 After=local-fs.target nss-user-lookup.target
-Wants=snapper-cleanup.service
+RequiresMountsFor=/.snapshots /home/.snapshots
 
 [Service]
 Type=oneshot
@@ -798,7 +897,7 @@ Nice=19
 IOSchedulingClass=idle
 CPUSchedulingPolicy=idle
 ExecCondition=/usr/bin/bash -c 'if [ -f /var/lib/dusky_snapshot_time ]; then elapsed=$$(( $$(date +%%s) - $$(stat -c %%Y /var/lib/dusky_snapshot_time) )); if [ $$elapsed -lt 72000 ]; then exit 1; fi; fi; exit 0'
-ExecStart=/usr/bin/bash -c 'pair=$$(cat /proc/sys/kernel/random/uuid); for cfg in $$(/usr/bin/snapper --csvout --no-headers list-configs | /usr/bin/cut -d, -f1); do /usr/bin/snapper -c "$$cfg" create --description "auto 8pm" --cleanup-algorithm number --userdata "dusky_pair=$${pair},dusky_role=$${cfg}"; done'
+ExecStart=/usr/local/libexec/dusky-snapshot-pair
 ExecStartPost=/usr/bin/touch /var/lib/dusky_snapshot_time
 EOF
 
@@ -816,13 +915,19 @@ RandomizedDelaySec=5m
 WantedBy=timers.target
 EOF
 
-    sudo cp "$tmp_service" "$service_file"
-    sudo cp "$tmp_timer" "$timer_file"
-    sudo chmod 0644 "$service_file" "$timer_file"
+    if ! sudo test -f "$service_file" || ! sudo cmp -s "$tmp_service" "$service_file"; then
+        backup_file "$service_file"
+        atomic_write "$service_file" "$tmp_service"
+    fi
+    if ! sudo test -f "$timer_file" || ! sudo cmp -s "$tmp_timer" "$timer_file"; then
+        backup_file "$timer_file"
+        atomic_write "$timer_file" "$tmp_timer"
+    fi
 
     rm -f "$tmp_service" "$tmp_timer"
     remove_array_value ACTIVE_TEMP_FILES "$tmp_service" "$tmp_timer"
 
+    sudo systemd-analyze verify "$service_file" "$timer_file" || fatal "Generated snapshot units failed verification."
     sudo systemctl daemon-reload
     sudo systemctl enable --now dusky_snapshot.timer
 
@@ -845,7 +950,9 @@ preflight_checks() {
     require_cmd mktemp
     require_cmd mountpoint
     require_cmd blkid
-    require_cmd cut
+    require_cmd install
+    require_cmd flock
+    require_cmd systemd-analyze
     require_cmd mount
     require_cmd umount
     require_cmd systemctl
@@ -885,7 +992,7 @@ preflight_checks() {
 preflight_checks
 quiesce_snapper
 
-execute "Reinstall Snapper runtime packages" install_packages
+execute "Verify Snapper runtime packages" install_packages
 post_install_checks
 
 # --- ROOT SNAPSHOT CONFIG ---
@@ -908,6 +1015,7 @@ execute "Tune Snapper home" tune_snapper "home"
 
 # --- SYSTEM WIDE OPTIMIZATIONS ---
 execute "Apply Global Btrfs Settings" apply_global_btrfs_tuning
-execute "Enforce Flat Topology" enforce_flat_topology
+execute "Remove old tmpfiles overrides" remove_legacy_tmpfiles_overrides
 execute "Enable Snapper Pruning Timers" enable_snapper_timers
 execute "Deploy Custom Autonomous Timer" deploy_custom_timer
+SETUP_COMPLETE=true
