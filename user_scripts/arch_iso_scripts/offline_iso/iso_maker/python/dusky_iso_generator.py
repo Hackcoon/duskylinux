@@ -1019,7 +1019,8 @@ def repo_add_entries(paths: Sequence[Path]) -> dict[str, DbEntry]:
     return merged
 
 
-def update_repo_db(repo: Path, want: Collection[str], old: dict[str, DbEntry] | None = None) -> dict[str, DbEntry]:
+def update_repo_db(repo: Path, want: Collection[str], old: dict[str, DbEntry] | None = None,
+                   force_write: bool = False) -> dict[str, DbEntry]:
     """Make the repo DB describe exactly `want` (filenames in `repo`). Entries whose filename and
     size still match are reused; only new files go through repo-add; unchanged DBs are not
     rewritten at all."""
@@ -1038,7 +1039,7 @@ def update_repo_db(repo: Path, want: Collection[str], old: dict[str, DbEntry] | 
         else:
             fresh.append(path)
     links_ok = all(os.path.lexists(repo / n) for n in (DB_NAME, FILES_NAME, f"{REPO_NAME}.db", f"{REPO_NAME}.files"))
-    if not fresh and len(keep) == len(old) and links_ok:
+    if not force_write and not fresh and len(keep) == len(old) and links_ok:
         ok(f"{repo.name} DB unchanged ({len(keep)} packages)")
         return keep
     if fresh:
@@ -1055,14 +1056,19 @@ def update_repo_db(repo: Path, want: Collection[str], old: dict[str, DbEntry] | 
 
 
 def ensure_repo_db(repo: Path) -> bool:
-    """True if `repo` has a DB afterwards (indexing its newest files when the DB is missing)."""
-    if (repo / FILES_NAME).is_file():
-        return True
+    """True if `repo` has a DB afterwards (indexing its newest files when the DB is missing or out of sync)."""
     files = set(newest_files(package_files(repo)).values())
     if not files:
         return False
+    if (repo / FILES_NAME).is_file():
+        old = load_db_by_filename(repo)
+        if set(old) == files:
+            return True
+        warn(f"{repo}: DB out of sync with disk ({len(files)} files on disk, {len(old)} in DB); updating index")
+        update_repo_db(repo, files, old, force_write=True)
+        return True
     warn(f"{repo}: no {FILES_NAME}; indexing the newest file of every package")
-    update_repo_db(repo, files, {})
+    update_repo_db(repo, files, {}, force_write=True)
     return True
 
 
@@ -1753,6 +1759,7 @@ class AurBuilder:
                 shutil.copyfile(bf, tmp)  # copy_file_range/sendfile: no userspace buffers
             name, ver, _ = parse_pkg_filename(bf.name)  # type: ignore[misc]
             self.index.setdefault(name, []).append((ver, bf.name))
+            self.keep_names.add(name)
             ok(f"built: {bf.name}")
         fsync_dir(self.repo)
         remove_tree(built[0].parent.parent)  # build-<pkgbase>
@@ -1772,6 +1779,9 @@ def finalize_aur_repo(db: IsolatedDB, repo: Path, official: Path | None, keep_na
     cachedirs = [repo] + ([official] if official is not None else [])
     targets = sorted(keep_names & aur_names)
     closure, dropped = db.closure_tolerant(targets, cachedirs)
+    needed = {fn for _, fn, sz in closure if sz > 0}
+    if needed and ingest_host_cache_packages(repo, needed):
+        closure, dropped = db.closure_tolerant(targets, cachedirs)
     keep = {newest[n] for n in dropped}
     for repo_name, fn, _ in closure:
         if repo_name == REPO_NAME or official is None or not (official / fn).is_file():
@@ -1780,7 +1790,7 @@ def finalize_aur_repo(db: IsolatedDB, repo: Path, official: Path | None, keep_na
         ensure_disk_space(repo, 2 << 30, "AUR runtime dependencies")
         db.download([t for t in targets if t not in dropped], cachedirs)
     prune_repo(repo, keep)
-    update_repo_db(repo, keep, old)
+    update_repo_db(repo, keep, old, force_write=True)
     restore_ownership(repo, user)
 
 
