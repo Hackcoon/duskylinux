@@ -1460,12 +1460,9 @@ def snapshot_rows(config: str) -> list[dict[str, Any]]:
     """
     Snapshot rows for one snapper config.
 
-    Always queried with --jsonout --utc.  snapper(8) states that ISO format is
-    always used for machine-readable output, but NOT that it is UTC; local
-    time is ambiguous for one hour every autumn, and the pair matcher compares
-    timestamps across configs against a hard second threshold, so a DST fold
-    could shift a candidate by 3600s and either reject a correct pair or
-    accept a wrong one.
+    Query with --iso and --utc: Snapper's JSON dates otherwise use the
+    human-readable local format. UTC avoids ambiguous local times during a
+    daylight-saving transition when matching snapshots across configs.
     """
 
     def build() -> list[dict[str, Any]]:
@@ -2200,7 +2197,8 @@ def audit_boot_consistency(root_dir: Path) -> list[str]:
     modules_dir = root_dir / "usr/lib/modules"
     if not modules_dir.is_dir():
         return ["restored root has no /usr/lib/modules directory"]
-    available = [p for p in modules_dir.iterdir() if p.is_dir()]
+    available = [p for p in modules_dir.iterdir()
+                 if p.is_dir() and re.match(r"\d+\.\d+", p.name)]
     if not available:
         return ["restored root has no installed kernel modules"]
     for tree in available:

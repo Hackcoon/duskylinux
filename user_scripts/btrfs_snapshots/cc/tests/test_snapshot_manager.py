@@ -86,6 +86,19 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual((item / 'keep').read_text(), 'data')
 
 class SecondPassTests(unittest.TestCase):
+    def test_boot_audit_ignores_non_kernel_module_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            modules = Path(tmp) / 'usr/lib/modules'
+            (modules / '.old').mkdir(parents=True)
+            kernel = modules / '7.3.0-rc4-custom'
+            kernel.mkdir()
+            (kernel / 'modules.dep').write_text('')
+            with patch.object(d, 'is_mountpoint', return_value=False):
+                self.assertEqual(d.audit_boot_consistency(Path(tmp)), [])
+                (kernel / 'modules.dep').unlink()
+                self.assertEqual(d.audit_boot_consistency(Path(tmp)),
+                                 ['modules tree 7.3.0-rc4-custom has no modules.dep'])
+
     def test_finalised_replica_still_blocks_changes(self):
         journal = d.Journal('txn', 'fs', 'finalised', '', [])
         with patch.object(d, 'load_journals', return_value=[journal]):
