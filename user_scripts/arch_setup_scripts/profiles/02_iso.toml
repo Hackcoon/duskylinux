@@ -101,6 +101,7 @@ scripts = [
     "U | 241_thunar_defaults.py",
     "U | 242_file_manager_bookmarks_sidepane.py",
     "U | 243_mousepad_defaults.py",
+    "U | 244_kitty_cache_redirect_tmpfs.py",
     # "S | 245_asusd_service_fix.sh",
     # "S | 250_ftp_arch.sh",
     # "U | 255_tldr_update.sh",
