@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Dusky Formatter v5.4.0 (Architect Edition - Bleeding Edge 2026)
+Dusky Formatter v5.5.0 (Architect Edition - Bleeding Edge 2026)
 A cutting-edge, interactive & non-interactive CLI/TUI utility for securely formatting,
 partitioning, and encrypting storage drives without unnecessary write amplification.
 
@@ -18,6 +18,7 @@ import uuid
 import time
 import shutil
 import argparse
+from pathlib import Path
 from typing import Any, Optional, TypedDict
 
 # ==============================================================================
@@ -49,7 +50,7 @@ class ExecutionStep(TypedDict):
 
 MANUAL_TEXT = """
 ===============================================================================
-               DUSKY FORMATTER v5.4.0 - ARCH LINUX SYSTEM MANUAL
+               DUSKY FORMATTER v5.5.0 - ARCH LINUX SYSTEM MANUAL
 ===============================================================================
 
 DESCRIPTION:
@@ -58,38 +59,51 @@ DESCRIPTION:
     both a rich interactive Terminal User Interface (TUI) and an automated CLI
     interface.
 
-KEY FEATURES & METHODOLOGIES (AUGUST 2026 / KERNEL 7.1 STANDARDS):
+KEY FEATURES & METHODOLOGIES (BLEEDING EDGE ARCH / KERNEL 7.1+ STANDARDS):
 
-1. ZERO WRITE AMPLIFICATION & NAND PROTECTION:
-   - Ext4/Ext3: Uses `-E lazy_itable_init=1,lazy_journal_init=1,discard`. Disabling 
-     lazy initialization (`lazy_itable_init=0`) forces mkfs.ext4 to write 
+1. ZERO WRITE AMPLIFICATION & ROTATIONAL INTELLIGENCE:
+   - Sysfs Rotational Inspection: Automatically identifies rotational HDDs vs.
+     SSDs/NVMe via `/sys/class/block/<dev>/queue/rotational` (inspecting parents
+     and device-mapper slaves).
+   - Ext4/Ext3: Uses `-E lazy_itable_init=1,lazy_journal_init=1,discard` on SSDs/NVMe
+     (and `-E lazy_itable_init=1,lazy_journal_init=1,nodiscard` on rotational HDDs).
+     Disabling lazy initialization (`lazy_itable_init=0`) forces mkfs.ext4 to write 
      zeros across the entire inode table on NAND flash drives, causing severe
      write amplification. Enabling lazy init defers zeroing to background 
      kernel allocation or discards block references.
    - Bcachefs: Next-generation Copy-on-Write (COW) Linux filesystem formatting 
      via `bcachefs format -f --label=<label>`.
-   - NTFS (Kernel 7.1 Native `ntfs.ko`): Formatted via `mkfs.ntfs -f -F` (fast 
+   - NTFS (Kernel 7.1+ Native `ntfs.ko`): Formatted via `mkfs.ntfs -f -F` (fast 
      format & force overwrite) creating clean NTFS volume structures with 
      zero write amplification. Fully compatible with the rewritten, native 
-     Linux 7.1 in-kernel `ntfs` driver (`fs/ntfs/ntfs.ko`, built on iomap 
+     Linux 7.1+ in-kernel `ntfs` driver (`fs/ntfs/ntfs.ko`, built on iomap 
      and folios by Namjae Jeon / Tuxera).
-     NOTE: On Arch Linux, if `ntfs-3g` is installed, `/sbin/mount.ntfs` is a 
-     symlink to the old FUSE daemon. To mount via the Kernel 7.1 native kernel 
-     driver, explicitly run `mount -t ntfs3 <dev> <mnt>` or remove the FUSE symlink.
-   - TRIM / Discard: Automatically includes discard flags across supported 
-     filesystems (BTRFS, EXT4, F2FS, exFAT, XFS, Bcachefs) and LUKS mappings (`--allow-discards`).
+     NOTE: On Arch Linux, if `ntfs-3g` is installed, `/sbin/mount.ntfs` may be a 
+     symlink to the old FUSE daemon. To mount via the Kernel 7.1+ native in-kernel 
+     driver directly without FUSE invocation, explicitly run `mount -i -t ntfs <dev> <mnt>`
+     (or `mount -i -t ntfs3 <dev> <mnt>`).
+   - TRIM / Discard & Hardware blkdiscard: Automatically skips hardware `blkdiscard`
+     on rotational HDDs to prevent noisy I/O stalls, while executing it on SSDs/NVMe.
+     On SSDs/NVMe, enables LUKS2 `--allow-discards` and crypto workqueue bypass.
    - Wiping: Uses `wipefs --all --force` to destroy magic signatures without
      overwriting whole disk blocks (avoiding zero-fills like `dd if=/dev/zero`).
 
 2. CUTTING-EDGE UTILITY INTEGRATION:
    - exFAT: Uses `exfatprogs` 1.4.2 syntax (`-L` for labels, `-F` for force).
    - BTRFS: Uses `btrfs-progs` 7.1 syntax supporting `blake2`, `xxhash`, 
-     `sha256`, and `crc32c` checksum algorithms.
-   - F2FS: Configured with `-t 1` for flash-friendly block placement and trim.
-   - XFS: Uses `xfsprogs` 7.1 syntax (`-f` for force, `-L` label up to 12 chars).
+     `sha256`, and `crc32c` checksum algorithms. Disables whole-device trim (`-K`)
+     on rotational drives.
+   - F2FS: Configured with `-t 1` for flash-friendly block placement and trim on SSDs,
+     and `-t 0` on rotational drives.
+   - XFS: Uses `xfsprogs` 7.1 syntax (`-f` for force, `-L` label up to 12 chars,
+     `-K` on rotational drives).
    - NILFS2: Continuous snapshot log-structured filesystem via `mkfs.nilfs2`.
-   - Partitioning: Universal GPT/MBR layout generation via `sfdisk` (util-linux 2.42.2).
-   - Cryptography: LUKS2 with Argon2id PBKDF via `cryptsetup` 2.8.7.
+   - Partitioning: Universal GPT/MBR layout generation via `sfdisk` (util-linux 2.42.2)
+     with kernel partition table synchronization via `partprobe` and bounded `udevadm settle`.
+   - Cryptography: LUKS2 with Argon2id PBKDF via `cryptsetup`. Uses `--sector-size 4096`
+     to align with modern 4Kn/512e flash page layout, avoiding 512-byte crypto fragmentation
+     and significantly improving read/write IOPS. Bypasses crypto workqueues on SSDs/NVMe
+     (`--perf-no_read_workqueue --perf-no_write_workqueue --persistent`).
 
 3. DEPENDENCY AUTO-RESOLUTION:
    - Automatically detects missing system packages (e.g. `python-rich`, `xfsprogs`, `ntfsprogs`, `bcachefs-tools`)
@@ -102,7 +116,7 @@ EXAMPLES:
    - Quick Format USB Drive as Bcachefs non-interactively:
        $ dusky_formater.py --device /dev/sda --fs bcachefs --label "FAST_COW" -y
 
-   - Encrypt Drive with LUKS2 + Ext4:
+   - Encrypt Drive with LUKS2 + Ext4 (4K alignment & workqueue bypass):
        $ dusky_formater.py --device /dev/sda1 --encrypt --passphrase "secret" --fs ext4 -y
 ===============================================================================
 """
@@ -111,7 +125,7 @@ SUPPORTED_FS = ["btrfs", "ext4", "f2fs", "exfat", "xfs", "fat32", "ntfs", "bcach
 
 def parse_cli_args() -> tuple[Optional[argparse.Namespace], bool]:
     parser = argparse.ArgumentParser(
-        description="Dusky Formatter v5.4.0 - Modern Arch Linux Storage Utility",
+        description="Dusky Formatter v5.5.0 - Modern Arch Linux Storage Utility",
         formatter_class=argparse.RawTextHelpFormatter,
         add_help=False
     )
@@ -131,7 +145,7 @@ def parse_cli_args() -> tuple[Optional[argparse.Namespace], bool]:
     args, unknown = parser.parse_known_args()
 
     if args.help:
-        print(f"Dusky Formatter v5.4.0 (Architect Edition - Bleeding Edge 2026)")
+        print(f"Dusky Formatter v5.5.0 (Architect Edition - Bleeding Edge 2026)")
         print(parser.format_help())
         print(f"\nSupported Filesystems ({len(SUPPORTED_FS)}): {', '.join(SUPPORTED_FS)}")
         print("Run with '--manual' for technical specifications and design rationale.")
@@ -215,6 +229,33 @@ def get_val(d: dict[str, Any], key: str, default: Any = "") -> Any:
     if val is None:
         val = d.get(key.upper())
     return val if val is not None else default
+
+def sysfs_block(dev_path: str) -> Optional[Path]:
+    try:
+        p = Path(dev_path).resolve(strict=True)
+        node = Path("/sys/class/block") / p.name
+        return node if node.exists() else None
+    except OSError:
+        return None
+
+def is_rotational(dev_path: str) -> bool:
+    """Check if the device, its parent disk, or underlying slaves are rotational HDD."""
+    if not dev_path or dev_path == "N/A":
+        return False
+    node = sysfs_block(dev_path)
+    if node is None:
+        return False
+    try:
+        real = node.resolve()
+        for cand in (real / "queue" / "rotational", real.parent / "queue" / "rotational"):
+            if cand.is_file():
+                return cand.read_text().strip() == "1"
+        slaves = real / "slaves"
+        if slaves.is_dir():
+            return any(is_rotational(str(Path("/dev") / s.name)) for s in slaves.iterdir())
+    except (OSError, ValueError):
+        pass
+    return False
 
 def get_mount_options() -> dict[str, dict[str, str]]:
     cmd = ["findmnt", "-A", "-l", "--json", "-o", "TARGET,FSTYPE,OPTIONS"]
@@ -312,12 +353,13 @@ def display_device_tree(devices: list[dict[str, Any]], table: Table, mount_data:
         dev_type = get_val(dev, "type", "").strip()
         label = get_val(dev, "label", "").strip()
         
+        rot_desc = "HDD" if is_rotational(path) else ("NVMe" if "nvme" in path else "SSD/Flash")
         if label:
-            identity_str = f"[green]{label}[/]\n[dim]({dev_type})[/]"
+            identity_str = f"[green]{label}[/]\n[dim]({dev_type} • {rot_desc})[/]"
         elif model:
-            identity_str = f"[yellow]{model}[/]\n[dim]({dev_type})[/]"
+            identity_str = f"[yellow]{model}[/]\n[dim]({dev_type} • {rot_desc})[/]"
         else:
-            identity_str = f"[dim]({dev_type})[/]"
+            identity_str = f"[dim]({dev_type} • {rot_desc})[/]"
         
         size = get_val(dev, "size", "N/A")
         fstype = get_val(dev, "fstype") or "[dim]Raw[/]"
@@ -549,7 +591,7 @@ def unmount_device_locks(target_device: str, current_devices: list[dict[str, Any
         teardown_descendants(device_node)
 
     subprocess.run(["blockdev", "--flushbufs", target_device], capture_output=True)
-    subprocess.run(["udevadm", "settle"], capture_output=True)
+    subprocess.run(["udevadm", "settle", "--timeout=10"], capture_output=True)
     
     updated_devices = get_block_devices()
     updated_node = find_device_node(updated_devices, target_device)
@@ -608,7 +650,7 @@ def build_plan_from_cli(args: argparse.Namespace) -> FormatPlan:
     dev_type = get_val(device_node, "type", "part")
     
     target_block = args.device
-    partition_table = args.partition if dev_type == "disk" else "none"
+    partition_table = args.partition if (dev_type in ["disk", "loop"] and not args.device.startswith("/dev/zram")) else "none"
 
     plan: FormatPlan = {
         "device": args.device,
@@ -625,7 +667,7 @@ def build_plan_from_cli(args: argparse.Namespace) -> FormatPlan:
     return plan
 
 def interactive_setup() -> FormatPlan:
-    console.print(Panel.fit("[bold magenta]Dusky Formatter v5.4.0[/] - [cyan]Arch Linux Storage Utility[/]", border_style="magenta"))
+    console.print(Panel.fit("[bold magenta]Dusky Formatter v5.5.0[/] - [cyan]Arch Linux Storage Utility[/]", border_style="magenta"))
     
     initial_devices = get_block_devices()
     mount_data = get_mount_options()
@@ -686,7 +728,7 @@ def interactive_setup() -> FormatPlan:
     
     partition_table = "none"
     partition_size = "100%"
-    if dev_type == "disk":
+    if dev_type in ["disk", "loop"] and not target_device.startswith("/dev/zram"):
         console.print(Panel(
             "[bold cyan]Partition Table Schemes:[/]\n"
             "  • [bold green]none[/]: Format raw block device directly (superfloppy mode, best for USB drives/flash media)\n"
@@ -772,8 +814,9 @@ def build_execution_plan(plan: FormatPlan) -> tuple[list[ExecutionStep], str, Op
     
     mapper_name = None
 
-    # Step 1: Low-level FTL discard (if blkdiscard available) & Wipe filesystem signatures
-    if shutil.which("blkdiscard") and not device.startswith("/dev/mapper/"):
+    # Step 1: Low-level FTL discard (SSD/NVMe only, if blkdiscard available) & Wipe filesystem signatures
+    rotational = is_rotational(device)
+    if shutil.which("blkdiscard") and not device.startswith("/dev/mapper/") and not rotational:
         blkdiscard_cmd = ["blkdiscard", "-f", device]
         commands.append({
             "action": "blkdiscard",
@@ -782,7 +825,7 @@ def build_execution_plan(plan: FormatPlan) -> tuple[list[ExecutionStep], str, Op
             "interactive": False,
             "input_data": None
         })
-        bash_script += f"# Low-level FTL discard (resets LBA mappings if supported)\n{shlex.join(blkdiscard_cmd)} 2>/dev/null || true\n\n"
+        bash_script += f"# Low-level FTL discard (resets LBA mappings on SSD/NVMe)\n{shlex.join(blkdiscard_cmd)} 2>/dev/null || true\n\n"
 
     wipe_cmd = ["wipefs", "--all", "--force", device]
     commands.append({
@@ -819,7 +862,18 @@ def build_execution_plan(plan: FormatPlan) -> tuple[list[ExecutionStep], str, Op
         part_suffix = "p1" if device[-1].isdigit() else "1"
         target_block = f"{device}{part_suffix}"
         
-        settle_cmd = ["udevadm", "settle"]
+        if shutil.which("partprobe"):
+            partprobe_cmd = ["partprobe", device]
+            commands.append({
+                "action": "partprobe",
+                "desc": f"Informing kernel of partition table updates on {device}",
+                "cmd": partprobe_cmd,
+                "interactive": False,
+                "input_data": None
+            })
+            bash_script += f"{shlex.join(partprobe_cmd)} || true\n"
+
+        settle_cmd = ["udevadm", "settle", "--timeout=10"]
         commands.append({
             "action": "settle",
             "desc": "Synchronizing kernel block layer device nodes",
@@ -827,31 +881,40 @@ def build_execution_plan(plan: FormatPlan) -> tuple[list[ExecutionStep], str, Op
             "interactive": False,
             "input_data": None
         })
-        bash_script += f"udevadm settle\n\n"
+        bash_script += f"udevadm settle --timeout=10\n\n"
 
     # Step 3: LUKS2 Encryption Setup
     if encrypt and passphrase:
         mapper_name = generate_secure_mapper_name()
         
-        luks_fmt = ["cryptsetup", "-q", "luksFormat", "--type", "luks2", target_block, "-"]
+        # Sector size 4096 aligns with modern 4Kn/512e SSDs and HDDs, avoiding crypto fragmentation
+        luks_fmt = ["cryptsetup", "-q", "luksFormat", "--type", "luks2", "--sector-size", "4096", target_block, "-"]
         commands.append({
             "action": "luks_format",
-            "desc": f"Initializing LUKS2 Encryption Container on {target_block}",
+            "desc": f"Initializing LUKS2 Encryption Container (4096 sector size) on {target_block}",
             "cmd": luks_fmt,
             "interactive": False, 
             "input_data": passphrase
         })
-        bash_script += f"# Initialize LUKS2 Container\necho -n 'YOUR_PASSPHRASE' | {shlex.join(luks_fmt[:-1])} -\n"
+        bash_script += f"# Initialize LUKS2 Container (4096 sector size)\necho -n 'YOUR_PASSPHRASE' | {shlex.join(luks_fmt[:-1])} -\n"
         
-        luks_open = ["cryptsetup", "open", "--type", "luks", "--allow-discards", "--key-file", "-", target_block, mapper_name]
+        luks_open = ["cryptsetup", "open", "--type", "luks", "--key-file", "-"]
+        if not rotational:
+            luks_open.extend(["--allow-discards", "--perf-no_read_workqueue", "--perf-no_write_workqueue", "--persistent"])
+        luks_open.extend([target_block, mapper_name])
+        
+        desc_open = f"Opening encrypted volume as '/dev/mapper/{mapper_name}'"
+        if not rotational:
+            desc_open += " (TRIM enabled, workqueues bypassed, persistent)"
+            
         commands.append({
             "action": "luks_open",
-            "desc": f"Opening encrypted volume as '/dev/mapper/{mapper_name}'",
+            "desc": desc_open,
             "cmd": luks_open,
             "interactive": False,
             "input_data": passphrase
         })
-        bash_script += f"# Map LUKS volume with discard (TRIM) passthrough\necho -n 'YOUR_PASSPHRASE' | cryptsetup open --type luks --allow-discards --key-file - {target_block} {mapper_name}\n\n"
+        bash_script += f"# Map LUKS volume\necho -n 'YOUR_PASSPHRASE' | {shlex.join(luks_open[:-2])} - {target_block} {mapper_name}\n\n"
         
         target_block = f"/dev/mapper/{mapper_name}"
 
@@ -860,28 +923,44 @@ def build_execution_plan(plan: FormatPlan) -> tuple[list[ExecutionStep], str, Op
     match fs_type:
         case "btrfs":
             csum = plan.get("csum") or "blake2"
-            mkfs_cmd = ["mkfs.btrfs", "-f", "--csum", csum] 
+            mkfs_cmd = ["mkfs.btrfs", "-f", "--csum", csum]
+            if rotational:
+                mkfs_cmd.append("-K")
             if label: mkfs_cmd.extend(["-L", label])
             mkfs_cmd.append(target_block)
             
         case "ext4" | "ext3" | "ext2":
             mkfs_binary = f"mkfs.{fs_type}"
-            mkfs_cmd = [mkfs_binary, "-F", "-v", "-E", "lazy_itable_init=1,lazy_journal_init=1,discard"]
+            ext_opts_list = ["lazy_itable_init=1"]
+            if fs_type in ["ext3", "ext4"]:
+                ext_opts_list.append("lazy_journal_init=1")
+            if not rotational:
+                ext_opts_list.append("discard")
+            else:
+                ext_opts_list.append("nodiscard")
+            mkfs_cmd = [mkfs_binary, "-F", "-v", "-E", ",".join(ext_opts_list)]
+            if fs_type == "ext4":
+                mkfs_cmd.extend(["-O", "fast_commit"])
             if label: mkfs_cmd.extend(["-L", label])
             mkfs_cmd.append(target_block)
 
         case "f2fs":
-            mkfs_cmd = ["mkfs.f2fs", "-f", "-t", "1"]
+            trim_flag = "0" if rotational else "1"
+            mkfs_cmd = ["mkfs.f2fs", "-f", "-t", trim_flag]
             if label: mkfs_cmd.extend(["-l", label])
             mkfs_cmd.append(target_block)
 
         case "exfat":
             mkfs_cmd = ["mkfs.exfat", "-F"]
+            if rotational:
+                mkfs_cmd.append("-K")
             if label: mkfs_cmd.extend(["-L", label])
             mkfs_cmd.append(target_block)
             
         case "xfs":
             mkfs_cmd = ["mkfs.xfs", "-f"]
+            if rotational:
+                mkfs_cmd.append("-K")
             if label: mkfs_cmd.extend(["-L", label[:12]])
             mkfs_cmd.append(target_block)
 
@@ -892,11 +971,15 @@ def build_execution_plan(plan: FormatPlan) -> tuple[list[ExecutionStep], str, Op
 
         case "bcachefs":
             mkfs_cmd = ["bcachefs", "format", "-f"]
-            if label: mkfs_cmd.append(f"--label={label}")
+            if rotational:
+                mkfs_cmd.append("--rotational")
+            if label: mkfs_cmd.append(f"--fs_label={label}")
             mkfs_cmd.append(target_block)
 
         case "nilfs2":
             mkfs_cmd = ["mkfs.nilfs2", "-f"]
+            if rotational:
+                mkfs_cmd.append("-K")
             if label: mkfs_cmd.extend(["-L", label])
             mkfs_cmd.append(target_block)
 
