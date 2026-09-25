@@ -14,18 +14,18 @@
   3. Immediate uinput Permissions: Applies POSIX ACLs (`setfacl -m u:$USER:rw /dev/uinput`)
      and boot module persistence (/etc/modules-load.d/uinput.conf) so current
      sessions work immediately without re-login.
-  4. Sunshine Configuration: Auto-configures output_name = HEADLESS-1 in sunshine.conf,
+  4. Sunshine Configuration: Auto-configures its own headless output in sunshine.conf,
      syncs D-Bus activation environment, and manages user units safely.
   5. WayVNC Audited Pipeline: Auto-generates 4096-bit RSA TLS certs, configures
      /etc/pam.d/wayvnc, cleans stale sockets (/run/user/UID/wayvncctl), and validates
      IPs using ipaddress.ip_address with 0.0.0.0 fallback.
   6. USB Tethering & Pairing: Validates idevicepair trust records, detects local
-     port conflicts before launching iproxy (skips busy ports), and relies on
+     port conflicts before optional iproxy for iPhone SSH, and relies on
      NetworkManager (or the distro's DHCP client) to bring up ipheth/USB tether links.
   7. Idempotent Firewalls: Handles UFW, Firewalld, nftables, and iptables idempotently
      without throwing duplicate rule or missing table/chain errors.
-  8. Unbreakable Cleanup: Signal handlers (SIGINT/SIGTERM), atexit hooks, and try/finally
-     blocks guarantee background processes and virtual displays are destroyed on exit.
+  8. Cleanup: Signal handlers (SIGINT/SIGTERM), atexit hooks, and try/finally
+     blocks attempt to remove background processes and virtual displays on exit.
 ===============================================================================
 """
 
@@ -85,14 +85,8 @@ def bootstrap_environment() -> None:
         try:
             subprocess.run(["pacman", "-S", "--needed", "--noconfirm"] + missing_pkgs, check=True)
         except subprocess.CalledProcessError:
-            # Fresh installs may have a stale sync DB: refresh mirrors, then retry once.
-            print("[\033[1;36m*\033[0m] First pass failed; syncing pacman databases and retrying...", flush=True)
-            try:
-                subprocess.run(["pacman", "-Sy", "--noconfirm"], check=True)
-                subprocess.run(["pacman", "-S", "--needed", "--noconfirm"] + missing_pkgs, check=True)
-            except subprocess.CalledProcessError as e:
-                print(f"[\033[1;31m!\033[0m] FATAL: Failed to install packages: {e}", flush=True)
-                sys.exit(1)
+            print("Package install failed. If sync databases are stale, run a full pacman -Syu before retrying.", flush=True)
+            sys.exit(1)
         print("[\033[1;32m✔\033[0m] Dependencies installed. Reloading runtime environment...", flush=True)
         os.execvp(sys.executable, [sys.executable] + sys.argv)
 
@@ -346,21 +340,9 @@ class SystemChecker:
         if res.returncode == 0:
             return True
 
-        # Fresh/minimal installs may have a stale sync DB: refresh mirrors once
-        # and retry before giving up (partial `-Sy` risk is limited to the DB).
-        console.print("[bold blue]  ::[/] First pass failed; syncing pacman databases and retrying...")
-        res = CommandRunner.run("pacman -Sy --noconfirm", timeout=None)
-        if res.returncode != 0:
-            console.print(
-                "[bold yellow]  ⚠[/] `pacman -Sy` failed. Verify network/mirrors in /etc/pacman.d/mirrorlist, "
-                "then re-run the orchestrator."
-            )
-            return False
-        res = CommandRunner.run(install_cmd, timeout=None)
-        if res.returncode != 0:
-            console.print(f"[bold red]  ✖[/] pacman exited {res.returncode}: {res.stderr.strip()[-300:]}")
-            return False
-        return True
+        console.print(f"[bold red]  ✖[/] pacman exited {res.returncode}: {res.stderr.strip()[-300:]}")
+        console.print("[bold yellow]  ⚠[/] If sync databases are stale, run a full pacman -Syu before retrying.")
+        return False
 
     @staticmethod
     def sync_user_dbus_env() -> None:
@@ -485,10 +467,14 @@ class HyprlandManager:
     @staticmethod
     def create_headless_output(res: str = "1170x2532", fps: int = 60, scale: float = 2.0) -> str | None:
         console.print("[bold blue]  ::[/] Requesting Hyprland virtual headless monitor...")
-        CommandRunner.run("hyprctl output create headless HEADLESS-1", as_user=True)
-
-        monitors = HyprlandManager.get_headless_monitors()
-        name = monitors[-1] if monitors else "HEADLESS-1"
+        name = f"HEADLESS-REMOTE-{os.getpid()}"
+        if name in HyprlandManager.get_headless_monitors():
+            console.print(f"[bold red]  ✖[/] Virtual display {name} already exists; refusing to take ownership.")
+            return None
+        created = CommandRunner.run(f"hyprctl output create headless {name}", as_user=True)
+        if created.returncode != 0 or name not in HyprlandManager.get_headless_monitors():
+            console.print(f"[bold red]  ✖[/] Hyprland did not create {name}: {created.stderr.strip()}")
+            return None
 
         width_s, _, height_s = str(res).partition("x")
         width, height = int(width_s), int(height_s)
@@ -632,7 +618,10 @@ class WayVNCManager:
         key_file = wayvnc_dir / "tls_key.pem"
         cert_file = wayvnc_dir / "tls_cert.pem"
 
-        if not key_file.exists() or not cert_file.exists():
+        cert_valid = cert_file.exists() and CommandRunner.run(
+            ["openssl", "x509", "-checkend", "2592000", "-noout", "-in", str(cert_file)]
+        ).returncode == 0
+        if not key_file.exists() or not cert_valid:
             console.print("[bold blue]  ::[/] Auto-generating self-signed TLS certificates for WayVNC...")
             # PKCS#1 ("BEGIN RSA PRIVATE KEY") is REQUIRED: neatvnc's RSA-AES
             # security type rejects OpenSSL 3's default PKCS#8 ("PRIVATE KEY").
@@ -642,7 +631,7 @@ class WayVNCManager:
             )
             CommandRunner.run(
                 f"openssl req -new -x509 -key {shlex.quote(str(key_file))} "
-                f"-out {shlex.quote(str(cert_file))} -days 365 -sha256 -subj \"/CN=WayVNC\"",
+                f"-out {shlex.quote(str(cert_file))} -days 3650 -sha256 -subj \"/CN=WayVNC\"",
                 check=True,
             )
             os.chown(key_file, user_ctx.uid, user_ctx.gid)
@@ -654,29 +643,45 @@ class WayVNCManager:
         # wayvnc >= 0.10: `pam_service` was removed (use `enable_pam`); TLS
         # key keys are `private_key_file`/`rsa_private_key_file`; add
         # `relax_encryption` so iOS clients can use Apple Diffie-Hellman.
-        config_content = (
-            f"address = 0.0.0.0\n"
-            f"port = 5900\n"
-            f"enable_auth = true\n"
-            f"enable_pam = true\n"
-            f"rsa_private_key_file = {key_file}\n"
-            f"private_key_file = {key_file}\n"
-            f"certificate_file = {cert_file}\n"
-            f"relax_encryption = true\n"
-        )
-        config_file.write_text(config_content)
+        managed = {
+            "address": "0.0.0.0", "port": "5900", "enable_auth": "true",
+            "enable_pam": "true", "rsa_private_key_file": str(key_file),
+            "private_key_file": str(key_file), "certificate_file": str(cert_file),
+            "relax_encryption": "true",
+        }
+        existing = config_file.read_text().splitlines() if config_file.exists() else []
+        merged, seen = [], set()
+        for line in existing:
+            key = line.partition("=")[0].strip()
+            if key in managed:
+                if key not in seen:
+                    merged.append(f"{key} = {managed[key]}")
+                    seen.add(key)
+            else:
+                merged.append(line)
+        merged.extend(f"{key} = {value}" for key, value in managed.items() if key not in seen)
+        config_content = "\n".join(merged) + "\n"
+        if not config_file.exists() or config_file.read_text() != config_content:
+            config_file.write_text(config_content)
         os.chown(config_file, user_ctx.uid, user_ctx.gid)
         os.chown(wayvnc_dir, user_ctx.uid, user_ctx.gid)
 
         return config_file
 
     @staticmethod
-    def cleanup_stale_sockets() -> None:
+    def cleanup_stale_sockets() -> bool:
         socket_file = user_ctx.xdg_runtime_dir / "wayvncctl"
-        if socket_file.exists():
-            with contextlib.suppress(Exception):
-                socket_file.unlink()
+        if not socket_file.exists():
+            return True
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
+            try:
+                control.connect(str(socket_file))
+            except (ConnectionRefusedError, FileNotFoundError):
+                socket_file.unlink(missing_ok=True)
                 console.print(f"[bold green]  ✔[/] Cleaned stale IPC control socket: {socket_file}")
+                return True
+        console.print("[bold yellow]  ⚠[/] A live WayVNC control socket already exists.")
+        return False
 
 # --- 10. Sunshine Configuration Engine ---
 class SunshineManager:
@@ -748,15 +753,21 @@ class SunshineManager:
         conf_dir.mkdir(parents=True, exist_ok=True)
         conf_file = conf_dir / "sunshine.conf"
 
-        lines = [
-            "# Auto-generated by Arch-iOS-Link Orchestrator",
-            f"output_name = {output_name}",
-            "# XDG Portal capture (Wayland direct capture is broken upstream on Hyprland 0.5x)",
-            "capture = portal",
-            "encoder = auto",
-            "min_log_level = info"
-        ]
-        conf_file.write_text("\n".join(lines))
+        managed = {"output_name": output_name, "capture": "portal"}
+        existing = conf_file.read_text().splitlines() if conf_file.exists() else []
+        lines, seen = [], set()
+        for line in existing:
+            key = line.partition("=")[0].strip()
+            if key in managed:
+                if key not in seen:
+                    lines.append(f"{key} = {managed[key]}")
+                    seen.add(key)
+            else:
+                lines.append(line)
+        lines.extend(f"{key} = {value}" for key, value in managed.items() if key not in seen)
+        content = "\n".join(lines) + "\n"
+        if not conf_file.exists() or conf_file.read_text() != content:
+            conf_file.write_text(content)
         os.chown(conf_dir, user_ctx.uid, user_ctx.gid)
         os.chown(conf_file, user_ctx.uid, user_ctx.gid)
 
@@ -904,13 +915,13 @@ class RemoteConnectClient:
         if app == "moonlight":
             cmd = [moonlight_bin, ip]
         elif app in ("vncviewer", "realvnc"):
-            if not os.environ.get("DISPLAY") and not Path("/tmp/.X11-unix").glob("X*"):
+            if not os.environ.get("DISPLAY") and not any(Path("/tmp/.X11-unix").glob("X*")):
                 console.print(
                     "[bold yellow]  ⚠[/] VNC viewers (tigervnc/RealVNC) are X11 apps, but no X display/XWayland "
                     "was detected here — launch will fail with 'Can't open display'. Enable XWayland "
                     "(Hyprland: `xwayland:enabled = true`, then relogin) or use Moonlight, which is native Wayland."
                 )
-            cmd = ["vncviewer", f"{ip}:5900"]
+            cmd = ["vncviewer", f"{ip}::5900"]
         else:
             return
         subprocess.Popen(
@@ -1119,8 +1130,9 @@ class ArchIOSLinkCLI:
                 SystemChecker.sync_user_dbus_env()
 
                 headless_name = HyprlandManager.create_headless_output(res="1170x2532", fps=60, scale=2.0)
-                if headless_name:
-                    SunshineManager.configure_target_display(headless_name)
+                if not headless_name:
+                    return
+                SunshineManager.configure_target_display(headless_name)
 
                 FirewallManager.configure_rules(
                     ports=[47984, 47989, 47990, 48010, 47998, 47999, 48000, 48002],
@@ -1143,7 +1155,7 @@ class ArchIOSLinkCLI:
                     primary_ip = "localhost"
                     console.print(
                         "[bold yellow]  ⚠[/] No routable IP detected yet — showing the localhost URI. "
-                        "Pair via USB tunnel or after Wi-Fi/DHCP assignment."
+                        "Enable the iPhone USB Personal Hotspot or Wi-Fi for remote pairing."
                     )
                 web_ui_url = f"https://{primary_ip}:47990"
                 console.print(f"\n[bold green]✔ Sunshine Streaming Server Active![/]")
@@ -1219,9 +1231,19 @@ class ArchIOSLinkCLI:
                     return
 
                 WayVNCManager.prepare_environment()
-                WayVNCManager.cleanup_stale_sockets()
+                if not WayVNCManager.cleanup_stale_sockets():
+                    return
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as port_probe:
+                    port_probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    try:
+                        port_probe.bind(("0.0.0.0", 5900))
+                    except OSError:
+                        console.print("[bold red]  ✖[/] Port 5900 is already in use.")
+                        return
 
                 headless_name = HyprlandManager.create_headless_output(res="1080x1920", fps=60, scale=1.5)
+                if not headless_name:
+                    return
                 FirewallManager.configure_rules(
                     ports=[5900],
                     interfaces=NetworkSensingEngine.firewall_interfaces()
@@ -1233,7 +1255,7 @@ class ArchIOSLinkCLI:
                     connect_ip = "localhost"
                     console.print(
                         "[bold yellow]  ⚠[/] No routable IP detected yet — showing the localhost URI. "
-                        "It works immediately over the USB iproxy tunnel; re-run once Wi-Fi/DHCP is up for network access."
+                        "Enable the iPhone USB Personal Hotspot or Wi-Fi, then re-run for network access."
                     )
 
                 hostname = socket.gethostname().split(".")[0]
@@ -1248,6 +1270,21 @@ class ArchIOSLinkCLI:
                     preexec_fn=user_ctx.demote_fn()
                 )
                 ResourceManager.register_process(vnc_proc)
+
+                deadline = time.monotonic() + 5
+                ready = False
+                while time.monotonic() < deadline:
+                    if vnc_proc.poll() is not None:
+                        break
+                    try:
+                        with socket.create_connection(("127.0.0.1", 5900), timeout=0.2):
+                            ready = True
+                            break
+                    except OSError:
+                        time.sleep(0.1)
+                if not ready:
+                    console.print("[bold red]  ✖[/] WayVNC did not open port 5900 within 5 seconds.")
+                    return
 
                 vnc_uri = f"vnc://{connect_ip}:5900"
                 console.print(f"\n[bold green]✔ WayVNC Server Running at {vnc_uri}[/]")
@@ -1287,6 +1324,9 @@ class ArchIOSLinkCLI:
                     with contextlib.suppress(Exception):
                         vnc_proc.terminate()
                         vnc_proc.wait(timeout=2)
+                    if vnc_proc.poll() is None:
+                        vnc_proc.kill()
+                        vnc_proc.wait()
                     ResourceManager.unregister_process(vnc_proc)
                 WayVNCManager.cleanup_stale_sockets()
                 if headless_name:
@@ -1323,10 +1363,10 @@ class ArchIOSLinkCLI:
                 console.print("  2. Unlock iPhone and tap 'Trust This Computer' if prompted.")
                 console.print("  3. Enable Personal Hotspot (USB Only) in Settings.")
 
-                if Confirm.ask("\nStart usbmuxd port forwarding (`iproxy`) for VNC, Sunshine & SSH?", default=True):
-                    console.print("[bold blue]  ::[/] Launching `iproxy` multi-port tunnel over USB...")
+                if Confirm.ask("\nForward this PC's localhost:2222 to an SSH server on the iPhone?", default=False):
+                    console.print("[bold blue]  ::[/] Launching `iproxy` for iPhone SSH...")
 
-                    proxy_maps = ["5900:5900", "3389:3389", "47989:47989", "47990:47990", "2222:22"]
+                    proxy_maps = ["2222:22"]
                     listen_ports = {int(m.split(":")[0]) for m in proxy_maps}
 
                     busy: set[int] = set()
@@ -1351,6 +1391,20 @@ class ArchIOSLinkCLI:
                             stderr=subprocess.DEVNULL
                         )
                         ResourceManager.register_process(iproxy_proc)
+                        deadline = time.monotonic() + 3
+                        ready = False
+                        while time.monotonic() < deadline:
+                            if iproxy_proc.poll() is not None:
+                                break
+                            try:
+                                with socket.create_connection(("127.0.0.1", 2222), timeout=0.2):
+                                    ready = True
+                                    break
+                            except OSError:
+                                time.sleep(0.1)
+                        if not ready:
+                            console.print("[bold red]  ✖[/] iproxy did not open localhost:2222 within 3 seconds.")
+                            return
                         pending = [m.split(":")[1] for m in proxy_maps]
                         console.print(f"[bold green]  ✔[/] USB Tunnel active! Localhost ports {', '.join(m.split(':')[0] for m in proxy_maps)} forwarded to device ports {', '.join(pending)} over USB cable.")
                         Prompt.ask("\nPress Enter to stop USB forwarding...")
@@ -1359,6 +1413,9 @@ class ArchIOSLinkCLI:
                     with contextlib.suppress(Exception):
                         iproxy_proc.terminate()
                         iproxy_proc.wait(timeout=2)
+                    if iproxy_proc.poll() is None:
+                        iproxy_proc.kill()
+                        iproxy_proc.wait()
                     ResourceManager.unregister_process(iproxy_proc)
 
             if not Confirm.ask("\nRestart USB forwarding / re-check the cable?", default=False):
