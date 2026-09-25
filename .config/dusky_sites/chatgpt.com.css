@@ -6,5 +6,7 @@
     aside { background-color: var(--surface_container_low) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Faside%1Fbg | bg: surface_container_low */
     #app-shell-sidebar > div > div { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1F%23app-shell-sidebar%20%3E%20div%20%3E%20div%1Fbg | bg: surface */
     div.relative.isolate.flex.max-h-full { background-color: var(--surface_container_lowest) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.relative.isolate.flex.max-h-full%1Fbg | bg: surface_container_lowest */
+    div.flex.flex-col.rounded-2xl.overflow-hidden { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.flex.flex-col.rounded-2xl.overflow-hidden%1Fbg | bg: surface */
+    .scrollbar-stable { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1F.scrollbar-stable%1Fbg | bg: surface */
     /* <<< dusky:picks */
 }
